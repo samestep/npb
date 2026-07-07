@@ -7,6 +7,7 @@
 //! parsed by streaming NDJSON straight off the child's stdout (never buffering
 //! the whole, meta-heavy output).
 
+use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -149,12 +150,19 @@ fn run_eval(
     scope: &[String],
 ) -> Result<Vec<AttrEval>> {
     let expr = build_expr(repo, commit, system, profile, scope)?;
-    // stderr is inherited (progress shows through, and — importantly — we don't
-    // have to drain a stderr pipe while reading stdout, which would deadlock).
+    // Send stderr to a log file rather than inheriting it: nix-eval-jobs prints a
+    // full Nix traceback per errored attr (megabytes over a whole package set),
+    // and the actionable per-attr error is already in the stdout JSON. A file
+    // (unlike an undrained pipe) also can't deadlock while we stream stdout.
+    let log_dir = cache_root()?.join("logs");
+    fs::create_dir_all(&log_dir).context("creating log dir")?;
+    let log_path = log_dir.join("eval.log");
+    let log = File::create(&log_path).context("creating eval log")?;
+
     let mut child = Command::new("nix-eval-jobs")
         .args(["--meta", "--workers", "4", "--expr", &expr])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(log))
         .spawn()
         .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -164,9 +172,24 @@ fn run_eval(
     // rest, so a non-zero status with parsed attrs is normal (a full nixpkgs
     // eval always has some). Only fail if it produced nothing at all.
     if !status.success() && attrs.is_empty() {
-        bail!("nix-eval-jobs failed ({status}) and produced no output (see stderr above)");
+        bail!(
+            "nix-eval-jobs failed ({status}) and produced no output. Last stderr from {}:\n{}",
+            log_path.display(),
+            tail(&log_path, 40),
+        );
     }
     Ok(attrs)
+}
+
+/// The last `lines` lines of a (possibly large) file; empty if unreadable.
+fn tail(path: &Path, lines: usize) -> String {
+    match fs::read_to_string(path) {
+        Ok(s) => {
+            let all: Vec<&str> = s.lines().collect();
+            all[all.len().saturating_sub(lines)..].join("\n")
+        }
+        Err(_) => String::new(),
+    }
 }
 
 // --- cache ------------------------------------------------------------------
@@ -265,5 +288,17 @@ mod tests {
             build_expr(repo, "abc123", "aarch64-linux", "default", &["python3Packages.numpy".into()])
                 .unwrap();
         assert!(scoped.contains(r#"attrByPath [ "python3Packages" "numpy" ]"#));
+    }
+
+    #[test]
+    fn tail_returns_last_lines() {
+        let dir = std::env::temp_dir().join(format!("npd-tail-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.log");
+        fs::write(&path, "l1\nl2\nl3\nl4\n").unwrap();
+        assert_eq!(tail(&path, 2), "l3\nl4");
+        assert_eq!(tail(&path, 99), "l1\nl2\nl3\nl4");
+        assert_eq!(tail(&dir.join("missing"), 5), "");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
