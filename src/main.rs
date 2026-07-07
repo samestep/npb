@@ -419,34 +419,23 @@ fn cmd_build(
         ),
     };
 
+    if targets.is_empty() {
+        println!("nothing to build (empty changed set)");
+        return Ok(());
+    }
+    // build_targets streams per-target progress; we just tally the summary.
     let built = build::build_targets(&targets, policy, dry_run)?;
 
     let (mut ok, mut failed, mut would, mut skip_ok, mut skip_fail) = (0, 0, 0, 0, 0);
     for r in &built {
-        let label = match (r.decision, r.outcome) {
-            (Decision::Build, Some(Outcome::Built)) => {
-                ok += 1;
-                "built"
-            }
-            (Decision::Build, Some(Outcome::Failed)) => {
-                failed += 1;
-                "FAILED"
-            }
-            (Decision::Build, None) => {
-                would += 1;
-                "would build"
-            }
-            (Decision::SkipOk, _) => {
-                skip_ok += 1;
-                "skip (known ok)"
-            }
-            (Decision::SkipFail, _) => {
-                skip_fail += 1;
-                "skip (known failure)"
-            }
-            _ => "?",
-        };
-        println!("  {label:<20} {}  {}", r.system, r.attr);
+        match (r.decision, r.outcome) {
+            (Decision::Build, Some(Outcome::Built)) => ok += 1,
+            (Decision::Build, Some(Outcome::Failed)) => failed += 1,
+            (Decision::Build, None) => would += 1,
+            (Decision::SkipOk, _) => skip_ok += 1,
+            (Decision::SkipFail, _) => skip_fail += 1,
+            _ => {}
+        }
     }
     if dry_run {
         println!("would-build={would} skipped-ok={skip_ok} skipped-fail={skip_fail} ({} targets)", built.len());

@@ -7,9 +7,9 @@
 //! Nix remembers successful builds (the store), but *forgets failures* — so
 //! without this, a known-failing derivation gets retried on every run.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -55,16 +55,11 @@ fn hostname() -> String {
 }
 
 /// Realise `drv` (all outputs), rooting the result under the cache's gcroots so
-/// it survives GC, and capturing build output to a per-drv log. Returns whether
-/// it succeeded, how long it took, and the log path (relative to the cache root).
-fn run_build(drv: &str, cache: &Path, when: i64) -> Result<(bool, f64, String)> {
-    let hash = store_hash(drv);
-    let log_rel = format!("logs/{hash}/build-{when}.log");
-    let log_path = cache.join(&log_rel);
-    fs::create_dir_all(log_path.parent().unwrap()).context("creating build log dir")?;
-    let log = File::create(&log_path).context("creating build log")?;
-
-    let gcroot = cache.join("gcroots").join(hash);
+/// it survives GC. `nix build`'s output is inherited so the user sees its native
+/// progress; the full build log stays retrievable via `nix log <drv>`. Returns
+/// whether it succeeded and how long it took.
+fn run_build(drv: &str, cache: &Path) -> Result<(bool, f64)> {
+    let gcroot = cache.join("gcroots").join(store_hash(drv));
     fs::create_dir_all(gcroot.parent().unwrap()).context("creating gcroots dir")?;
 
     let start = Instant::now();
@@ -72,11 +67,9 @@ fn run_build(drv: &str, cache: &Path, when: i64) -> Result<(bool, f64, String)> 
         .args(["build", &format!("{drv}^*"), "--out-link"])
         .arg(&gcroot)
         .args(["--extra-experimental-features", "nix-command"])
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
         .status()
         .context("running nix build")?;
-    Ok((status.success(), start.elapsed().as_secs_f64(), log_rel))
+    Ok((status.success(), start.elapsed().as_secs_f64()))
 }
 
 /// For each target, consult `policy` against the observation log and either
@@ -91,33 +84,53 @@ pub fn build_targets(
     let cache = eval::cache_root()?;
     let host = hostname();
 
+    let n = targets.len();
     let mut results = Vec::new();
-    for t in targets {
+    for (i, t) in targets.iter().enumerate() {
         let observations = store.load_observations(&t.drv_path)?;
         // `substitutable` is left false for now: on a drv's first encounter we
         // let `nix build` no-op if the output is already valid. The observation
         // log skips it thereafter. (A batch validity/narinfo pre-check to skip
         // even the first nix invocation is a later optimization.)
         let decision = policy.decide(&observations, false);
-        let outcome = if decision == Decision::Build && !dry_run {
-            let now = chrono::Utc::now().timestamp();
-            let (ok, secs, log_ref) = run_build(&t.drv_path, &cache, now)?;
-            let outcome = if ok { Outcome::Built } else { Outcome::Failed };
-            store.add_observation(&Observation {
-                drv_path: t.drv_path.clone(),
-                source: Source::Local,
-                outcome,
-                when: now,
-                system: Some(t.system.clone()),
-                duration_s: Some(secs),
-                cached: None,
-                machine: Some(host.clone()),
-                log_ref: Some(log_ref),
-                build_id: None,
-            })?;
-            Some(outcome)
-        } else {
-            None
+        let progress = format!("[{}/{n}] {} {}", i + 1, t.system, t.attr);
+        let outcome = match decision {
+            Decision::Build if !dry_run => {
+                // Header before nix build inherits the terminal for its progress.
+                println!("{progress}: building…");
+                let now = chrono::Utc::now().timestamp();
+                let (ok, secs) = run_build(&t.drv_path, &cache)?;
+                let outcome = if ok { Outcome::Built } else { Outcome::Failed };
+                store.add_observation(&Observation {
+                    drv_path: t.drv_path.clone(),
+                    source: Source::Local,
+                    outcome,
+                    when: now,
+                    system: Some(t.system.clone()),
+                    duration_s: Some(secs),
+                    cached: None,
+                    machine: Some(host.clone()),
+                    log_ref: None,
+                    build_id: None,
+                })?;
+                println!(
+                    "{progress}: {} ({secs:.0}s)",
+                    if ok { "built" } else { "FAILED" }
+                );
+                Some(outcome)
+            }
+            Decision::Build => {
+                println!("{progress}: would build");
+                None
+            }
+            Decision::SkipOk => {
+                println!("{progress}: skip (known ok)");
+                None
+            }
+            Decision::SkipFail => {
+                println!("{progress}: skip (known failure)");
+                None
+            }
         };
         results.push(Built {
             attr: t.attr.clone(),
