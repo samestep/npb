@@ -14,17 +14,25 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use crate::eval::{self, DEFAULT_PROFILE};
+use crate::eval;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
-/// What happened to one (attr, system) target.
+/// One derivation to consider building, with the attr/system it came from (for
+/// reporting). Produced from either an explicit eval or a diff's changed set.
+pub struct Target {
+    pub attr: String,
+    pub system: String,
+    pub drv_path: String,
+}
+
+/// What happened to one target.
 pub struct Built {
     pub attr: String,
     pub system: String,
     pub drv_path: String,
     pub decision: Decision,
-    /// The build outcome, when `decision` was `Build`.
+    /// The build outcome, when `decision` was `Build` and this was not a dry run.
     pub outcome: Option<Outcome>,
 }
 
@@ -71,61 +79,53 @@ fn run_build(drv: &str, cache: &Path, when: i64) -> Result<(bool, f64, String)> 
     Ok((status.success(), start.elapsed().as_secs_f64(), log_rel))
 }
 
-/// Evaluate `commit` for the given `scope`, then build each buildable derivation
-/// subject to `policy` and the observation log.
-pub fn build_commit(
-    repo: &Path,
-    commit: &str,
-    systems: &[String],
-    scope: &[String],
+/// For each target, consult `policy` against the observation log and either
+/// build it (recording the result and rooting the output) or skip it. With
+/// `dry_run`, decisions are computed but nothing is built or recorded.
+pub fn build_targets(
+    targets: &[Target],
     policy: BuildPolicy,
+    dry_run: bool,
 ) -> Result<Vec<Built>> {
     let mut store = Store::open(&eval::db_path()?)?;
     let cache = eval::cache_root()?;
     let host = hostname();
 
-    let evals = eval::eval_commit(repo, commit, systems, DEFAULT_PROFILE, scope)?;
     let mut results = Vec::new();
-    for e in &evals {
-        for a in &e.attrs {
-            // Anything with a drv can be built — including meta-blocked packages,
-            // whose drv exists (we eval with the allow-flags on) and builds fine
-            // since meta is only an eval-time gate. Skip eval errors (no drv).
-            let Some(drv) = a.drv_path.clone() else {
-                continue;
-            };
-
-            let observations = store.load_observations(&drv)?;
-            let decision = policy.decide(&observations, false);
-            let outcome = match decision {
-                Decision::Build => {
-                    let now = chrono::Utc::now().timestamp();
-                    let (ok, secs, log_ref) = run_build(&drv, &cache, now)?;
-                    let outcome = if ok { Outcome::Built } else { Outcome::Failed };
-                    store.add_observation(&Observation {
-                        drv_path: drv.clone(),
-                        source: Source::Local,
-                        outcome,
-                        when: now,
-                        system: Some(e.system.clone()),
-                        duration_s: Some(secs),
-                        cached: None,
-                        machine: Some(host.clone()),
-                        log_ref: Some(log_ref),
-                        build_id: None,
-                    })?;
-                    Some(outcome)
-                }
-                Decision::SkipOk | Decision::SkipFail => None,
-            };
-            results.push(Built {
-                attr: a.attr.clone(),
-                system: e.system.clone(),
-                drv_path: drv,
-                decision,
+    for t in targets {
+        let observations = store.load_observations(&t.drv_path)?;
+        // `substitutable` is left false for now: on a drv's first encounter we
+        // let `nix build` no-op if the output is already valid. The observation
+        // log skips it thereafter. (A batch validity/narinfo pre-check to skip
+        // even the first nix invocation is a later optimization.)
+        let decision = policy.decide(&observations, false);
+        let outcome = if decision == Decision::Build && !dry_run {
+            let now = chrono::Utc::now().timestamp();
+            let (ok, secs, log_ref) = run_build(&t.drv_path, &cache, now)?;
+            let outcome = if ok { Outcome::Built } else { Outcome::Failed };
+            store.add_observation(&Observation {
+                drv_path: t.drv_path.clone(),
+                source: Source::Local,
                 outcome,
-            });
-        }
+                when: now,
+                system: Some(t.system.clone()),
+                duration_s: Some(secs),
+                cached: None,
+                machine: Some(host.clone()),
+                log_ref: Some(log_ref),
+                build_id: None,
+            })?;
+            Some(outcome)
+        } else {
+            None
+        };
+        results.push(Built {
+            attr: t.attr.clone(),
+            system: t.system.clone(),
+            drv_path: t.drv_path.clone(),
+            decision,
+            outcome,
+        });
     }
     Ok(results)
 }

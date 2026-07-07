@@ -70,11 +70,18 @@ enum Command {
     },
     /// Build derivations, consulting (and appending to) the observation log.
     Build {
-        /// Git commit / revision to evaluate the attrs at.
+        /// Git commit / revision to build at (the "head" for --changed).
         commit: String,
-        /// Attribute paths to build (dotted). Required — building the whole
-        /// package set is almost never intended.
+        /// Attribute paths to build (dotted). Provide these or --changed.
         attrs: Vec<String>,
+        /// Build the reverse-closure changed between <base> and <commit>
+        /// (i.e. diff base..commit, build the Changed+Added set) instead of
+        /// explicit attrs.
+        #[arg(long, value_name = "base")]
+        changed: Option<String>,
+        /// Show what would be built (decisions per target) without building.
+        #[arg(long)]
+        dry_run: bool,
         /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
@@ -151,6 +158,15 @@ fn short_drv(drv: &Option<String>) -> String {
     }
 }
 
+/// The attrs an eval produced for `sys` (empty if that system wasn't evaluated).
+fn attrs_for(evals: &[eval::Eval], sys: &str) -> Vec<model::AttrEval> {
+    evals
+        .iter()
+        .find(|e| e.system == sys)
+        .map(|e| e.attrs.clone())
+        .unwrap_or_default()
+}
+
 fn cmd_eval(
     commit: String,
     attrs: Vec<String>,
@@ -217,14 +233,6 @@ fn cmd_diff(
         Some(c) => Some(eval::eval_commit(&repo, c, &systems, &profile, &attrs)?),
         None => None,
     };
-    let attrs_for = |evals: &[eval::Eval], sys: &str| -> Vec<model::AttrEval> {
-        evals
-            .iter()
-            .find(|e| e.system == sys)
-            .map(|e| e.attrs.clone())
-            .unwrap_or_default()
-    };
-
     if let Some(c) = &merge_base {
         println!("merge base: {c}");
     }
@@ -281,22 +289,70 @@ fn cmd_diff(
     Ok(())
 }
 
+/// Build targets from an explicit scoped eval at `commit`.
+fn targets_from_attrs(
+    repo: &std::path::Path,
+    commit: &str,
+    systems: &[String],
+    attrs: &[String],
+) -> Result<Vec<build::Target>> {
+    let evals = eval::eval_commit(repo, commit, systems, eval::DEFAULT_PROFILE, attrs)?;
+    let mut targets = Vec::new();
+    for e in &evals {
+        for a in &e.attrs {
+            if let Some(drv) = &a.drv_path {
+                targets.push(build::Target {
+                    attr: a.attr.clone(),
+                    system: e.system.clone(),
+                    drv_path: drv.clone(),
+                });
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// Build targets = the reverse-closure changed between `base` and `commit`
+/// (the Changed + Added entries of the full-set diff, at the head drv).
+fn targets_from_diff(
+    repo: &std::path::Path,
+    base: &str,
+    commit: &str,
+    systems: &[String],
+) -> Result<Vec<build::Target>> {
+    let base_evals = eval::eval_commit(repo, base, systems, eval::DEFAULT_PROFILE, &[])?;
+    let head_evals = eval::eval_commit(repo, commit, systems, eval::DEFAULT_PROFILE, &[])?;
+    let mut targets = Vec::new();
+    for sys in systems {
+        let b = attrs_for(&base_evals, sys);
+        let h = attrs_for(&head_evals, sys);
+        for e in diff::diff_evals(&b, &h, None) {
+            if matches!(e.kind, DiffKind::Changed | DiffKind::Added)
+                && let Some(drv) = e.head_drv
+            {
+                targets.push(build::Target {
+                    attr: e.attr,
+                    system: sys.clone(),
+                    drv_path: drv,
+                });
+            }
+        }
+    }
+    Ok(targets)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_build(
     commit: String,
     attrs: Vec<String>,
+    changed: Option<String>,
+    dry_run: bool,
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
     recheck: bool,
     retry: bool,
     prefer_local: bool,
 ) -> Result<()> {
-    if attrs.is_empty() {
-        bail!(
-            "npd build: pass one or more attrs \
-             (building the whole package set is almost never intended)"
-        );
-    }
     let repo = resolve_repo(nixpkgs)?;
     let systems = resolve_systems(system);
     let policy = BuildPolicy {
@@ -305,9 +361,19 @@ fn cmd_build(
         prefer_local,
     };
 
-    let built = build::build_commit(&repo, &commit, &systems, &attrs, policy)?;
+    let targets = match (&changed, attrs.is_empty()) {
+        (Some(_), false) => bail!("npd build: pass either attrs or --changed <base>, not both"),
+        (Some(base), true) => targets_from_diff(&repo, base, &commit, &systems)?,
+        (None, false) => targets_from_attrs(&repo, &commit, &systems, &attrs)?,
+        (None, true) => bail!(
+            "npd build: pass one or more attrs, or --changed <base> \
+             (building the whole package set is almost never intended)"
+        ),
+    };
 
-    let (mut ok, mut failed, mut skip_ok, mut skip_fail) = (0, 0, 0, 0);
+    let built = build::build_targets(&targets, policy, dry_run)?;
+
+    let (mut ok, mut failed, mut would, mut skip_ok, mut skip_fail) = (0, 0, 0, 0, 0);
     for r in &built {
         let label = match (r.decision, r.outcome) {
             (Decision::Build, Some(Outcome::Built)) => {
@@ -317,6 +383,10 @@ fn cmd_build(
             (Decision::Build, Some(Outcome::Failed)) => {
                 failed += 1;
                 "FAILED"
+            }
+            (Decision::Build, None) => {
+                would += 1;
+                "would build"
             }
             (Decision::SkipOk, _) => {
                 skip_ok += 1;
@@ -330,9 +400,13 @@ fn cmd_build(
         };
         println!("  {label:<20} {}  {}", r.system, r.attr);
     }
-    println!("built={ok} failed={failed} skipped-ok={skip_ok} skipped-fail={skip_fail}");
-    if failed > 0 {
-        bail!("{failed} build(s) failed");
+    if dry_run {
+        println!("would-build={would} skipped-ok={skip_ok} skipped-fail={skip_fail} ({} targets)", built.len());
+    } else {
+        println!("built={ok} failed={failed} skipped-ok={skip_ok} skipped-fail={skip_fail}");
+        if failed > 0 {
+            bail!("{failed} build(s) failed");
+        }
     }
     Ok(())
 }
@@ -358,12 +432,24 @@ fn main() -> Result<()> {
         Command::Build {
             commit,
             attrs,
+            changed,
+            dry_run,
             nixpkgs,
             system,
             recheck,
             retry,
             prefer_local,
-        } => cmd_build(commit, attrs, nixpkgs, system, recheck, retry, prefer_local),
+        } => cmd_build(
+            commit,
+            attrs,
+            changed,
+            dry_run,
+            nixpkgs,
+            system,
+            recheck,
+            retry,
+            prefer_local,
+        ),
         Command::Hydra { .. } => bail!("npd hydra: not implemented yet (see DESIGN.md build order)"),
         Command::Report => bail!("npd report: not implemented yet (see DESIGN.md build order)"),
     }
