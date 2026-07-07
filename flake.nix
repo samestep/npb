@@ -31,6 +31,8 @@
             # npd shells out to these:
             pkgs.nix
             pkgs.nix-eval-jobs
+            # for poking at the store during development:
+            pkgs.sqlite
           ];
         };
       }

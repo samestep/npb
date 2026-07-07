@@ -14,26 +14,26 @@ use crate::model::{AttrEval, Existence};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS eval_run (
+    id           INTEGER PRIMARY KEY,
     commit_      TEXT    NOT NULL,
     system       TEXT    NOT NULL,
     profile      TEXT    NOT NULL,
     eval_version INTEGER NOT NULL,
     evaluated_at INTEGER NOT NULL,
-    PRIMARY KEY (commit_, system, profile, eval_version)
+    UNIQUE (commit_, system, profile, eval_version)
 ) STRICT;
 
+-- attr rows reference the run by its small integer id rather than repeating the
+-- (40-char commit, system, profile, version) key in every row and its index.
 CREATE TABLE IF NOT EXISTS attr_eval (
-    commit_      TEXT    NOT NULL,
-    system       TEXT    NOT NULL,
-    profile      TEXT    NOT NULL,
-    eval_version INTEGER NOT NULL,
+    run_id       INTEGER NOT NULL REFERENCES eval_run (id) ON DELETE CASCADE,
     attr         TEXT    NOT NULL,
     drv_path     TEXT,
     broken       INTEGER,
     unsupported  INTEGER,
     insecure     INTEGER,
     error        TEXT,
-    PRIMARY KEY (commit_, system, profile, eval_version, attr)
+    PRIMARY KEY (run_id, attr)
 ) STRICT;
 
 -- The append-only observation log (DESIGN.md §3). Not yet written to; the build
@@ -79,8 +79,26 @@ impl Store {
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // WAL: readers don't block the writer; better for a durable local store.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "foreign_keys", "ON").ok();
         conn.execute_batch(SCHEMA).context("initializing schema")?;
         Ok(Self { conn })
+    }
+
+    fn run_id(
+        conn: &Connection,
+        commit: &str,
+        system: &str,
+        profile: &str,
+        version: u32,
+    ) -> Result<Option<i64>> {
+        Ok(conn
+            .query_row(
+                "SELECT id FROM eval_run \
+                 WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND eval_version = ?4",
+                params![commit, system, profile, version],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// The cached full-set eval for this key, or `None` if never evaluated.
@@ -91,25 +109,15 @@ impl Store {
         profile: &str,
         version: u32,
     ) -> Result<Option<Vec<AttrEval>>> {
-        let evaluated: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM eval_run \
-                 WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND eval_version = ?4",
-                params![commit, system, profile, version],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if evaluated.is_none() {
+        let Some(run_id) = Self::run_id(&self.conn, commit, system, profile, version)? else {
             return Ok(None);
-        }
+        };
 
         let mut stmt = self.conn.prepare(
             "SELECT attr, drv_path, broken, unsupported, insecure, error FROM attr_eval \
-             WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND eval_version = ?4 \
-             ORDER BY attr",
+             WHERE run_id = ?1 ORDER BY attr",
         )?;
-        let rows = stmt.query_map(params![commit, system, profile, version], |r| {
+        let rows = stmt.query_map(params![run_id], |r| {
             let mut a = AttrEval {
                 attr: r.get(0)?,
                 existence: Existence::Error, // fixed up below
@@ -141,23 +149,26 @@ impl Store {
         attrs: &[AttrEval],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // Upsert the run, then (re)populate its attrs. Deleting the run cascades
+        // to its old attr_eval rows.
+        if let Some(old) = Self::run_id(&tx, commit, system, profile, version)? {
+            tx.execute("DELETE FROM eval_run WHERE id = ?1", params![old])?;
+        }
         tx.execute(
-            "DELETE FROM attr_eval \
-             WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND eval_version = ?4",
-            params![commit, system, profile, version],
+            "INSERT INTO eval_run (commit_, system, profile, eval_version, evaluated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![commit, system, profile, version, evaluated_at],
         )?;
+        let run_id = tx.last_insert_rowid();
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO attr_eval \
-                 (commit_, system, profile, eval_version, attr, drv_path, broken, unsupported, insecure, error) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (run_id, attr, drv_path, broken, unsupported, insecure, error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for a in attrs {
                 stmt.execute(params![
-                    commit,
-                    system,
-                    profile,
-                    version,
+                    run_id,
                     a.attr,
                     a.drv_path,
                     a.broken,
@@ -167,11 +178,6 @@ impl Store {
                 ])?;
             }
         }
-        tx.execute(
-            "INSERT OR REPLACE INTO eval_run \
-             (commit_, system, profile, eval_version, evaluated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![commit, system, profile, version, evaluated_at],
-        )?;
         tx.commit()?;
         Ok(())
     }
