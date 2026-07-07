@@ -64,17 +64,20 @@ differing outcomes).
 **Hydra facts are observations too** — not a separate mutable store. A Hydra
 build record keyed by `build_id` is itself immutable; "what is the latest build
 of job X" and "is output H in the cache right now" are just observations we make
-at time `when`. So there is no eviction and no TTL *discipline*: **freshness is a
-read-time policy** (accept the newest observation if it is younger than some
-threshold, otherwise make a new one), not a storage concern. This keeps full
-history (a job that went green → red → green is visible) and unifies local and
-remote facts under one log.
+at time `when`. So there is no eviction and no TTL. Crucially, because a Hydra
+observation already records the *drvpath*, staleness never affects
+**correctness** — only whether we bother to re-fetch. So we start with
+**manually-triggered** Hydra fetching and no freshness threshold at all; an
+auto-refresh policy can come later if it earns its keep. This keeps full history
+(a job that went green → red → green is visible) and unifies local and remote
+facts under one log.
 
 ## 4. Storage
 
-Durable state lives under `$NPD_STATE` (default `$XDG_STATE_HOME/npd`, i.e.
-`~/.local/state/npd`) — **state**, not cache, because we do not want it swept by
-cache-cleaning or Nix GC.
+Everything `npd` stores is re-derivable, so it lives under
+`dirs::cache_dir()/npd` (i.e. `~/.cache/npd`), like `npc`. The gcroots below are
+the one thing that must survive Nix GC while it exists, but the *records* are all
+cache: losing them costs re-evaluation / re-building, not correctness.
 
 **First, a non-problem to dispel:** we never need to build an in-memory reverse
 index at startup. We only ever look facts up by keys we already hold — an attr
@@ -103,7 +106,7 @@ dependency. This is the **one open backend decision** (§10); the schema is not
 written until it's settled.
 
 ```
-$NPD_STATE/
+~/.cache/npd/
   npd.sqlite                    # evals + observation log (recommended)
   logs/<drv-hash>/<obs-id>.log  # build logs referenced by observations
   gcroots/<drv-hash>-<output>   # nix gcroots for outputs we choose to keep
@@ -213,11 +216,10 @@ root.
 ## 10. Open questions
 
 - **Storage backend (the one live decision):** SQLite (recommended, §4) vs. plain
-  files (consistent with `npc`, no dependency). Schema is deferred until settled.
-- **Freshness threshold** for reusing a Hydra/`Cache` observation before making a
-  new one (read-time policy, §3) — what default, and per-source?
-- Whether the report classifier is a shared library or vendored from the
-  nixpkgs-review comparison PR (§8).
+  files (consistent with `npc`, no dependency). Deferred until we build the
+  observation store; the eval cache is file-blobs either way, so it doesn't block
+  the eval spine.
+- The report classifier's eventual home (§8) — revisit when we get to reports.
 
 Resolved earlier and recorded for context:
 
@@ -226,5 +228,7 @@ Resolved earlier and recorded for context:
 - *Concurrency* → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.
-- *Hydra facts lifetime* → append-only observations, no eviction/TTL; freshness
-  is read-time (§3).
+- *Hydra facts lifetime* → append-only observations, no eviction/TTL. Fetching is
+  manual for now and there is no freshness threshold, since a Hydra observation
+  records the drvpath so staleness can't affect correctness (§3).
+- *Storage location* → `dirs::cache_dir()/npd`; it's all re-derivable cache (§4).
