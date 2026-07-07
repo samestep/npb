@@ -1,15 +1,17 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-build/
-dist/
+# Rust
+/target
 
 # Nix build results
 result
 result-*
 
+# direnv
+.direnv
+
 # Editor / OS
 .DS_Store
 *.swp
+
+# stray Python bytecode
+__pycache__/
+*.pyc

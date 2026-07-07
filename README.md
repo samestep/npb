@@ -24,6 +24,16 @@ So `npd` is a thin **fact store + policy layer over `nix-eval-jobs` and
 
 ## Status
 
-Early scaffolding. The pure data model (`npd/model.py`) is in place; the
-orchestration (eval / diff / build / hydra / report) is stubbed and being
-fleshed out spine-first — see the build order in `DESIGN.md`.
+Early scaffolding (Rust; edition 2024, à la [`npc`](https://github.com/samestep/npc)).
+The pure data model (`src/model.rs`) is in place with tests; the orchestration
+(eval / diff / build / hydra / report) is stubbed and being fleshed out
+spine-first — see the build order in `DESIGN.md`.
+
+## Development
+
+Toolchain comes from the flake (like `npc`): `direnv allow`, or `nix develop`.
+
+```sh
+nix develop --command cargo test    # run the model tests
+nix develop --command cargo run -- --help
+```

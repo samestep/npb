@@ -44,37 +44,69 @@ the schema:
 Therefore: **build facts are keyed on `drvpath`.** Output paths are used only
 where they are the right key (narinfo / substituter presence).
 
-## 3. Three kinds of facts, three caching disciplines
+## 3. Two kinds of facts
 
-Conflating these is the classic way to be subtly wrong. Keep them separate.
+There are only two, and collapsing everything else into the second is a
+deliberate simplification (it dropped out of the design discussion):
 
 | fact | key | discipline |
 | --- | --- | --- |
-| **eval** — attr→drv map + meta | `(commit, system, config-hash)` | **pure** → cache forever, never invalidate |
-| **local build observations** | `drvpath` | **append-only log** — never overwrite; each entry is one attempt |
-| **Hydra facts** — job status, narinfo, drift | `(job, system)` and `drvpath` / outpath | **mutable** → TTL / explicit refresh; Hydra's answer changes over time |
+| **eval** — attr→drv map + meta | `(commit, system, config)` | **pure** → cache forever, never invalidate |
+| **observation** — one build/lookup event | `drvpath` (or output path for `Cache`) | **append-only log** — never overwrite |
 
-Rationale: an eval at a fixed `(commit, system, config)` is deterministic, so its
-result is valid forever. A build *attempt* is an event, not a current-value — we
-append it and never discard it, which is exactly what makes flakiness
-representable (multiple observations of the same drv with differing outcomes).
-Hydra's state is a moving target (a queued job finishes; a cached path is GC'd),
-so those facts carry a `fetched_at` and expire.
+An eval at a fixed `(commit, system, config)` is deterministic, so its result is
+valid forever. Everything else is an **observation**: a single event, from some
+`Source` — a `Local` build we ran, a `HydraJob` build record, or `Cache`
+(narinfo) presence — stamped with `when`. We append and never discard, which is
+what makes flakiness representable (multiple observations of one drv with
+differing outcomes).
 
-## 4. On-disk layout
+**Hydra facts are observations too** — not a separate mutable store. A Hydra
+build record keyed by `build_id` is itself immutable; "what is the latest build
+of job X" and "is output H in the cache right now" are just observations we make
+at time `when`. So there is no eviction and no TTL *discipline*: **freshness is a
+read-time policy** (accept the newest observation if it is younger than some
+threshold, otherwise make a new one), not a storage concern. This keeps full
+history (a job that went green → red → green is visible) and unifies local and
+remote facts under one log.
+
+## 4. Storage
 
 Durable state lives under `$NPD_STATE` (default `$XDG_STATE_HOME/npd`, i.e.
 `~/.local/state/npd`) — **state**, not cache, because we do not want it swept by
 cache-cleaning or Nix GC.
 
+**First, a non-problem to dispel:** we never need to build an in-memory reverse
+index at startup. We only ever look facts up by keys we already hold — an attr
+or job name, an output hash, a drvpath — and **the eval fact is itself the join**
+between the drvpath world and Hydra's name-/output-keyed world (given an eval,
+`attr ⇄ drv ⇄ outputs ⇄ job`). So per-key access is direct regardless of backend.
+
+**Recommended backend: SQLite** (one file) for the observation log and eval
+maps, **files** for the two things that are naturally large blobs — build logs,
+and (optionally) the raw attr→drv eval dumps. Reasons SQLite wins over a pile of
+small JSON files here:
+
+- the observation log is genuinely relational and long-lived; indexes give
+  O(log n) lookup by `drvpath` / output hash / `(job, system)` with no manual
+  index files;
+- it avoids the millions-of-tiny-files failure mode (inode pressure, slow
+  `readdir`, directory sharding) that a fact-per-file scheme hits over time;
+- transactional appends avoid torn writes;
+- the two-way / three-way eval diff and the cross-cutting queries ("everything
+  that fails locally but is green on Hydra", "all flaky drvs") are one SQL query
+  instead of a directory scan.
+
+Trade-off worth naming: `npc` uses plain files, so there is a consistency
+argument for files here too, and files are trivially inspectable / need no
+dependency. This is the **one open backend decision** (§10); the schema is not
+written until it's settled.
+
 ```
 $NPD_STATE/
-  evals/<commit>-<system>-<confighash>.json   # pure: {attr: AttrEval}
-  observations/<drv-hash>.jsonl               # append-only Observation log per derivation
-  hydra/job/<jobset>/<attr>.<system>.json     # mutable: last Hydra job status + fetched_at
-  hydra/narinfo/<out-hash>.json               # mutable: substituter presence + fetched_at
-  logs/<drv-hash>/<obs-id>.log                # build logs referenced by observations
-  gcroots/<drv-hash>-<output>                 # nix gcroots for outputs we choose to keep
+  npd.sqlite                    # evals + observation log (recommended)
+  logs/<drv-hash>/<obs-id>.log  # build logs referenced by observations
+  gcroots/<drv-hash>-<output>   # nix gcroots for outputs we choose to keep
 ```
 
 `<drv-hash>` is the 32-char hash component of the drvpath. gcroots are
@@ -97,7 +129,24 @@ suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
 (don't trust a substituted/Hydra success — build it here). See
 `BuildPolicy.decide` in `npd/model.py`.
 
-## 6. Evaluation and the three-way diff
+## 6. Evaluation, its cache key, and the three-way diff
+
+**The cache key is `(commit, system, config)`, and it is not a can of worms —
+provided `npd` owns the config.** What determines the attr→drv map is the
+nixpkgs revision, the platform, and the nixpkgs *config* (allowlists like
+`allowBroken`/`allowUnfree`/`allowUnsupportedSystem`, `permittedInsecurePackages`,
+overlays, `config.allowAliases`, …). The trap is letting a user pass arbitrary
+Nix as config — that isn't cleanly hashable. `npd` avoids it by **defining the
+eval config itself**: a single canonical profile (or a small set of named
+profiles), so `config` is a short enumerable label, not arbitrary code. The key
+is then just `(commit, system, profile)`, plus an `npd`-eval-version tag bumped
+if we ever change *how* we invoke `nix-eval-jobs`.
+
+Caching is sound because nixpkgs evaluation is deterministic given those inputs
+(drv paths are content-addressed by their inputs, stable across time and
+machines); IFD is still deterministic, and impurities like `currentSystem` are
+fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, once
+`npd` owns the config.
 
 `eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs` (cached, pure).
 A two-way diff is a set-diff on `(attr, drv_path)`. The **three-way** diff also
@@ -131,6 +180,11 @@ ours — the failure mode that first motivated this whole line of work). Hydra's
 `isCachedBuild` flag / build duration further tells us whether a Hydra verdict is
 a genuine run or a reused cached result.
 
+Every Hydra lookup is recorded as an `Observation` (`Source::HydraJob` or
+`Source::Cache`) in the same append-only log (§3), so a Hydra verdict is stored
+and reasoned about identically to a local build. Fetching is **on demand** via
+the `hydra` subcommand for now (§9); whether/when to prefetch is deferred.
+
 Upstream opportunity (separate): Hydra already indexes `BuildOutputs.path`
 (hash) and `Builds.drvpath` (btree + trigram); its `/search` merely uses a
 substring `ilike` that can't use those indexes and times out. A small PR adding
@@ -158,10 +212,19 @@ root.
 
 ## 10. Open questions
 
-- `config-hash` in the eval key: which inputs actually affect the attr→drv map
-  (nixpkgs config, overlays, system) and how to hash them stably.
-- Concurrency / locking on the append-only logs across the three machines
-  (shared store? per-machine store that syncs?).
-- How aggressively to prefetch/refresh Hydra facts vs. fetch on demand.
-- Whether the classifier lives as a shared library or is vendored from the
-  nixpkgs-review PR.
+- **Storage backend (the one live decision):** SQLite (recommended, §4) vs. plain
+  files (consistent with `npc`, no dependency). Schema is deferred until settled.
+- **Freshness threshold** for reusing a Hydra/`Cache` observation before making a
+  new one (read-time policy, §3) — what default, and per-source?
+- Whether the report classifier is a shared library or vendored from the
+  nixpkgs-review comparison PR (§8).
+
+Resolved earlier and recorded for context:
+
+- *Eval cache key* → `(commit, system, profile)` with an eval-version tag; not a
+  can of worms because `npd` owns the config (§6).
+- *Concurrency* → not handled. One machine is the driver and keeps its store
+  local; multiple drivers keep independent stores, exactly as the Nix store
+  already works. The append-only design stays friendly to revisiting this.
+- *Hydra facts lifetime* → append-only observations, no eviction/TTL; freshness
+  is read-time (§3).
