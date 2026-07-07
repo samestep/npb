@@ -1,6 +1,9 @@
 //! Evaluate a nixpkgs revision into an `attr -> drv` map via `nix-eval-jobs`,
 //! cached on disk. This is the first spine primitive (DESIGN.md §6, §9): a pure
 //! fact keyed by `(commit, system, profile)`, so it is computed at most once.
+//!
+//! The revision's source comes from `builtins.fetchGit`, so Nix fetches and
+//! caches it in the store — npd manages no worktrees of its own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,13 +106,15 @@ fn parse_jobs(stdout: &str) -> Result<Vec<AttrEval>> {
 
 // --- running the evaluator --------------------------------------------------
 
-/// Build the Nix expression `nix-eval-jobs` walks. With no `scope` it is the
-/// whole package set at `nixpkgs`; with a scope it is just those (dotted) attrs.
-fn build_expr(nixpkgs: &Path, system: &str, profile: &str, scope: &[String]) -> Result<String> {
+/// Build the Nix expression `nix-eval-jobs` walks. The revision's source is
+/// fetched by `builtins.fetchGit`. With no `scope` it is the whole package set;
+/// with a scope it is just those (dotted) attrs.
+fn build_expr(repo: &Path, commit: &str, system: &str, profile: &str, scope: &[String]) -> Result<String> {
     let cfg = profile_config(profile)?;
     let base = format!(
-        "import {} {{ system = \"{system}\"; config = {cfg}; }}",
-        nixpkgs.display()
+        "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{commit}\"; }}) \
+         {{ system = \"{system}\"; config = {cfg}; }}",
+        repo.display()
     );
     if scope.is_empty() {
         return Ok(base);
@@ -129,8 +134,8 @@ fn build_expr(nixpkgs: &Path, system: &str, profile: &str, scope: &[String]) -> 
     Ok(format!("let pkgs = {base}; in {{ {entries} }}"))
 }
 
-fn run_eval(nixpkgs: &Path, system: &str, profile: &str, scope: &[String]) -> Result<Vec<AttrEval>> {
-    let expr = build_expr(nixpkgs, system, profile, scope)?;
+fn run_eval(repo: &Path, commit: &str, system: &str, profile: &str, scope: &[String]) -> Result<Vec<AttrEval>> {
+    let expr = build_expr(repo, commit, system, profile, scope)?;
     let output = Command::new("nix-eval-jobs")
         .args(["--meta", "--workers", "4", "--expr", &expr])
         .output()
@@ -147,39 +152,19 @@ fn run_eval(nixpkgs: &Path, system: &str, profile: &str, scope: &[String]) -> Re
     parse_jobs(&String::from_utf8_lossy(&output.stdout))
 }
 
-// --- worktrees and cache ----------------------------------------------------
+// --- cache ------------------------------------------------------------------
 
 pub fn cache_root() -> Result<PathBuf> {
     Ok(dirs::cache_dir()
         .context("could not determine cache directory")?
-        .join("npd"))
-}
-
-/// Add (or reuse) a detached worktree of `repo` at `commit` under the cache.
-fn worktree(repo: &Path, commit: &str, cache: &Path) -> Result<PathBuf> {
-    let dir = cache.join("worktrees").join(commit);
-    if dir.exists() {
-        return Ok(dir);
-    }
-    fs::create_dir_all(dir.parent().unwrap()).context("creating worktrees dir")?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "add", "--detach"])
-        .arg(&dir)
-        .arg(commit)
-        .status()
-        .context("running git worktree add")?;
-    if !status.success() {
-        bail!("git worktree add failed for {commit} in {}", repo.display());
-    }
-    Ok(dir)
+        .join("nix-npd"))
 }
 
 fn eval_cache_path(cache: &Path, commit: &str, system: &str, profile: &str) -> PathBuf {
-    cache.join("evals").join(system).join(format!(
-        "{commit}-{profile}-v{EVAL_VERSION}.json"
-    ))
+    cache
+        .join("evals")
+        .join(system)
+        .join(format!("{commit}-{profile}-v{EVAL_VERSION}.json"))
 }
 
 fn load_cached(path: &Path) -> Option<Vec<AttrEval>> {
@@ -210,7 +195,6 @@ pub fn eval_commit(
     scope: &[String],
 ) -> Result<Vec<Eval>> {
     let cache = cache_root()?;
-    let wt = worktree(repo, commit, &cache)?;
     let mut results = Vec::new();
     for system in systems {
         let path = eval_cache_path(&cache, commit, system, profile);
@@ -224,7 +208,7 @@ pub fn eval_commit(
             });
             continue;
         }
-        let attrs = run_eval(&wt, system, profile, scope)?;
+        let attrs = run_eval(repo, commit, system, profile, scope)?;
         if scope.is_empty() {
             store_cached(&path, &attrs)?;
         }
@@ -268,14 +252,14 @@ mod tests {
     }
 
     #[test]
-    fn full_expr_imports_the_set_scoped_expr_selects() {
-        let np = Path::new("/nix/store/np");
-        let full = build_expr(np, "aarch64-linux", "default", &[]).unwrap();
-        assert!(full.starts_with("import /nix/store/np {"));
+    fn full_expr_fetches_and_imports_scoped_expr_selects() {
+        let repo = Path::new("/repo");
+        let full = build_expr(repo, "abc123", "aarch64-linux", "default", &[]).unwrap();
+        assert!(full.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
         assert!(full.contains("allowBroken = true"));
 
         let scoped =
-            build_expr(np, "aarch64-linux", "default", &["python3Packages.numpy".into()]).unwrap();
+            build_expr(repo, "abc123", "aarch64-linux", "default", &["python3Packages.numpy".into()]).unwrap();
         assert!(scoped.contains(r#"attrByPath [ "python3Packages" "numpy" ]"#));
     }
 
