@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "npd"
+version = "0.0.0"
+description = "A persistent fact store for iterating on nixpkgs changes"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+npd = "npd.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["npd"]
+
+[tool.ruff]
+line-length = 100

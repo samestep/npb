@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Nix build results
+result
+result-*
+
+# Editor / OS
+.DS_Store
+*.swp
