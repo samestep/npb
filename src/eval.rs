@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -173,11 +174,15 @@ fn run_eval(
     eprint!("  evaluating {short} ({system})…");
     let _ = std::io::stderr().flush();
     let mut attrs = Vec::new();
+    // Redraw on a timer (not every N attrs) so the counter moves smoothly at any
+    // eval speed and shows the true running count, while capping stderr writes.
+    let mut last_draw = Instant::now();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
         attrs.push(raw_to_attr_eval(item.context("parsing nix-eval-jobs output")?));
-        if attrs.len() % 2000 == 0 {
+        if last_draw.elapsed() >= Duration::from_millis(100) {
             eprint!("\r  evaluating {short} ({system})… {} attrs", attrs.len());
             let _ = std::io::stderr().flush();
+            last_draw = Instant::now();
         }
     }
     eprintln!("\r  evaluated {short} ({system}): {} attrs          ", attrs.len());
