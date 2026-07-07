@@ -100,56 +100,47 @@ pub struct HydraResult {
 }
 
 /// Query Hydra about one (attr, drv, system) and produce observations to record.
+///
+/// Always records one `Cache` and one `HydraJob` observation — `Built`/`Failed`
+/// on a hit, `NotAttempted` on a miss — so the log remembers *that we probed*
+/// this drv (letting a re-run skip it). `NotAttempted` doesn't affect verdicts.
 pub fn observe(attr: &str, drv: &str, system: &str, jobset: &str, now: i64) -> HydraResult {
+    let obs = |source, outcome, build_id| Observation {
+        drv_path: drv.to_string(),
+        source,
+        outcome,
+        when: now,
+        system: Some(system.to_string()),
+        duration_s: None,
+        cached: None,
+        machine: None,
+        log_ref: None,
+        build_id,
+    };
     let mut observations = Vec::new();
 
     // Tier 1: narinfo — drv-precise "Hydra built exactly this output".
     let in_cache = store_outputs(drv).iter().any(|o| output_in_cache(o));
-    if in_cache {
-        observations.push(Observation {
-            drv_path: drv.to_string(),
-            source: Source::Cache,
-            outcome: Outcome::Built,
-            when: now,
-            system: Some(system.to_string()),
-            duration_s: None,
-            cached: Some(true),
-            machine: None,
-            log_ref: None,
-            build_id: None,
-        });
-    }
+    observations.push(obs(
+        Source::Cache,
+        if in_cache { Outcome::Built } else { Outcome::NotAttempted },
+        None,
+    ));
 
-    // Tier 2: forward job — record only if it's our exact drv (else it's drift).
+    // Tier 2: forward job — a fact only if it's our exact drv (else it's drift).
     let mut drift = false;
-    let mut job = None;
-    if let Some(js) = latest_build(jobset, attr, system)
-        && js.finished
-    {
-        if js.drvpath.as_deref() == Some(drv) {
-            let outcome = if js.succeeded {
-                Outcome::Built
-            } else {
-                Outcome::Failed
-            };
-            job = Some(format!("{outcome:?} (#{})", js.build_id.unwrap_or(0)));
-            observations.push(Observation {
-                drv_path: drv.to_string(),
-                source: Source::HydraJob,
-                outcome,
-                when: now,
-                system: Some(system.to_string()),
-                duration_s: None,
-                cached: None,
-                machine: None,
-                log_ref: None,
-                build_id: js.build_id,
-            });
-        } else {
-            drift = true;
-            job = Some("drift (different drv)".to_string());
+    let (job, hydra) = match latest_build(jobset, attr, system) {
+        Some(js) if js.finished && js.drvpath.as_deref() == Some(drv) => {
+            let outcome = if js.succeeded { Outcome::Built } else { Outcome::Failed };
+            (Some(format!("{outcome:?} (#{})", js.build_id.unwrap_or(0))), obs(Source::HydraJob, outcome, js.build_id))
         }
-    }
+        Some(js) if js.finished => {
+            drift = true;
+            (Some("drift (different drv)".to_string()), obs(Source::HydraJob, Outcome::NotAttempted, None))
+        }
+        _ => (None, obs(Source::HydraJob, Outcome::NotAttempted, None)),
+    };
+    observations.push(hydra);
 
     HydraResult {
         observations,

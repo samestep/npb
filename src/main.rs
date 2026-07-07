@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::diff::{Attribution, DiffKind};
-use crate::model::{BuildPolicy, Decision, Existence, Outcome};
+use crate::model::{BuildPolicy, Decision, Existence, Outcome, Source};
 
 #[derive(Parser)]
 #[command(name = "npd", version, about = "A persistent fact store for iterating on nixpkgs changes")]
@@ -119,6 +119,9 @@ enum Command {
         /// Hydra jobset for the forward lookup (default: `nixpkgs/trunk`).
         #[arg(long)]
         jobset: Option<String>,
+        /// Re-probe even drvs already looked up (default: skip those).
+        #[arg(long)]
+        refresh: bool,
     },
     /// Render a Markdown report classifying the changed set between two revisions.
     Report {
@@ -457,6 +460,7 @@ fn cmd_build(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_hydra(
     commit: String,
     attrs: Vec<String>,
@@ -464,6 +468,7 @@ fn cmd_hydra(
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
     jobset: Option<String>,
+    refresh: bool,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
     let commit = resolve_commit(&repo, &commit)?;
@@ -512,11 +517,23 @@ fn cmd_hydra(
     let mut store = store::Store::open(&eval::db_path()?)?;
     let now = chrono::Utc::now().timestamp();
     let mut seen = std::collections::HashSet::new();
-    let mut recorded = 0;
+    let (mut probed, mut skipped, mut recorded) = (0, 0, 0);
     for (attr, drv, system) in lookups {
         if !seen.insert((drv.clone(), system.clone())) {
-            continue; // same drv already looked up
+            continue; // same drv already looked up this run
         }
+        // Skip drvs we've already probed (the log is the query cache); --refresh forces.
+        if !refresh {
+            let prior = store.load_observations(&drv)?;
+            if prior.iter().any(|o| {
+                matches!(o.source, Source::Cache | Source::HydraJob)
+                    && o.system.as_deref() == Some(system.as_str())
+            }) {
+                skipped += 1;
+                continue;
+            }
+        }
+        probed += 1;
         let r = hydra::observe(&attr, &drv, &system, &jobset, now);
         for o in &r.observations {
             store.add_observation(o)?;
@@ -528,7 +545,7 @@ fn cmd_hydra(
             r.job.as_deref().unwrap_or("none"),
         );
     }
-    println!("recorded {recorded} observation(s)");
+    println!("probed {probed}, skipped {skipped} already-known; recorded {recorded} observation(s)");
     Ok(())
 }
 
@@ -618,7 +635,8 @@ fn main() -> Result<()> {
             nixpkgs,
             system,
             jobset,
-        } => cmd_hydra(commit, attrs, changed, nixpkgs, system, jobset),
+            refresh,
+        } => cmd_hydra(commit, attrs, changed, nixpkgs, system, jobset, refresh),
         Command::Report {
             base,
             head,
