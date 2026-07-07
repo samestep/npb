@@ -13,6 +13,7 @@ mod diff;
 mod eval;
 mod hydra;
 mod model;
+mod report;
 mod store;
 
 use std::path::PathBuf;
@@ -115,8 +116,17 @@ enum Command {
         #[arg(long)]
         jobset: Option<String>,
     },
-    /// Render a Markdown report from stored facts.
-    Report,
+    /// Render a Markdown report classifying the changed set between two revisions.
+    Report {
+        base: String,
+        head: String,
+        /// nixpkgs repo to resolve the commits in (default: `$NPD_NIXPKGS`).
+        #[arg(long)]
+        nixpkgs: Option<PathBuf>,
+        /// Systems to report on (repeatable); defaults to the host system.
+        #[arg(long)]
+        system: Vec<String>,
+    },
 }
 
 /// The host Nix system double, e.g. `aarch64-linux`.
@@ -468,6 +478,44 @@ fn cmd_hydra(
     Ok(())
 }
 
+fn cmd_report(
+    base: String,
+    head: String,
+    nixpkgs: Option<PathBuf>,
+    system: Vec<String>,
+) -> Result<()> {
+    let repo = resolve_repo(nixpkgs)?;
+    let systems = resolve_systems(system);
+    let store = store::Store::open(&eval::db_path()?)?;
+
+    let base_evals = eval::eval_commit(&repo, &base, &systems, eval::DEFAULT_PROFILE, &[])?;
+    let head_evals = eval::eval_commit(&repo, &head, &systems, eval::DEFAULT_PROFILE, &[])?;
+
+    let mut per_system = Vec::new();
+    for sys in &systems {
+        let b = attrs_for(&base_evals, sys);
+        let h = attrs_for(&head_evals, sys);
+        let mut rows = Vec::new();
+        for e in diff::diff_evals(&b, &h, None) {
+            if e.kind == DiffKind::Unchanged {
+                continue; // report only the changed set
+            }
+            let base_obs = match &e.base_drv {
+                Some(d) => store.load_observations(d)?,
+                None => Vec::new(),
+            };
+            let head_obs = match &e.head_drv {
+                Some(d) => store.load_observations(d)?,
+                None => Vec::new(),
+            };
+            rows.push(report::row_for(&e, &base_obs, &head_obs));
+        }
+        per_system.push((sys.clone(), rows));
+    }
+    print!("{}", report::render(&base, &head, &per_system));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Eval {
@@ -514,6 +562,11 @@ fn main() -> Result<()> {
             system,
             jobset,
         } => cmd_hydra(commit, attrs, nixpkgs, system, jobset),
-        Command::Report => bail!("npd report: not implemented yet (see DESIGN.md build order)"),
+        Command::Report {
+            base,
+            head,
+            nixpkgs,
+            system,
+        } => cmd_report(base, head, nixpkgs, system),
     }
 }
