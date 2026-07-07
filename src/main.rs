@@ -102,10 +102,14 @@ enum Command {
     },
     /// Fetch facts from Hydra on demand and record them as observations.
     Hydra {
-        /// Git commit / revision to evaluate the attrs at.
+        /// Git commit / revision to evaluate the attrs at (the "head" for --changed).
         commit: String,
-        /// Attribute paths to look up (dotted). Required.
+        /// Attribute paths to look up (dotted). Provide these or --changed.
         attrs: Vec<String>,
+        /// Look up the changed set between <base> and <commit> — both sides — so
+        /// a `report base commit` gets its base and head verdicts populated.
+        #[arg(long, value_name = "base")]
+        changed: Option<String>,
         /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
@@ -456,41 +460,73 @@ fn cmd_build(
 fn cmd_hydra(
     commit: String,
     attrs: Vec<String>,
+    changed: Option<String>,
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
     jobset: Option<String>,
 ) -> Result<()> {
-    if attrs.is_empty() {
-        bail!("npd hydra: pass one or more attrs to look up");
-    }
     let repo = resolve_repo(nixpkgs)?;
     let commit = resolve_commit(&repo, &commit)?;
     let systems = resolve_systems(system);
     let jobset = jobset.unwrap_or_else(|| hydra::DEFAULT_JOBSET.to_string());
-    let mut store = store::Store::open(&eval::db_path()?)?;
 
-    let evals = eval::eval_commit(&repo, &commit, &systems, eval::DEFAULT_PROFILE, &attrs)?;
-    let now = chrono::Utc::now().timestamp();
-    let mut recorded = 0;
-    for e in &evals {
-        for a in &e.attrs {
-            let Some(drv) = &a.drv_path else {
-                println!("  {} {}: no drv (eval error)", e.system, a.attr);
-                continue;
-            };
-            let r = hydra::observe(&a.attr, drv, &e.system, &jobset, now);
-            for o in &r.observations {
-                store.add_observation(o)?;
-                recorded += 1;
+    // The (attr, drv, system) triples to look up.
+    let mut lookups: Vec<(String, String, String)> = Vec::new();
+    match (&changed, attrs.is_empty()) {
+        (Some(_), false) => bail!("npd hydra: pass either attrs or --changed <base>, not both"),
+        (Some(base), true) => {
+            let base = resolve_commit(&repo, base)?;
+            let base_evals = eval::eval_commit(&repo, &base, &systems, eval::DEFAULT_PROFILE, &[])?;
+            let head_evals =
+                eval::eval_commit(&repo, &commit, &systems, eval::DEFAULT_PROFILE, &[])?;
+            for sys in &systems {
+                let b = attrs_for(&base_evals, sys);
+                let h = attrs_for(&head_evals, sys);
+                for e in diff::diff_evals(&b, &h, None) {
+                    if e.kind == DiffKind::Unchanged {
+                        continue;
+                    }
+                    // Both sides, so `report` gets base and head verdicts.
+                    if let Some(d) = e.base_drv {
+                        lookups.push((e.attr.clone(), d, sys.clone()));
+                    }
+                    if let Some(d) = e.head_drv {
+                        lookups.push((e.attr, d, sys.clone()));
+                    }
+                }
             }
-            println!(
-                "  {} {}: cache={} job={}",
-                e.system,
-                a.attr,
-                if r.in_cache { "hit" } else { "miss" },
-                r.job.as_deref().unwrap_or("none"),
-            );
         }
+        (None, false) => {
+            let evals = eval::eval_commit(&repo, &commit, &systems, eval::DEFAULT_PROFILE, &attrs)?;
+            for e in &evals {
+                for a in &e.attrs {
+                    if let Some(d) = &a.drv_path {
+                        lookups.push((a.attr.clone(), d.clone(), e.system.clone()));
+                    }
+                }
+            }
+        }
+        (None, true) => bail!("npd hydra: pass one or more attrs, or --changed <base>"),
+    }
+
+    let mut store = store::Store::open(&eval::db_path()?)?;
+    let now = chrono::Utc::now().timestamp();
+    let mut seen = std::collections::HashSet::new();
+    let mut recorded = 0;
+    for (attr, drv, system) in lookups {
+        if !seen.insert((drv.clone(), system.clone())) {
+            continue; // same drv already looked up
+        }
+        let r = hydra::observe(&attr, &drv, &system, &jobset, now);
+        for o in &r.observations {
+            store.add_observation(o)?;
+            recorded += 1;
+        }
+        println!(
+            "  {system} {attr}: cache={} job={}",
+            if r.in_cache { "hit" } else { "miss" },
+            r.job.as_deref().unwrap_or("none"),
+        );
     }
     println!("recorded {recorded} observation(s)");
     Ok(())
@@ -578,10 +614,11 @@ fn main() -> Result<()> {
         Command::Hydra {
             commit,
             attrs,
+            changed,
             nixpkgs,
             system,
             jobset,
-        } => cmd_hydra(commit, attrs, nixpkgs, system, jobset),
+        } => cmd_hydra(commit, attrs, changed, nixpkgs, system, jobset),
         Command::Report {
             base,
             head,
