@@ -29,6 +29,7 @@
         runtimeDeps = [
           pkgs.nix
           pkgs.nix-eval-jobs
+          pkgs.nix-output-monitor # `nom`, the build front-end
           pkgs.git
           pkgs.nettools # `hostname`
         ];
@@ -56,6 +57,7 @@
             pkgs.rust-bin.stable.latest.default
             pkgs.nix
             pkgs.nix-eval-jobs
+            pkgs.nix-output-monitor
             pkgs.sqlite # for poking at the store during development
           ];
         };

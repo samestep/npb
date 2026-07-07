@@ -55,20 +55,20 @@ fn hostname() -> String {
 }
 
 /// Realise `drv` (all outputs), rooting the result under the cache's gcroots so
-/// it survives GC. `nix build`'s output is inherited so the user sees its native
-/// progress; the full build log stays retrievable via `nix log <drv>`. Returns
-/// whether it succeeded and how long it took.
+/// it survives GC. Uses `nom` (nix-output-monitor, a `nix build` drop-in) so the
+/// user gets its live build tree; output is inherited and the full build log
+/// stays retrievable via `nix log <drv>`. Returns success and elapsed time.
 fn run_build(drv: &str, cache: &Path) -> Result<(bool, f64)> {
     let gcroot = cache.join("gcroots").join(store_hash(drv));
     fs::create_dir_all(gcroot.parent().unwrap()).context("creating gcroots dir")?;
 
     let start = Instant::now();
-    let status = Command::new("nix")
+    let status = Command::new("nom")
         .args(["build", &format!("{drv}^*"), "--out-link"])
         .arg(&gcroot)
         .args(["--extra-experimental-features", "nix-command"])
         .status()
-        .context("running nix build")?;
+        .context("running nom build (nix-output-monitor)")?;
     Ok((status.success(), start.elapsed().as_secs_f64()))
 }
 
