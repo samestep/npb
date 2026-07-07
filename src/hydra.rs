@@ -41,6 +41,13 @@ fn store_outputs(drv: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Is any of `drv`'s outputs in the binary cache — i.e. substitutable without a
+/// local build? Used by the build driver to avoid "building" (really fetching)
+/// a cached path and mislabelling it as a local build.
+pub fn in_cache(drv: &str) -> bool {
+    store_outputs(drv).iter().any(|o| output_in_cache(o))
+}
+
 /// Is this exact output path in the binary cache? (narinfo HEAD -> 2xx.)
 fn output_in_cache(out_path: &str) -> bool {
     let Some(hash) = store_hash(out_path) else {

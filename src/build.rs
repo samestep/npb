@@ -15,6 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::eval;
+use crate::hydra;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
@@ -58,17 +59,22 @@ fn hostname() -> String {
 /// it survives GC. Uses `nom` (nix-output-monitor, a `nix build` drop-in) so the
 /// user gets its live build tree; output is inherited and the full build log
 /// stays retrievable via `nix log <drv>`. Returns success and elapsed time.
-fn run_build(drv: &str, cache: &Path) -> Result<(bool, f64)> {
+fn run_build(drv: &str, cache: &Path, force: bool) -> Result<(bool, f64)> {
     let gcroot = cache.join("gcroots").join(store_hash(drv));
     fs::create_dir_all(gcroot.parent().unwrap()).context("creating gcroots dir")?;
 
-    let start = Instant::now();
-    let status = Command::new("nom")
-        .args(["build", &format!("{drv}^*"), "--out-link"])
+    let installable = format!("{drv}^*");
+    let mut cmd = Command::new("nom");
+    cmd.args(["build", &installable, "--out-link"])
         .arg(&gcroot)
-        .args(["--extra-experimental-features", "nix-command"])
-        .status()
-        .context("running nom build (nix-output-monitor)")?;
+        .args(["--extra-experimental-features", "nix-command"]);
+    if force {
+        // --recheck / --prefer-local: build from source even if the output is
+        // already valid or substitutable, so the result is a genuine local build.
+        cmd.arg("--rebuild");
+    }
+    let start = Instant::now();
+    let status = cmd.status().context("running nom build (nix-output-monitor)")?;
     Ok((status.success(), start.elapsed().as_secs_f64()))
 }
 
@@ -84,22 +90,23 @@ pub fn build_targets(
     let cache = eval::cache_root()?;
     let host = hostname();
 
+    // --recheck / --prefer-local force a genuine local build; otherwise a
+    // cached (substitutable) output means we needn't build at all.
+    let force = policy.recheck || policy.prefer_local;
     let n = targets.len();
     let mut results = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = store.load_observations(&t.drv_path)?;
-        // `substitutable` is left false for now: on a drv's first encounter we
-        // let `nix build` no-op if the output is already valid. The observation
-        // log skips it thereafter. (A batch validity/narinfo pre-check to skip
-        // even the first nix invocation is a later optimization.)
-        let decision = policy.decide(&observations, false);
+        // Only probe the cache when it could change the decision (not when forcing).
+        let substitutable = !force && hydra::in_cache(&t.drv_path);
+        let decision = policy.decide(&observations, substitutable);
         let progress = format!("[{}/{n}] {} {}", i + 1, t.system, t.attr);
         let outcome = match decision {
             Decision::Build if !dry_run => {
-                // Header before nix build inherits the terminal for its progress.
+                // Header before nom build inherits the terminal for its progress.
                 println!("{progress}: building…");
                 let now = chrono::Utc::now().timestamp();
-                let (ok, secs) = run_build(&t.drv_path, &cache)?;
+                let (ok, secs) = run_build(&t.drv_path, &cache, force)?;
                 let outcome = if ok { Outcome::Built } else { Outcome::Failed };
                 store.add_observation(&Observation {
                     drv_path: t.drv_path.clone(),
@@ -124,7 +131,33 @@ pub fn build_targets(
                 None
             }
             Decision::SkipOk => {
-                println!("{progress}: skip (known ok)");
+                let has_local_built = observations
+                    .iter()
+                    .any(|o| o.source == Source::Local && o.outcome == Outcome::Built);
+                if substitutable && !has_local_built {
+                    // It's in the cache, not built here — record that as a Cache
+                    // fact (deduped) so the report shows `C`, never a bogus `L`.
+                    let known_cache = observations
+                        .iter()
+                        .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
+                    if !known_cache {
+                        store.add_observation(&Observation {
+                            drv_path: t.drv_path.clone(),
+                            source: Source::Cache,
+                            outcome: Outcome::Built,
+                            when: chrono::Utc::now().timestamp(),
+                            system: Some(t.system.clone()),
+                            duration_s: None,
+                            cached: Some(true),
+                            machine: None,
+                            log_ref: None,
+                            build_id: None,
+                        })?;
+                    }
+                    println!("{progress}: skip (in binary cache)");
+                } else {
+                    println!("{progress}: skip (known ok)");
+                }
                 None
             }
             Decision::SkipFail => {
