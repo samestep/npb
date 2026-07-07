@@ -11,6 +11,7 @@
 mod diff;
 mod eval;
 mod model;
+mod store;
 
 use std::path::PathBuf;
 use std::process::Command as Proc;

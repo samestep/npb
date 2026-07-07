@@ -75,7 +75,7 @@ facts under one log.
 ## 4. Storage
 
 Everything `npd` stores is re-derivable, so it lives under
-`dirs::cache_dir()/npd` (i.e. `~/.cache/npd`), like `npc`. The gcroots below are
+`dirs::cache_dir()/nix-npd` (i.e. `~/.cache/nix-npd`), like `npc`. The gcroots below are
 the one thing that must survive Nix GC while it exists, but the *records* are all
 cache: losing them costs re-evaluation / re-building, not correctness.
 
@@ -85,29 +85,26 @@ or job name, an output hash, a drvpath — and **the eval fact is itself the joi
 between the drvpath world and Hydra's name-/output-keyed world (given an eval,
 `attr ⇄ drv ⇄ outputs ⇄ job`). So per-key access is direct regardless of backend.
 
-**Recommended backend: SQLite** (one file) for the observation log and eval
-maps, **files** for the two things that are naturally large blobs — build logs,
-and (optionally) the raw attr→drv eval dumps. Reasons SQLite wins over a pile of
-small JSON files here:
+**Backend: SQLite** (`npd.sqlite`, one file) for both eval maps and the
+observation log; **files** only for build logs (naturally large blobs). Schema
+lives in `src/store.rs`. Why SQLite over a pile of JSON files (a full-set eval
+is ~114k rows / ~27 MB of JSON, ~85% redundant — it compresses ~6.5×):
 
-- the observation log is genuinely relational and long-lived; indexes give
-  O(log n) lookup by `drvpath` / output hash / `(job, system)` with no manual
-  index files;
+- indexes give O(log n) lookup by `drvpath` / output hash / `(job, system)` with
+  no manual index files, and a normalized table captures that redundancy natively;
 - it avoids the millions-of-tiny-files failure mode (inode pressure, slow
   `readdir`, directory sharding) that a fact-per-file scheme hits over time;
 - transactional appends avoid torn writes;
-- the two-way / three-way eval diff and the cross-cutting queries ("everything
-  that fails locally but is green on Hydra", "all flaky drvs") are one SQL query
-  instead of a directory scan.
+- the two-way / three-way eval diff and cross-cutting queries ("everything that
+  fails locally but is green on Hydra", "all flaky drvs") are one SQL query
+  rather than loading and parsing multiple 27 MB blobs.
 
-Trade-off worth naming: `npc` uses plain files, so there is a consistency
-argument for files here too, and files are trivially inspectable / need no
-dependency. This is the **one open backend decision** (§10); the schema is not
-written until it's settled.
+`existence` is not persisted — it is recomputed from `drv_path` + the meta flags
+on load, so there is one source of truth for that mapping.
 
 ```
-~/.cache/npd/
-  npd.sqlite                    # evals + observation log (recommended)
+~/.cache/nix-npd/
+  npd.sqlite                    # evals + observation log
   logs/<drv-hash>/<obs-id>.log  # build logs referenced by observations
   gcroots/<drv-hash>-<output>   # nix gcroots for outputs we choose to keep
 ```
@@ -130,7 +127,7 @@ over that log plus substituter presence:
 So the cache-bypass knobs are just fields on the policy: `recheck` (rebuild a
 suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
 (don't trust a substituted/Hydra success — build it here). See
-`BuildPolicy.decide` in `npd/model.py`.
+`BuildPolicy::decide` in `src/model.rs`.
 
 ## 6. Evaluation, its cache key, and the three-way diff
 
@@ -215,10 +212,6 @@ root.
 
 ## 10. Open questions
 
-- **Storage backend (the one live decision):** SQLite (recommended, §4) vs. plain
-  files (consistent with `npc`, no dependency). Deferred until we build the
-  observation store; the eval cache is file-blobs either way, so it doesn't block
-  the eval spine.
 - The report classifier's eventual home (§8) — revisit when we get to reports.
 
 Resolved earlier and recorded for context:
@@ -231,4 +224,4 @@ Resolved earlier and recorded for context:
 - *Hydra facts lifetime* → append-only observations, no eviction/TTL. Fetching is
   manual for now and there is no freshness threshold, since a Hydra observation
   records the drvpath so staleness can't affect correctness (§3).
-- *Storage location* → `dirs::cache_dir()/npd`; it's all re-derivable cache (§4).
+- *Storage* → SQLite (`npd.sqlite`) under `dirs::cache_dir()/nix-npd`; all re-derivable cache (§4).

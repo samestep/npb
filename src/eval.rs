@@ -1,21 +1,24 @@
 //! Evaluate a nixpkgs revision into an `attr -> drv` map via `nix-eval-jobs`,
-//! cached on disk. This is the first spine primitive (DESIGN.md §6, §9): a pure
-//! fact keyed by `(commit, system, profile)`, so it is computed at most once.
+//! cached in the SQLite store. This is the first spine primitive (DESIGN.md §6,
+//! §9): a pure fact keyed by `(commit, system, profile)`, computed at most once.
 //!
 //! The revision's source comes from `builtins.fetchGit`, so Nix fetches and
-//! caches it in the store — npd manages no worktrees of its own.
+//! caches it in the store — npd manages no worktrees. `nix-eval-jobs` output is
+//! parsed by streaming NDJSON straight off the child's stdout (never buffering
+//! the whole, meta-heavy output).
 
-use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::model::{AttrEval, Existence};
+use crate::store::Store;
 
 /// Bumped if we change *how* we invoke `nix-eval-jobs` in a way that could alter
-/// the attr->drv map; old cache entries under a different version are ignored.
+/// the attr->drv map; cache entries under a different version are ignored.
 pub const EVAL_VERSION: u32 = 1;
 
 /// The default (and, for now, only) eval profile. npd owns the config so the key
@@ -91,14 +94,12 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     }
 }
 
-fn parse_jobs(stdout: &str) -> Result<Vec<AttrEval>> {
+/// Stream NDJSON values off `reader`, mapping each to an `AttrEval`. Memory stays
+/// bounded to one value at a time rather than the whole (meta-heavy) output.
+fn parse_jobs<R: std::io::Read>(reader: R) -> Result<Vec<AttrEval>> {
     let mut out = Vec::new();
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let raw: RawJob = serde_json::from_str(line)
-            .with_context(|| format!("parsing nix-eval-jobs output line: {line}"))?;
+    for item in serde_json::Deserializer::from_reader(reader).into_iter::<RawJob>() {
+        let raw = item.context("parsing nix-eval-jobs output")?;
         out.push(raw_to_attr_eval(raw));
     }
     Ok(out)
@@ -109,7 +110,13 @@ fn parse_jobs(stdout: &str) -> Result<Vec<AttrEval>> {
 /// Build the Nix expression `nix-eval-jobs` walks. The revision's source is
 /// fetched by `builtins.fetchGit`. With no `scope` it is the whole package set;
 /// with a scope it is just those (dotted) attrs.
-fn build_expr(repo: &Path, commit: &str, system: &str, profile: &str, scope: &[String]) -> Result<String> {
+fn build_expr(
+    repo: &Path,
+    commit: &str,
+    system: &str,
+    profile: &str,
+    scope: &[String],
+) -> Result<String> {
     let cfg = profile_config(profile)?;
     let base = format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{commit}\"; }}) \
@@ -134,22 +141,32 @@ fn build_expr(repo: &Path, commit: &str, system: &str, profile: &str, scope: &[S
     Ok(format!("let pkgs = {base}; in {{ {entries} }}"))
 }
 
-fn run_eval(repo: &Path, commit: &str, system: &str, profile: &str, scope: &[String]) -> Result<Vec<AttrEval>> {
+fn run_eval(
+    repo: &Path,
+    commit: &str,
+    system: &str,
+    profile: &str,
+    scope: &[String],
+) -> Result<Vec<AttrEval>> {
     let expr = build_expr(repo, commit, system, profile, scope)?;
-    let output = Command::new("nix-eval-jobs")
+    // stderr is inherited (progress shows through, and — importantly — we don't
+    // have to drain a stderr pipe while reading stdout, which would deadlock).
+    let mut child = Command::new("nix-eval-jobs")
         .args(["--meta", "--workers", "4", "--expr", &expr])
-        .output()
-        .context("running nix-eval-jobs (is it on PATH? use the flake dev shell)")?;
-    // nix-eval-jobs exits non-zero if any attr errors but still emits JSON for
-    // the rest, so parse stdout regardless; only bail if it gave us nothing.
-    if !output.status.success() && output.stdout.is_empty() {
-        bail!(
-            "nix-eval-jobs failed ({}):\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let attrs = parse_jobs(BufReader::new(stdout))?;
+    let status = child.wait().context("waiting for nix-eval-jobs")?;
+    // nix-eval-jobs exits non-zero if *any* attr errored but still emits the
+    // rest, so a non-zero status with parsed attrs is normal (a full nixpkgs
+    // eval always has some). Only fail if it produced nothing at all.
+    if !status.success() && attrs.is_empty() {
+        bail!("nix-eval-jobs failed ({status}) and produced no output (see stderr above)");
     }
-    parse_jobs(&String::from_utf8_lossy(&output.stdout))
+    Ok(attrs)
 }
 
 // --- cache ------------------------------------------------------------------
@@ -160,22 +177,8 @@ pub fn cache_root() -> Result<PathBuf> {
         .join("nix-npd"))
 }
 
-fn eval_cache_path(cache: &Path, commit: &str, system: &str, profile: &str) -> PathBuf {
-    cache
-        .join("evals")
-        .join(system)
-        .join(format!("{commit}-{profile}-v{EVAL_VERSION}.json"))
-}
-
-fn load_cached(path: &Path) -> Option<Vec<AttrEval>> {
-    let data = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-fn store_cached(path: &Path, attrs: &[AttrEval]) -> Result<()> {
-    fs::create_dir_all(path.parent().unwrap()).context("creating evals dir")?;
-    fs::write(path, serde_json::to_string(attrs)?).context("writing eval cache")?;
-    Ok(())
+pub fn db_path() -> Result<PathBuf> {
+    Ok(cache_root()?.join("npd.sqlite"))
 }
 
 /// A completed evaluation and where its result came from.
@@ -186,7 +189,7 @@ pub struct Eval {
 }
 
 /// Evaluate `commit` for each `system`. Full-set evals (`scope` empty) are
-/// cached read-through; scoped evals are ad-hoc and always run fresh.
+/// cached read-through in SQLite; scoped evals are ad-hoc and always run fresh.
 pub fn eval_commit(
     repo: &Path,
     commit: &str,
@@ -194,12 +197,12 @@ pub fn eval_commit(
     profile: &str,
     scope: &[String],
 ) -> Result<Vec<Eval>> {
-    let cache = cache_root()?;
+    let mut store = Store::open(&db_path()?)?;
+    let now = chrono::Utc::now().timestamp();
     let mut results = Vec::new();
     for system in systems {
-        let path = eval_cache_path(&cache, commit, system, profile);
         if scope.is_empty()
-            && let Some(attrs) = load_cached(&path)
+            && let Some(attrs) = store.load_eval(commit, system, profile, EVAL_VERSION)?
         {
             results.push(Eval {
                 system: system.clone(),
@@ -210,7 +213,7 @@ pub fn eval_commit(
         }
         let attrs = run_eval(repo, commit, system, profile, scope)?;
         if scope.is_empty() {
-            store_cached(&path, &attrs)?;
+            store.store_eval(commit, system, profile, EVAL_VERSION, now, &attrs)?;
         }
         results.push(Eval {
             system: system.clone(),
@@ -235,7 +238,7 @@ mod tests {
             r#"{"attr":"bad","attrPath":["bad"],"error":"boom","fatal":false}"#,
             "\n",
         );
-        let attrs = parse_jobs(stdout).unwrap();
+        let attrs = parse_jobs(stdout.as_bytes()).unwrap();
         assert_eq!(attrs.len(), 3);
 
         assert_eq!(attrs[0].attr, "hello");
@@ -259,26 +262,8 @@ mod tests {
         assert!(full.contains("allowBroken = true"));
 
         let scoped =
-            build_expr(repo, "abc123", "aarch64-linux", "default", &["python3Packages.numpy".into()]).unwrap();
+            build_expr(repo, "abc123", "aarch64-linux", "default", &["python3Packages.numpy".into()])
+                .unwrap();
         assert!(scoped.contains(r#"attrByPath [ "python3Packages" "numpy" ]"#));
-    }
-
-    #[test]
-    fn cache_round_trips() {
-        let dir = std::env::temp_dir().join(format!("npd-eval-test-{}", std::process::id()));
-        let path = dir.join("e.json");
-        let attrs = vec![AttrEval {
-            attr: "hello".into(),
-            existence: Existence::Buildable,
-            drv_path: Some("/nix/store/a.drv".into()),
-            broken: Some(false),
-            unsupported: None,
-            insecure: None,
-            hydra_platforms_ok: None,
-            error: None,
-        }];
-        store_cached(&path, &attrs).unwrap();
-        assert_eq!(load_cached(&path).unwrap(), attrs);
-        let _ = fs::remove_dir_all(&dir);
     }
 }
