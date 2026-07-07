@@ -8,6 +8,7 @@
 // consume them (see DESIGN.md build order). Drop this once build/report land.
 #![allow(dead_code)]
 
+mod build;
 mod diff;
 mod eval;
 mod model;
@@ -20,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::diff::{Attribution, DiffKind};
-use crate::model::Existence;
+use crate::model::{BuildPolicy, Decision, Existence, Outcome};
 
 #[derive(Parser)]
 #[command(name = "npd", version, about = "A persistent fact store for iterating on nixpkgs changes")]
@@ -69,11 +70,24 @@ enum Command {
     },
     /// Build derivations, consulting (and appending to) the observation log.
     Build {
+        /// Git commit / revision to evaluate the attrs at.
+        commit: String,
+        /// Attribute paths to build (dotted). Required — building the whole
+        /// package set is almost never intended.
         attrs: Vec<String>,
+        /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
+        #[arg(long)]
+        nixpkgs: Option<PathBuf>,
+        /// Systems to build for (repeatable); defaults to the host system.
+        #[arg(long)]
+        system: Vec<String>,
+        /// Rebuild even a previously-succeeded drv (suspect a flaky success).
         #[arg(long)]
         recheck: bool,
+        /// Re-attempt a previously-failed drv (expect it might pass now).
         #[arg(long)]
         retry: bool,
+        /// Ignore Cache/Hydra success; require a genuine local build.
         #[arg(long)]
         prefer_local: bool,
     },
@@ -267,6 +281,62 @@ fn cmd_diff(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmd_build(
+    commit: String,
+    attrs: Vec<String>,
+    nixpkgs: Option<PathBuf>,
+    system: Vec<String>,
+    recheck: bool,
+    retry: bool,
+    prefer_local: bool,
+) -> Result<()> {
+    if attrs.is_empty() {
+        bail!(
+            "npd build: pass one or more attrs \
+             (building the whole package set is almost never intended)"
+        );
+    }
+    let repo = resolve_repo(nixpkgs)?;
+    let systems = resolve_systems(system);
+    let policy = BuildPolicy {
+        recheck,
+        retry,
+        prefer_local,
+    };
+
+    let built = build::build_commit(&repo, &commit, &systems, &attrs, policy)?;
+
+    let (mut ok, mut failed, mut skip_ok, mut skip_fail) = (0, 0, 0, 0);
+    for r in &built {
+        let label = match (r.decision, r.outcome) {
+            (Decision::Build, Some(Outcome::Built)) => {
+                ok += 1;
+                "built"
+            }
+            (Decision::Build, Some(Outcome::Failed)) => {
+                failed += 1;
+                "FAILED"
+            }
+            (Decision::SkipOk, _) => {
+                skip_ok += 1;
+                "skip (known ok)"
+            }
+            (Decision::SkipFail, _) => {
+                skip_fail += 1;
+                "skip (known failure)"
+            }
+            _ => "?",
+        };
+        println!("  {label:<20} {}  {}", r.system, r.attr);
+    }
+    println!("built={ok} failed={failed} skipped-ok={skip_ok} skipped-fail={skip_fail}");
+    if failed > 0 {
+        bail!("{failed} build(s) failed");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Eval {
@@ -285,7 +355,15 @@ fn main() -> Result<()> {
             system,
             profile,
         } => cmd_diff(base, head, attrs, three_way, nixpkgs, system, profile),
-        Command::Build { .. } => bail!("npd build: not implemented yet (see DESIGN.md build order)"),
+        Command::Build {
+            commit,
+            attrs,
+            nixpkgs,
+            system,
+            recheck,
+            retry,
+            prefer_local,
+        } => cmd_build(commit, attrs, nixpkgs, system, recheck, retry, prefer_local),
         Command::Hydra { .. } => bail!("npd hydra: not implemented yet (see DESIGN.md build order)"),
         Command::Report => bail!("npd report: not implemented yet (see DESIGN.md build order)"),
     }

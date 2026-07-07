@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::{AttrEval, Existence};
+use crate::model::{AttrEval, Existence, Observation, Outcome, Source};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS eval_run (
@@ -53,6 +53,42 @@ CREATE TABLE IF NOT EXISTS observation (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 ";
+
+fn source_str(s: Source) -> &'static str {
+    match s {
+        Source::Local => "local",
+        Source::HydraJob => "hydra-job",
+        Source::Cache => "cache",
+    }
+}
+
+fn source_from(s: &str) -> Result<Source> {
+    Ok(match s {
+        "local" => Source::Local,
+        "hydra-job" => Source::HydraJob,
+        "cache" => Source::Cache,
+        other => anyhow::bail!("unknown observation source in store: {other:?}"),
+    })
+}
+
+fn outcome_str(o: Outcome) -> &'static str {
+    match o {
+        Outcome::Built => "built",
+        Outcome::Failed => "failed",
+        Outcome::DepFailed => "dep-failed",
+        Outcome::NotAttempted => "not-attempted",
+    }
+}
+
+fn outcome_from(s: &str) -> Result<Outcome> {
+    Ok(match s {
+        "built" => Outcome::Built,
+        "failed" => Outcome::Failed,
+        "dep-failed" => Outcome::DepFailed,
+        "not-attempted" => Outcome::NotAttempted,
+        other => anyhow::bail!("unknown observation outcome in store: {other:?}"),
+    })
+}
 
 fn recompute_existence(a: &AttrEval) -> Existence {
     if a.drv_path.is_some() {
@@ -181,6 +217,67 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Append one observation to the log (never overwrites; DESIGN.md §3).
+    pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO observation \
+             (drv_path, source, outcome, when_, system, duration_s, cached, machine, log_ref, build_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                o.drv_path,
+                source_str(o.source),
+                outcome_str(o.outcome),
+                o.when,
+                o.system,
+                o.duration_s,
+                o.cached,
+                o.machine,
+                o.log_ref,
+                o.build_id.map(|b| b as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All observations for a derivation, oldest first.
+    pub fn load_observations(&self, drv_path: &str) -> Result<Vec<Observation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, outcome, when_, system, duration_s, cached, machine, log_ref, build_id \
+             FROM observation WHERE drv_path = ?1 ORDER BY when_, id",
+        )?;
+        let rows = stmt.query_map(params![drv_path], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, Option<bool>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, outcome, when, system, duration_s, cached, machine, log_ref, build_id) =
+                row?;
+            out.push(Observation {
+                drv_path: drv_path.to_string(),
+                source: source_from(&source)?,
+                outcome: outcome_from(&outcome)?,
+                when,
+                system,
+                duration_s,
+                cached,
+                machine,
+                log_ref,
+                build_id: build_id.map(|b| b as u64),
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +324,41 @@ mod tests {
         // a different key is still absent; wrong version misses
         assert!(s.load_eval("c2", "aarch64-linux", "default", 1).unwrap().is_none());
         assert!(s.load_eval("c1", "aarch64-linux", "default", 2).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observations_append_and_load() {
+        let dir = std::env::temp_dir().join(format!("npd-obs-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+
+        assert!(s.load_observations("/nix/store/x.drv").unwrap().is_empty());
+
+        let mk = |outcome, when| Observation {
+            drv_path: "/nix/store/x.drv".into(),
+            source: Source::Local,
+            outcome,
+            when,
+            system: Some("aarch64-linux".into()),
+            duration_s: Some(1.5),
+            cached: None,
+            machine: Some("host".into()),
+            log_ref: Some("logs/x/build.log".into()),
+            build_id: None,
+        };
+        s.add_observation(&mk(Outcome::Failed, 100)).unwrap();
+        s.add_observation(&mk(Outcome::Built, 200)).unwrap();
+
+        let got = s.load_observations("/nix/store/x.drv").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].outcome, Outcome::Failed); // oldest first
+        assert_eq!(got[1].outcome, Outcome::Built);
+        assert_eq!(got[1].source, Source::Local);
+        assert_eq!(got[1].duration_s, Some(1.5));
+        // a different drv is independent
+        assert!(s.load_observations("/nix/store/y.drv").unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
