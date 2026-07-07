@@ -170,6 +170,22 @@ fn git_merge_base(repo: &std::path::Path, base: &str, head: &str) -> Result<Stri
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
+/// Resolve a revision (ref, short/full sha, tag, `HEAD~1`, …) to a full commit
+/// sha, so callers can use friendly names even though `fetchGit` needs a rev.
+fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
+    let out = Proc::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .context("running git rev-parse")?;
+    if !out.status.success() {
+        bail!("cannot resolve revision {rev:?} in {}", repo.display());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
 /// Short, human-scannable form of a drv path: its store hash prefix.
 fn short_drv(drv: &Option<String>) -> String {
     match drv {
@@ -200,6 +216,7 @@ fn cmd_eval(
     profile: Option<String>,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
+    let commit = resolve_commit(&repo, &commit)?;
     let systems = resolve_systems(system);
     let profile = profile.unwrap_or_else(|| eval::DEFAULT_PROFILE.to_string());
 
@@ -243,6 +260,8 @@ fn cmd_diff(
     profile: Option<String>,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
+    let base = resolve_commit(&repo, &base)?;
+    let head = resolve_commit(&repo, &head)?;
     let systems = resolve_systems(system);
     let profile = profile.unwrap_or_else(|| eval::DEFAULT_PROFILE.to_string());
 
@@ -379,6 +398,7 @@ fn cmd_build(
     prefer_local: bool,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
+    let commit = resolve_commit(&repo, &commit)?;
     let systems = resolve_systems(system);
     let policy = BuildPolicy {
         recheck,
@@ -388,7 +408,10 @@ fn cmd_build(
 
     let targets = match (&changed, attrs.is_empty()) {
         (Some(_), false) => bail!("npd build: pass either attrs or --changed <base>, not both"),
-        (Some(base), true) => targets_from_diff(&repo, base, &commit, &systems)?,
+        (Some(base), true) => {
+            let base = resolve_commit(&repo, base)?;
+            targets_from_diff(&repo, &base, &commit, &systems)?
+        }
         (None, false) => targets_from_attrs(&repo, &commit, &systems, &attrs)?,
         (None, true) => bail!(
             "npd build: pass one or more attrs, or --changed <base> \
@@ -447,6 +470,7 @@ fn cmd_hydra(
         bail!("npd hydra: pass one or more attrs to look up");
     }
     let repo = resolve_repo(nixpkgs)?;
+    let commit = resolve_commit(&repo, &commit)?;
     let systems = resolve_systems(system);
     let jobset = jobset.unwrap_or_else(|| hydra::DEFAULT_JOBSET.to_string());
     let mut store = store::Store::open(&eval::db_path()?)?;
@@ -485,6 +509,8 @@ fn cmd_report(
     system: Vec<String>,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
+    let base = resolve_commit(&repo, &base)?;
+    let head = resolve_commit(&repo, &head)?;
     let systems = resolve_systems(system);
     let store = store::Store::open(&eval::db_path()?)?;
 
