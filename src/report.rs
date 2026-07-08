@@ -1,7 +1,7 @@
 //! Render a Markdown report of a change (base -> head): for each attr in the
 //! changed set, derive a *base* and *head* build verdict from the observation
 //! log, classify the delta, and group. Read-only over stored facts (DESIGN.md
-//! §8) — run `npd build` / `npd hydra` first to populate the verdicts.
+//! §8); `npd report` populates those facts itself by building first.
 
 use crate::diff::{DiffEntry, DiffKind};
 use crate::model::{Observation, Outcome, Source};
@@ -11,11 +11,15 @@ use crate::model::{Observation, Outcome, Source};
 pub enum Verdict {
     Built,
     Failed,
+    /// The attr has a derivation on this side but we have no build fact for it.
     Unknown,
+    /// The attr does not exist on this side (no derivation) — a *known* fact,
+    /// not an unknown: rendered as `—`, never `?`.
+    Absent,
 }
 
-/// A verdict plus the source that decided it (`L`ocal / `H`ydra job / `C`ache)
-/// and whether local observations disagree (flaky).
+/// A verdict plus the source that decided it (`L`ocal build / `C`ache) and
+/// whether local observations disagree (flaky).
 #[derive(Clone, Copy)]
 pub struct Side {
     pub verdict: Verdict,
@@ -24,7 +28,7 @@ pub struct Side {
 }
 
 /// Reduce a drv's observations to a verdict. Local builds are ground truth and
-/// win over Hydra/cache; a local success beats a local failure (it *can* build)
+/// win over the cache; a local success beats a local failure (it *can* build)
 /// but the disagreement is flagged flaky.
 pub fn side_verdict(obs: &[Observation]) -> Side {
     let is = |src: Source, built: bool| {
@@ -45,16 +49,19 @@ pub fn side_verdict(obs: &[Observation]) -> Side {
             flaky: lb && lf,
         };
     }
-    if is(Source::HydraJob, true) {
-        return Side { verdict: Verdict::Built, tag: "H", flaky: false };
-    }
     if is(Source::Cache, true) {
         return Side { verdict: Verdict::Built, tag: "C", flaky: false };
     }
-    if is(Source::HydraJob, false) {
-        return Side { verdict: Verdict::Failed, tag: "H", flaky: false };
-    }
     Side { verdict: Verdict::Unknown, tag: "", flaky: false }
+}
+
+/// The verdict for a side, given whether the attr has a derivation there.
+/// No drv ⇒ `Absent` (a fact); a drv with no observations ⇒ `Unknown`.
+fn side_for(drv: &Option<String>, obs: &[Observation]) -> Side {
+    match drv {
+        None => Side { verdict: Verdict::Absent, tag: "", flaky: false },
+        Some(_) => side_verdict(obs),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,21 +89,21 @@ pub const CATEGORIES: &[(Category, &str, &str)] = &[
 ];
 
 pub fn classify(kind: DiffKind, base: Verdict, head: Verdict) -> Category {
-    use Verdict::{Built, Failed, Unknown};
+    use Verdict::{Built, Failed};
     match kind {
         DiffKind::Added => match head {
             Built => Category::NewlyBuilds,
             Failed => Category::NewlyFails,
-            Unknown => Category::Unverified,
+            _ => Category::Unverified,
         },
         DiffKind::Removed => Category::Dropped,
         DiffKind::Changed | DiffKind::Unchanged => match (base, head) {
             (Built, Failed) => Category::Regression,
             (Failed, Built) => Category::Fixed,
             (Failed, Failed) => Category::PreExisting,
-            (Built, Built) | (Unknown, Built) => Category::Builds,
-            // head fails with an unknown base, or head not built yet -> verify
-            (_, Failed) | (_, Unknown) => Category::Unverified,
+            (_, Built) => Category::Builds,
+            // head fails/unknown with an unknown-or-absent base -> needs a build
+            _ => Category::Unverified,
         },
     }
 }
@@ -106,6 +113,7 @@ fn glyph(v: Verdict) -> &'static str {
         Verdict::Built => "✓",
         Verdict::Failed => "✗",
         Verdict::Unknown => "?",
+        Verdict::Absent => "—",
     }
 }
 
@@ -125,14 +133,16 @@ pub struct Row {
     pub head: Side,
 }
 
-/// Build a row from a diff entry, looking up each side's verdict.
+/// Build a row from a diff entry, looking up each side's verdict. A side with no
+/// derivation is `Absent` (rendered `—`), distinct from a present-but-unbuilt
+/// `Unknown` (`?`).
 pub fn row_for(
     entry: &DiffEntry,
     base_obs: &[Observation],
     head_obs: &[Observation],
 ) -> Row {
-    let base = side_verdict(base_obs);
-    let head = side_verdict(head_obs);
+    let base = side_for(&entry.base_drv, base_obs);
+    let head = side_for(&entry.head_drv, head_obs);
     Row {
         attr: entry.attr.clone(),
         category: classify(entry.kind, base.verdict, head.verdict),
@@ -145,8 +155,9 @@ pub fn row_for(
 pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Row>)]) -> String {
     let mut out = format!("## `npd` report: `{base}` → `{head}`\n\n");
     out.push_str(
-        "Verdicts from the observation log — source tag: `L` local build, `H` Hydra job, \
-         `C` binary cache. Run `npd build` / `npd hydra` on the changed set to fill in `?`.\n",
+        "Verdicts from the observation log — `base → head`, source tag `L` local build / \
+         `C` binary cache. `✓` builds, `✗` fails, `—` absent (no such attr on that side), \
+         `?` unbuilt.\n",
     );
     for (system, rows) in per_system {
         out.push_str(&format!("\n### `{system}`\n"));
@@ -167,7 +178,7 @@ pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Row>)]) -> Stri
                     ""
                 };
                 out.push_str(&format!(
-                    "- `{}` — {} → {}{flaky}\n",
+                    "- `{}`: {} → {}{flaky}\n",
                     r.attr,
                     fmt_side(r.base),
                     fmt_side(r.head)
@@ -193,7 +204,6 @@ mod tests {
             cached: None,
             machine: None,
             log_ref: None,
-            build_id: None,
         }
     }
 
@@ -201,12 +211,12 @@ mod tests {
     fn verdict_prefers_local_and_flags_flaky() {
         assert_eq!(side_verdict(&[]).verdict, Verdict::Unknown);
         assert_eq!(
-            side_verdict(&[obs(Source::HydraJob, Outcome::Built)]).verdict,
+            side_verdict(&[obs(Source::Cache, Outcome::Built)]).verdict,
             Verdict::Built
         );
-        // local failure overrides a hydra success as the "ground truth" source...
+        // local failure overrides a cache success as the "ground truth" source...
         let s = side_verdict(&[
-            obs(Source::HydraJob, Outcome::Built),
+            obs(Source::Cache, Outcome::Built),
             obs(Source::Local, Outcome::Failed),
         ]);
         assert_eq!(s.verdict, Verdict::Failed);
@@ -218,6 +228,32 @@ mod tests {
         ]);
         assert_eq!(f.verdict, Verdict::Built);
         assert!(f.flaky);
+    }
+
+    #[test]
+    fn render_shows_absent_as_dash_not_question() {
+        use crate::diff::{DiffEntry, DiffKind};
+        // A Removed attr: present (built) on base, absent on head.
+        let entry = DiffEntry {
+            attr: "gone".into(),
+            base_drv: Some("/nix/store/a.drv".into()),
+            head_drv: None,
+            kind: DiffKind::Removed,
+            attribution: None,
+        };
+        let row = row_for(&entry, &[obs(Source::Cache, Outcome::Built)], &[]);
+        let out = render("b", "h", &[("aarch64-linux".into(), vec![row])]);
+        assert!(out.contains("`gone`: ✓(C) → —"), "got:\n{out}");
+        assert!(!out.contains("→ ?"), "absent head must not render as `?`:\n{out}");
+    }
+
+    #[test]
+    fn absent_side_is_not_unknown() {
+        // No drv on a side -> Absent (`—`), distinct from a present-but-unbuilt `?`.
+        let s = side_for(&None, &[]);
+        assert_eq!(s.verdict, Verdict::Absent);
+        let u = side_for(&Some("/nix/store/x.drv".into()), &[]);
+        assert_eq!(u.verdict, Verdict::Unknown);
     }
 
     #[test]

@@ -7,8 +7,8 @@ long-lived build machines with plenty of disk. It exists to make these cheap:
 
 - evaluate a revision → the set of `attr → derivation` on each platform;
 - diff two revisions (and, three-way, their merge base) to a set of changed attrs;
-- learn what Hydra knows about a derivation or job;
-- build derivations locally;
+- learn whether a derivation is already substitutable from `cache.nixos.org`;
+- build derivations locally, remembering the outcome and keeping the log;
 - render human-readable Markdown reports from all of the above;
 
 …while **never repeating expensive work whose answer is already known**, and
@@ -19,9 +19,9 @@ you expect to just repeat).
 ### What `npd` is not
 
 - Not a `nixpkgs-review` replacement. The build-result **classifier / comparison
-  report** (the 3×3 base×change grid, the composed status token, `narinfo`/drift
-  logic) is a *presentation* concern that belongs upstream in nixpkgs-review as a
-  self-contained feature; `npd` reuses that rendering rather than owning it.
+  report** (the base×head delta grid, the composed status token) is a
+  *presentation* concern that could live upstream in nixpkgs-review as a
+  self-contained feature; `npd` keeps its own rendering for now.
 - Not a re-implementation of Nix's primitives. Evaluation goes through
   `nix-eval-jobs`; building goes through `nix build` + the existing remote
   builders. `npd` owns the **memory** and the **orchestration**, not the plumbing.
@@ -56,34 +56,36 @@ deliberate simplification (it dropped out of the design discussion):
 
 An eval at a fixed `(commit, system, config)` is deterministic, so its result is
 valid forever. Everything else is an **observation**: a single event, from some
-`Source` — a `Local` build we ran, a `HydraJob` build record, or `Cache`
-(narinfo) presence — stamped with `when`. We append and never discard, which is
-what makes flakiness representable (multiple observations of one drv with
-differing outcomes).
+`Source` — a `Local` build we ran, or `Cache` (narinfo) presence on a
+substituter — stamped with `when`. We append and never discard, which is what
+makes flakiness representable (multiple observations of one drv with differing
+outcomes).
 
-**Hydra facts are observations too** — not a separate mutable store. A Hydra
-build record keyed by `build_id` is itself immutable; "what is the latest build
-of job X" and "is output H in the cache right now" are just observations we make
-at time `when`. So there is no eviction and no TTL. Crucially, because a Hydra
-observation already records the *drvpath*, staleness never affects
-**correctness** — only whether we bother to re-fetch. So we start with
-**manually-triggered** Hydra fetching and no freshness threshold at all; an
-auto-refresh policy can come later if it earns its keep. This keeps full history
-(a job that went green → red → green is visible) and unifies local and remote
-facts under one log.
+**A cache probe is an observation too** — "is output H in the cache right now"
+is just something we observed at time `when`, recorded so a later run needn't
+re-probe. There is no eviction and no TTL, which keeps full history (a drv that
+went green → red → green is visible) under one log.
+
+> **History:** `npd` once also consulted Hydra (a `HydraJob` source + an `npd
+> hydra` command). That was dropped: the public Hydra API has no reverse
+> drvpath→build lookup, so its forward-job answers *drift* (a different drv than
+> ours) and are unreliable to key facts on. `npd` now consults only
+> `cache.nixos.org` (drv-precise) and local builds (ground truth).
 
 ## 4. Storage
 
 Everything `npd` stores is re-derivable, so it lives under
-`dirs::cache_dir()/nix-npd` (i.e. `~/.cache/nix-npd`), like `npc`. The gcroots below are
-the one thing that must survive Nix GC while it exists, but the *records* are all
-cache: losing them costs re-evaluation / re-building, not correctness.
+`dirs::cache_dir()/nix-npd` (i.e. `~/.cache/nix-npd`), like `npc`. The records are
+all cache: losing them costs re-evaluation / re-building, not correctness. `npd`
+keeps **no gcroots** — a built output may be GC'd, but the *observation* that it
+built survives, and that's the fact we actually need; if the output is wanted
+again, Nix rebuilds or substitutes it.
 
 **First, a non-problem to dispel:** we never need to build an in-memory reverse
 index at startup. We only ever look facts up by keys we already hold — an attr
-or job name, an output hash, a drvpath — and **the eval fact is itself the join**
-between the drvpath world and Hydra's name-/output-keyed world (given an eval,
-`attr ⇄ drv ⇄ outputs ⇄ job`). So per-key access is direct regardless of backend.
+name, an output hash, a drvpath — and **the eval fact is itself the join**
+(given an eval, `attr ⇄ drv ⇄ outputs`). So per-key access is direct regardless
+of backend.
 
 **Backend: SQLite** (`npd.sqlite`, one file) for both eval maps and the
 observation log; **files** only for build logs (naturally large blobs). Schema
@@ -96,21 +98,20 @@ is ~114k rows / ~27 MB of JSON, ~85% redundant — it compresses ~6.5×):
   `readdir`, directory sharding) that a fact-per-file scheme hits over time;
 - transactional appends avoid torn writes;
 - the two-way / three-way eval diff and cross-cutting queries ("everything that
-  fails locally but is green on Hydra", "all flaky drvs") are one SQL query
-  rather than loading and parsing multiple 27 MB blobs.
+  fails locally but is substitutable from the cache", "all flaky drvs") are one
+  SQL query rather than loading and parsing multiple 27 MB blobs.
 
 `existence` is not persisted — it is recomputed from `drv_path` + the meta flags
 on load, so there is one source of truth for that mapping.
 
 ```
 ~/.cache/nix-npd/
-  npd.sqlite                    # evals + observation log
-  logs/<drv-hash>/<obs-id>.log  # build logs referenced by observations
-  gcroots/<drv-hash>-<output>   # nix gcroots for outputs we choose to keep
+  npd.sqlite                 # evals + observation log
+  logs/build/<drv-hash>.log  # build logs (every build, success and failure)
+  logs/eval-<commit>-<sys>.log
 ```
 
-`<drv-hash>` is the 32-char hash component of the drvpath. gcroots are
-mandatory for anything we want to survive `nix-collect-garbage`.
+`<drv-hash>` is the 32-char hash component of the drvpath.
 
 ## 5. The observation log and the build-policy predicate
 
@@ -126,8 +127,17 @@ over that log plus substituter presence:
 
 So the cache-bypass knobs are just fields on the policy: `recheck` (rebuild a
 suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
-(don't trust a substituted/Hydra success — build it here). See
-`BuildPolicy::decide` in `src/model.rs`.
+(don't trust a substituted success — build it here). See `BuildPolicy::decide`
+in `src/model.rs`.
+
+**Staying instant when cached.** The driver loads every target's history in one
+SQLite query, and only *probes the cache* for drvs it doesn't already know are
+built (locally, or from a `Cache` observation a prior run recorded); those probes
+run concurrently (`cache::in_cache_many`). So a changed set whose facts are all
+known costs one query and no network — the whole build set is decided in
+milliseconds. The actual build is a single batched `nix build` piped through
+`nom` for the live tree, from which we recover, per drv, its outcome (built /
+direct failure / dependency cascade), duration, and full log.
 
 ## 6. Evaluation, its cache key, and the three-way diff
 
@@ -161,61 +171,59 @@ attr the way a git three-way merge does:
 This is the main capability nixpkgs-review lacks; it is nearly free once
 `eval` is a cached primitive.
 
-## 7. Hydra facts — best-effort, tiered
+## 7. Cache facts — the one remote signal
 
-There is **no reverse index** from a store path to a Hydra job on
-hydra.nixos.org (search is name-keyed and 500s on paths; no `/store-path`
-endpoint). So Hydra answers are best-effort, cheapest-first:
+The only remote fact `npd` gathers is **narinfo presence** on `cache.nixos.org`:
+`HEAD /<out-hash>.narinfo` → does an already-built output for *this exact drv*
+exist to substitute? It is drv-precise and drift-free, but **success-only** (a
+404 conflates never-built / failed / GC-evicted — it can never assert a
+failure). A hit is recorded as a `Cache`/`Built` observation so a later run
+skips the probe; a miss records nothing (re-probing is cheap, and cache state
+can change under us). Ground truth for anything a narinfo can't answer is a
+**local build** (§5).
 
-1. **narinfo** `HEAD cache.nixos.org/<out-hash>.narinfo` — drv-precise, drift-free,
-   but **success-only** (404 conflates never-built / failed / GC-evicted). Cheap.
-2. **forward job** `/job/<jobset>/<attr>.<system>/latest` — status + logs, but for
-   the job's *latest* drv, which may differ from ours (**drift**). Medium.
-3. **local rebuild** — ground truth; disambiguates narinfo's 404. Expensive.
-
-Because our own eval already yields the base revision's *exact* output paths,
-narinfo on **those** paths is drv-precise, and disagreeing with the forward-job
-verdict is a **drift detector** (Hydra's green is a different derivation than
-ours — the failure mode that first motivated this whole line of work). Hydra's
-`isCachedBuild` flag / build duration further tells us whether a Hydra verdict is
-a genuine run or a reused cached result.
-
-Every Hydra lookup is recorded as an `Observation` (`Source::HydraJob` or
-`Source::Cache`) in the same append-only log (§3), so a Hydra verdict is stored
-and reasoned about identically to a local build. Fetching is **on demand** via
-the `hydra` subcommand for now (§9); whether/when to prefetch is deferred.
-
-Upstream opportunity (separate): Hydra already indexes `BuildOutputs.path`
-(hash) and `Builds.drvpath` (btree + trigram); its `/search` merely uses a
-substring `ilike` that can't use those indexes and times out. A small PR adding
-an exact `drvpath`/`path` lookup would give a real reverse endpoint (surfacing
-failures + cached flags), which `npd` would prefer over narinfo when available.
+> Why not Hydra? The public hydra.nixos.org API has **no reverse index** from a
+> store path to a build (search is name-keyed, 500s on paths; no `/store-path`
+> endpoint). Its forward job endpoint (`/job/.../latest`) returns the *latest*
+> build's drv, which routinely **drifts** from ours — so it can't be keyed on
+> without inventing false regressions. `npd` dropped it.
+>
+> Upstream opportunity (separate): Hydra already indexes `BuildOutputs.path` and
+> `Builds.drvpath`; a small PR adding an exact `drvpath`/`path` lookup would give
+> a real reverse endpoint (surfacing failures + cached flags), which `npd` could
+> then consult in place of a local build for drvs Hydra actually built.
 
 ## 8. Reports
 
-Markdown, reusing the nixpkgs-review comparison classifier: group each attr by
-its **delta** (regression / fixed / dropped / added / pre-existing / unchanged /
-uncertain) for triage, and render a **composed token** per row (`before → after`,
-tagged with source and confidence/drift) so no information is lost. Cascades
-(`dependency failed`) are separated from direct failures and attributed to their
-root.
+Markdown: group each attr by its **delta** (regression / fixed / dropped / added
+/ pre-existing / newly-builds / …) for triage, and render a **composed token**
+per row (`base → head`, tagged `L` local / `C` cache) so no information is lost.
+The glyphs are deliberately distinct: `✓` built, `✗` failed, `?` *unknown* (has a
+drv here, not yet built), `—` *absent* (no such attr on this side). Absence is a
+**known fact**, never a `?`.
+
+`npd report` is not merely read-only: with defaults (`head` = `HEAD`, `base` =
+merge-base with `master`) it first **builds both sides of the changed set**
+(skipping anything already known or substitutable), so a fresh report has a real
+verdict for every row rather than a wall of `?`. `--no-build` opts back into pure
+read-only rendering.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
-The spine is implemented (✓); what remains are refinements.
+The spine is implemented (✓).
 
-1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`).
+1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`), evals run
+   in parallel under a RAM-slot budget.
 2. ✓ two-way diff, then the three-way (merge-base) diff.
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
-   that consults/appends it and manages gcroots.
-4. ✓ Hydra facts (narinfo → forward job → drift), recorded as observations.
-5. ✓ Markdown report classifying the changed set from the observation log.
+   that consults/appends it: one batched `nom` build, parallel cache probing,
+   `DepFailed`/cascade detection, per-drv duration, and a kept log per build.
+4. ✓ `Cache` facts (narinfo), recorded as observations.
+5. ✓ Markdown report classifying the changed set, building both sides first so
+   there are no `?`.
 
-Open refinements: `substitutable` build pre-skip (batch validity/narinfo so we
-don't invoke `nix build` on already-available drvs); `DepFailed`/cascade
-detection (the 0-byte-log signal) so a dependency failure isn't counted as a
-direct one; `Local`-vs-`Cache` build fidelity (a dry-run probe to tell a
-from-source build from a substitution); parallel builds; remote-builder fan-out.
+Open refinements: remote-builder fan-out; a `Local`-vs-`Cache` fidelity probe
+(from-source build vs. substitution); pruning old build logs.
 
 ## 10. Open questions
 
@@ -228,7 +236,7 @@ Resolved earlier and recorded for context:
 - *Concurrency* → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.
-- *Hydra facts lifetime* → append-only observations, no eviction/TTL. Fetching is
-  manual for now and there is no freshness threshold, since a Hydra observation
-  records the drvpath so staleness can't affect correctness (§3).
+- *Cache facts lifetime* → append-only observations, no eviction/TTL. A `Cache`
+  observation records the drvpath, so staleness can't affect correctness (§3).
+- *Remote facts* → narinfo on `cache.nixos.org` only; Hydra was dropped (§7).
 - *Storage* → SQLite (`npd.sqlite`) under `dirs::cache_dir()/nix-npd`; all re-derivable cache (§4).

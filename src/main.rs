@@ -1,21 +1,21 @@
 //! npd — a persistent fact store for iterating on nixpkgs changes.
 //!
 //! See DESIGN.md for the architecture. The pure data model lives in [`model`];
-//! orchestration (eval / diff / build / hydra / report) is being built
-//! spine-first, and unimplemented subcommands fail loudly rather than pretending.
+//! orchestration (eval / diff / build / report) is built spine-first.
 
 // Scaffolding: some model types are defined ahead of the orchestration that will
 // consume them (see DESIGN.md build order). Drop this once build/report land.
 #![allow(dead_code)]
 
 mod build;
+mod cache;
 mod diff;
 mod eval;
-mod hydra;
 mod model;
 mod report;
 mod store;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command as Proc;
 
@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::diff::{Attribution, DiffKind};
-use crate::model::{BuildPolicy, Decision, Existence, Outcome, Source};
+use crate::model::{BuildPolicy, Decision, Existence, Outcome};
 
 #[derive(Parser)]
 #[command(name = "npd", version, about = "A persistent fact store for iterating on nixpkgs changes")]
@@ -96,43 +96,29 @@ enum Command {
         /// Re-attempt a previously-failed drv (expect it might pass now).
         #[arg(long)]
         retry: bool,
-        /// Ignore Cache/Hydra success; require a genuine local build.
+        /// Ignore a substitutable (cached) success; require a genuine local build.
         #[arg(long)]
         prefer_local: bool,
     },
-    /// Fetch facts from Hydra on demand and record them as observations.
-    Hydra {
-        /// Git commit / revision to evaluate the attrs at (the "head" for --changed).
-        commit: String,
-        /// Attribute paths to look up (dotted). Provide these or --changed.
-        attrs: Vec<String>,
-        /// Look up the changed set between <base> and <commit> — both sides — so
-        /// a `report base commit` gets its base and head verdicts populated.
-        #[arg(long, value_name = "base")]
-        changed: Option<String>,
-        /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
-        #[arg(long)]
-        nixpkgs: Option<PathBuf>,
-        /// Systems to look up (repeatable); defaults to the host system.
-        #[arg(long)]
-        system: Vec<String>,
-        /// Hydra jobset for the forward lookup (default: `nixpkgs/trunk`).
-        #[arg(long)]
-        jobset: Option<String>,
-        /// Re-probe even drvs already looked up (default: skip those).
-        #[arg(long)]
-        refresh: bool,
-    },
-    /// Render a Markdown report classifying the changed set between two revisions.
+    /// Render a Markdown report classifying the changed set between two revisions,
+    /// building whatever the verdicts need first (so there are no `?`).
+    ///
+    /// With no arguments: head = `HEAD`, base = merge-base of `HEAD` and `master`.
+    /// With one: it is the base, and head = `HEAD`.
     Report {
-        base: String,
-        head: String,
+        /// Base revision (default: merge-base of head and `master`).
+        base: Option<String>,
+        /// Head revision (default: `HEAD`).
+        head: Option<String>,
         /// nixpkgs repo to resolve the commits in (default: `$NPD_NIXPKGS`).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
         /// Systems to report on (repeatable); defaults to the host system.
         #[arg(long)]
         system: Vec<String>,
+        /// Don't build; render only from facts already in the log (may show `?`).
+        #[arg(long)]
+        no_build: bool,
     },
 }
 
@@ -459,118 +445,78 @@ fn cmd_build(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_hydra(
-    commit: String,
-    attrs: Vec<String>,
-    changed: Option<String>,
-    nixpkgs: Option<PathBuf>,
-    system: Vec<String>,
-    jobset: Option<String>,
-    refresh: bool,
-) -> Result<()> {
-    let repo = resolve_repo(nixpkgs)?;
-    let commit = resolve_commit(&repo, &commit)?;
-    let systems = resolve_systems(system);
-    let jobset = jobset.unwrap_or_else(|| hydra::DEFAULT_JOBSET.to_string());
-
-    // The (attr, drv, system) triples to look up.
-    let mut lookups: Vec<(String, String, String)> = Vec::new();
-    match (&changed, attrs.is_empty()) {
-        (Some(_), false) => bail!("npd hydra: pass either attrs or --changed <base>, not both"),
-        (Some(base), true) => {
-            let base = resolve_commit(&repo, base)?;
-            let (base_evals, head_evals) =
-                eval::eval_two(&repo, &base, &commit, &systems, eval::DEFAULT_PROFILE, &[])?;
-            for sys in &systems {
-                let b = attrs_for(&base_evals, sys);
-                let h = attrs_for(&head_evals, sys);
-                for e in diff::diff_evals(&b, &h, None) {
-                    if e.kind == DiffKind::Unchanged {
-                        continue;
-                    }
-                    // Both sides, so `report` gets base and head verdicts.
-                    if let Some(d) = e.base_drv {
-                        lookups.push((e.attr.clone(), d, sys.clone()));
-                    }
-                    if let Some(d) = e.head_drv {
-                        lookups.push((e.attr, d, sys.clone()));
-                    }
-                }
-            }
-        }
-        (None, false) => {
-            let evals = eval::eval_commit(&repo, &commit, &systems, eval::DEFAULT_PROFILE, &attrs)?;
-            for e in &evals {
-                for a in &e.attrs {
-                    if let Some(d) = &a.drv_path {
-                        lookups.push((a.attr.clone(), d.clone(), e.system.clone()));
-                    }
-                }
-            }
-        }
-        (None, true) => bail!("npd hydra: pass one or more attrs, or --changed <base>"),
-    }
-
-    let mut store = store::Store::open(&eval::db_path()?)?;
-    let now = chrono::Utc::now().timestamp();
-    let mut seen = std::collections::HashSet::new();
-    let (mut probed, mut skipped, mut recorded) = (0, 0, 0);
-    for (attr, drv, system) in lookups {
-        if !seen.insert((drv.clone(), system.clone())) {
-            continue; // same drv already looked up this run
-        }
-        // Skip drvs we've already probed (the log is the query cache); --refresh forces.
-        if !refresh {
-            let prior = store.load_observations(&drv)?;
-            if prior.iter().any(|o| {
-                matches!(o.source, Source::Cache | Source::HydraJob)
-                    && o.system.as_deref() == Some(system.as_str())
-            }) {
-                skipped += 1;
-                continue;
-            }
-        }
-        probed += 1;
-        let r = hydra::observe(&attr, &drv, &system, &jobset, now);
-        for o in &r.observations {
-            store.add_observation(o)?;
-            recorded += 1;
-        }
-        println!(
-            "  {system} {attr}: cache={} job={}",
-            if r.in_cache { "hit" } else { "miss" },
-            r.job.as_deref().unwrap_or("none"),
-        );
-    }
-    println!("probed {probed}, skipped {skipped} already-known; recorded {recorded} observation(s)");
-    Ok(())
+/// Resolve report/… revisions with ergonomic defaults: head defaults to `HEAD`,
+/// base to the merge-base of head and `master` (the fork point of this branch).
+fn resolve_base_head(
+    repo: &std::path::Path,
+    base: Option<String>,
+    head: Option<String>,
+) -> Result<(String, String)> {
+    let head = resolve_commit(repo, &head.unwrap_or_else(|| "HEAD".to_string()))?;
+    let base = match base {
+        Some(b) => resolve_commit(repo, &b)?,
+        None => git_merge_base(repo, "master", &head)
+            .context("no base given and could not merge-base with `master`; pass one explicitly")?,
+    };
+    Ok((base, head))
 }
 
 fn cmd_report(
-    base: String,
-    head: String,
+    base: Option<String>,
+    head: Option<String>,
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
+    no_build: bool,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
-    let base = resolve_commit(&repo, &base)?;
-    let head = resolve_commit(&repo, &head)?;
+    let (base, head) = resolve_base_head(&repo, base, head)?;
     let systems = resolve_systems(system);
-    let store = store::Store::open(&eval::db_path()?)?;
 
     let (base_evals, head_evals) =
         eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, &[])?;
 
-    let mut per_system = Vec::new();
+    // The changed set per system, computed once and reused for both the build and
+    // the render so they can never disagree.
+    let mut per_system_diff: Vec<(String, Vec<diff::DiffEntry>)> = Vec::new();
     for sys in &systems {
         let b = attrs_for(&base_evals, sys);
         let h = attrs_for(&head_evals, sys);
-        let mut rows = Vec::new();
-        for e in diff::diff_evals(&b, &h, None) {
-            if e.kind == DiffKind::Unchanged {
-                continue; // report only the changed set
+        let changed: Vec<diff::DiffEntry> = diff::diff_evals(&b, &h, None)
+            .into_iter()
+            .filter(|e| e.kind != DiffKind::Unchanged)
+            .collect();
+        per_system_diff.push((sys.clone(), changed));
+    }
+
+    // Build both sides of the changed set (skipping anything already known or
+    // substitutable) so the report has a real verdict for every row, not a `?`.
+    if !no_build {
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for (sys, changed) in &per_system_diff {
+            for e in changed {
+                for drv in [&e.base_drv, &e.head_drv].into_iter().flatten() {
+                    if seen.insert((drv.clone(), sys.clone())) {
+                        targets.push(build::Target {
+                            attr: e.attr.clone(),
+                            system: sys.clone(),
+                            drv_path: drv.clone(),
+                        });
+                    }
+                }
             }
+        }
+        if !targets.is_empty() {
+            build::build_targets(&targets, BuildPolicy::default(), false)?;
+        }
+    }
+
+    // Render from the (now-populated) log.
+    let store = store::Store::open(&eval::db_path()?)?;
+    let mut per_system = Vec::new();
+    for (sys, changed) in &per_system_diff {
+        let mut rows = Vec::new();
+        for e in changed {
             let base_obs = match &e.base_drv {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
@@ -579,7 +525,7 @@ fn cmd_report(
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
-            rows.push(report::row_for(&e, &base_obs, &head_obs));
+            rows.push(report::row_for(e, &base_obs, &head_obs));
         }
         per_system.push((sys.clone(), rows));
     }
@@ -626,20 +572,12 @@ fn main() -> Result<()> {
             retry,
             prefer_local,
         ),
-        Command::Hydra {
-            commit,
-            attrs,
-            changed,
-            nixpkgs,
-            system,
-            jobset,
-            refresh,
-        } => cmd_hydra(commit, attrs, changed, nixpkgs, system, jobset, refresh),
         Command::Report {
             base,
             head,
             nixpkgs,
             system,
-        } => cmd_report(base, head, nixpkgs, system),
+            no_build,
+        } => cmd_report(base, head, nixpkgs, system, no_build),
     }
 }

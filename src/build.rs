@@ -17,8 +17,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::cache;
 use crate::eval;
-use crate::hydra;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
@@ -71,12 +71,17 @@ struct NixEvent {
 
 /// The `actBuild` activity type in nix's internal-json log.
 const ACT_BUILD: i64 = 105;
+/// The `resBuildLogLine` result type — one line of a build's stdout/stderr,
+/// tagged with the build activity's id.
+const RES_BUILD_LOG_LINE: i64 = 101;
 
 /// What the batch build observed per drv: which ones nix actually attempted to
-/// build (a build activity started) and how long each build activity took.
+/// build (a build activity started), how long each took, and its captured log
+/// lines (so we keep the log of *every* build, success or failure).
 struct BatchInfo {
     attempted: HashSet<String>,
     durations: HashMap<String, f64>,
+    logs: HashMap<String, Vec<String>>,
 }
 
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
@@ -117,7 +122,12 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
     let mut nom_in = nom.stdin.take().expect("stdin is piped");
     let mut attempted = HashSet::new();
     let mut durations = HashMap::new();
+    let mut logs: HashMap<String, Vec<String>> = HashMap::new();
     let mut starts: HashMap<u64, (String, Instant)> = HashMap::new();
+    // Activity id -> drv, kept for the whole run so log-line events (which arrive
+    // between a build's start and stop, tagged only with the activity id) can be
+    // attributed to their derivation.
+    let mut act_drv: HashMap<u64, String> = HashMap::new();
 
     for line in log.lines() {
         let line = line.context("reading nix build log")?;
@@ -134,6 +144,15 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
                 if let (Some(id), Some(drv)) = (ev.id, ev.fields.first().and_then(|v| v.as_str())) {
                     attempted.insert(drv.to_string());
                     starts.insert(id, (drv.to_string(), Instant::now()));
+                    act_drv.insert(id, drv.to_string());
+                }
+            }
+            "result" if ev.typ == Some(RES_BUILD_LOG_LINE) => {
+                if let Some(id) = ev.id
+                    && let Some(drv) = act_drv.get(&id)
+                    && let Some(text) = ev.fields.first().and_then(|v| v.as_str())
+                {
+                    logs.entry(drv.clone()).or_default().push(text.to_string());
                 }
             }
             "stop" => {
@@ -152,7 +171,18 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
     Ok(BatchInfo {
         attempted,
         durations,
+        logs,
     })
+}
+
+/// Persist a captured build log under `<cache>/logs/build/<drvhash>.log` and
+/// return its path relative to the cache root (for `Observation::log_ref`).
+fn write_build_log(cache: &Path, drv: &str, lines: &[String]) -> Result<String> {
+    let rel = format!("logs/build/{}.log", store_hash(drv));
+    let path = cache.join(&rel);
+    fs::create_dir_all(path.parent().unwrap()).context("creating build-log dir")?;
+    fs::write(&path, lines.join("\n")).with_context(|| format!("writing {}", path.display()))?;
+    Ok(rel)
 }
 
 /// The realised output paths of a derivation.
@@ -201,22 +231,6 @@ fn build_outcomes(drvs: &[&str]) -> Result<HashMap<String, bool>> {
         .collect())
 }
 
-/// Root a (already-built) drv's outputs under the cache's gcroots so GC keeps
-/// them. Instant — the drv is valid, so `nix build` just creates the symlink.
-fn root_drv(drv: &str, cache: &Path) -> Result<()> {
-    let gcroot = cache.join("gcroots").join(store_hash(drv));
-    fs::create_dir_all(gcroot.parent().unwrap()).context("creating gcroots dir")?;
-    Command::new("nix")
-        .args(["build", &format!("{drv}^*"), "--out-link"])
-        .arg(&gcroot)
-        .args(["--extra-experimental-features", "nix-command"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("rooting built output")?;
-    Ok(())
-}
-
 fn lines(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -240,47 +254,81 @@ pub fn build_targets(
     // (substitutable) output means we needn't build at all.
     let force = policy.recheck || policy.prefer_local;
 
-    // Pass 1: decide per target. Record/print skips now; collect the build set.
+    // One SQLite round-trip for every target's history, rather than one query
+    // each — so an all-known set costs a single query, not N.
+    let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
+    let obs_by_drv = store.load_observations_many(&drv_refs)?;
+    let obs_of = |drv: &str| obs_by_drv.get(drv).map(Vec::as_slice).unwrap_or(&[]);
+
+    // A drv already known built (locally or, from a prior run, in the cache) needs
+    // no cache probe at all. Everything else — unless we're forcing a rebuild —
+    // gets probed, and those probes run concurrently (see `cache::in_cache_many`)
+    // so a fully-cached changed set resolves in ~one round-trip, not N.
+    let cache_built = |drv: &str| {
+        obs_of(drv)
+            .iter()
+            .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built)
+    };
+    let local_built = |drv: &str| {
+        obs_of(drv)
+            .iter()
+            .any(|o| o.source == Source::Local && o.outcome == Outcome::Built)
+    };
+    let mut to_probe: Vec<String> = Vec::new();
+    if !force {
+        let mut seen = HashSet::new();
+        for t in targets {
+            if !local_built(&t.drv_path)
+                && !cache_built(&t.drv_path)
+                && seen.insert(t.drv_path.clone())
+            {
+                to_probe.push(t.drv_path.clone());
+            }
+        }
+    }
+    let probed = cache::in_cache_many(&to_probe);
+    let substitutable = |drv: &str| {
+        !force && (cache_built(drv) || probed.get(drv).copied().unwrap_or(false))
+    };
+
+    // Pass 1: decide per target. Skips are tallied into a one-line summary (a
+    // fully-cached set would otherwise bury the useful output under N lines);
+    // dry-run still lists each would-build target, since that's its whole point.
+    let now = chrono::Utc::now().timestamp();
     let mut results: Vec<Built> = Vec::with_capacity(targets.len());
     let mut to_build: Vec<usize> = Vec::new();
+    let (mut skip_ok, mut skip_cache, mut skip_fail) = (0, 0, 0);
     for (i, t) in targets.iter().enumerate() {
-        let observations = store.load_observations(&t.drv_path)?;
-        // Only probe the cache when it could change the decision (not when forcing).
-        let substitutable = !force && hydra::in_cache(&t.drv_path);
-        let decision = policy.decide(&observations, substitutable);
+        let observations = obs_of(&t.drv_path);
+        let sub = substitutable(&t.drv_path);
+        let decision = policy.decide(observations, sub);
         match decision {
             Decision::Build if dry_run => println!("  would build           {} {}", t.system, t.attr),
             Decision::Build => to_build.push(i),
             Decision::SkipOk => {
-                let has_local_built = observations
-                    .iter()
-                    .any(|o| o.source == Source::Local && o.outcome == Outcome::Built);
-                if substitutable && !has_local_built {
+                if sub && !local_built(&t.drv_path) {
                     // In the cache, not built here — record a Cache fact (deduped)
-                    // so the report shows `C`, never a bogus `L`.
-                    let known = observations
-                        .iter()
-                        .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
-                    if !known {
+                    // so the report shows `C`, never a bogus `L`, and a re-run needn't
+                    // probe again.
+                    if !cache_built(&t.drv_path) {
                         store.add_observation(&Observation {
                             drv_path: t.drv_path.clone(),
                             source: Source::Cache,
                             outcome: Outcome::Built,
-                            when: chrono::Utc::now().timestamp(),
+                            when: now,
                             system: Some(t.system.clone()),
                             duration_s: None,
                             cached: Some(true),
                             machine: None,
                             log_ref: None,
-                            build_id: None,
                         })?;
                     }
-                    println!("  skip (in binary cache) {} {}", t.system, t.attr);
+                    skip_cache += 1;
                 } else {
-                    println!("  skip (known ok)        {} {}", t.system, t.attr);
+                    skip_ok += 1;
                 }
             }
-            Decision::SkipFail => println!("  skip (known failure)   {} {}", t.system, t.attr),
+            Decision::SkipFail => skip_fail += 1,
         }
         results.push(Built {
             attr: t.attr.clone(),
@@ -290,8 +338,16 @@ pub fn build_targets(
             outcome: None,
         });
     }
+    if skip_ok + skip_cache + skip_fail > 0 {
+        println!(
+            "skipping {} target(s): {skip_ok} known-ok, {skip_cache} in binary cache, \
+             {skip_fail} known-failure",
+            skip_ok + skip_cache + skip_fail
+        );
+    }
 
-    // Pass 2: one nom build for the whole set; Pass 3: attribute + record + root.
+    // Pass 2: one nom build for the whole set; Pass 3: attribute, keep each log,
+    // and record the outcome.
     if !to_build.is_empty() {
         let drvs: Vec<&str> = to_build.iter().map(|&i| targets[i].drv_path.as_str()).collect();
         println!("building {} derivation(s)…", drvs.len());
@@ -313,9 +369,12 @@ pub fn build_targets(
             } else {
                 (Outcome::DepFailed, "dep-failed")
             };
-            if built {
-                root_drv(&t.drv_path, &cache)?;
-            }
+            // Keep the log of every build we actually ran, pass or fail (a
+            // dep-failure never ran, so it has none).
+            let log_ref = match info.logs.get(&t.drv_path) {
+                Some(l) if !l.is_empty() => Some(write_build_log(&cache, &t.drv_path, l)?),
+                _ => None,
+            };
             let duration_s = info.durations.get(&t.drv_path).copied();
             store.add_observation(&Observation {
                 drv_path: t.drv_path.clone(),
@@ -326,8 +385,7 @@ pub fn build_targets(
                 duration_s,
                 cached: None,
                 machine: Some(host.clone()),
-                log_ref: None,
-                build_id: None,
+                log_ref,
             })?;
             let dur = duration_s.map(|s| format!(" ({s:.0}s)")).unwrap_or_default();
             println!("  {label}  {} {}{dur}", t.system, t.attr);

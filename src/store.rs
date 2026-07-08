@@ -36,8 +36,9 @@ CREATE TABLE IF NOT EXISTS attr_eval (
     PRIMARY KEY (run_id, attr)
 ) STRICT;
 
--- The append-only observation log (DESIGN.md §3). Not yet written to; the build
--- driver and hydra fetch will append here.
+-- The append-only observation log (DESIGN.md §3): the build driver appends a
+-- `local`/`cache` fact here per drv. (A legacy `build_id` column may linger on
+-- old databases from the dropped Hydra source; it is simply never written now.)
 CREATE TABLE IF NOT EXISTS observation (
     id         INTEGER PRIMARY KEY,
     drv_path   TEXT    NOT NULL,
@@ -48,16 +49,18 @@ CREATE TABLE IF NOT EXISTS observation (
     duration_s REAL,
     cached     INTEGER,
     machine    TEXT,
-    log_ref    TEXT,
-    build_id   INTEGER
+    log_ref    TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
+
+-- npd once recorded Hydra facts; that source is gone. Purge its rows so the
+-- verdict logic (which no longer knows `hydra-job`) never trips over them.
+DELETE FROM observation WHERE source = 'hydra-job';
 ";
 
 fn source_str(s: Source) -> &'static str {
     match s {
         Source::Local => "local",
-        Source::HydraJob => "hydra-job",
         Source::Cache => "cache",
     }
 }
@@ -65,7 +68,6 @@ fn source_str(s: Source) -> &'static str {
 fn source_from(s: &str) -> Result<Source> {
     Ok(match s {
         "local" => Source::Local,
-        "hydra-job" => Source::HydraJob,
         "cache" => Source::Cache,
         other => anyhow::bail!("unknown observation source in store: {other:?}"),
     })
@@ -222,8 +224,8 @@ impl Store {
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
         self.conn.execute(
             "INSERT INTO observation \
-             (drv_path, source, outcome, when_, system, duration_s, cached, machine, log_ref, build_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (drv_path, source, outcome, when_, system, duration_s, cached, machine, log_ref) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 o.drv_path,
                 source_str(o.source),
@@ -234,7 +236,6 @@ impl Store {
                 o.cached,
                 o.machine,
                 o.log_ref,
-                o.build_id.map(|b| b as i64),
             ],
         )?;
         Ok(())
@@ -242,29 +243,53 @@ impl Store {
 
     /// All observations for a derivation, oldest first.
     pub fn load_observations(&self, drv_path: &str) -> Result<Vec<Observation>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT source, outcome, when_, system, duration_s, cached, machine, log_ref, build_id \
-             FROM observation WHERE drv_path = ?1 ORDER BY when_, id",
-        )?;
-        let rows = stmt.query_map(params![drv_path], |r| {
+        Ok(self
+            .load_observations_many(std::slice::from_ref(&drv_path))?
+            .remove(drv_path)
+            .unwrap_or_default())
+    }
+
+    /// Load observations for many drvs in one query (oldest first per drv). Drvs
+    /// with no observations are simply absent from the map. This is how a report
+    /// or build over a whole changed set stays a single round-trip to SQLite
+    /// rather than one query per target.
+    pub fn load_observations_many(
+        &self,
+        drv_paths: &[&str],
+    ) -> Result<std::collections::HashMap<String, Vec<Observation>>> {
+        let mut out: std::collections::HashMap<String, Vec<Observation>> =
+            std::collections::HashMap::new();
+        if drv_paths.is_empty() {
+            return Ok(out);
+        }
+        // `WHERE drv_path IN (?,?,…)` with one placeholder per drv.
+        let placeholders = std::iter::repeat_n("?", drv_paths.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT drv_path, source, outcome, when_, system, duration_s, cached, machine, log_ref \
+             FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(drv_paths.iter());
+        let rows = stmt.query_map(params, |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-                r.get::<_, Option<bool>>(5)?,
-                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<bool>>(6)?,
                 r.get::<_, Option<String>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?;
-        let mut out = Vec::new();
         for row in rows {
-            let (source, outcome, when, system, duration_s, cached, machine, log_ref, build_id) =
+            let (drv_path, source, outcome, when, system, duration_s, cached, machine, log_ref) =
                 row?;
-            out.push(Observation {
-                drv_path: drv_path.to_string(),
+            out.entry(drv_path.clone()).or_default().push(Observation {
+                drv_path,
                 source: source_from(&source)?,
                 outcome: outcome_from(&outcome)?,
                 when,
@@ -273,7 +298,6 @@ impl Store {
                 cached,
                 machine,
                 log_ref,
-                build_id: build_id.map(|b| b as u64),
             });
         }
         Ok(out)
@@ -346,7 +370,6 @@ mod tests {
             cached: None,
             machine: Some("host".into()),
             log_ref: Some("logs/x/build.log".into()),
-            build_id: None,
         };
         s.add_observation(&mk(Outcome::Failed, 100)).unwrap();
         s.add_observation(&mk(Outcome::Built, 200)).unwrap();

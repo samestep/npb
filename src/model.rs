@@ -55,15 +55,13 @@ pub struct AttrEval {
     pub error: Option<String>,
 }
 
-/// Where a build observation came from. Local builds, Hydra job records, and
-/// substituter presence are *all* observations in one append-only log.
+/// Where a build observation came from. Local builds and substituter presence
+/// are both observations in one append-only log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Source {
     /// We ran `nix build` on one of our machines.
     Local,
-    /// Hydra's build record for a named job (forward lookup).
-    HydraJob,
     /// narinfo presence on a substituter (success only).
     Cache,
 }
@@ -97,17 +95,14 @@ pub struct Observation {
     /// ~0 for a substituted/cached result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
-    /// Hydra `isCachedBuild` / substituted rather than genuinely run.
+    /// True when the result was substituted from the cache rather than built here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
-    /// Path under `$NPD_STATE/logs`, if any.
+    /// Path (relative to the cache root) of the captured build log, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_ref: Option<String>,
-    /// Hydra build id, when `source` is `HydraJob`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_id: Option<u64>,
 }
 
 /// What the build policy says to do about a derivation.
@@ -132,7 +127,7 @@ pub struct BuildPolicy {
     pub recheck: bool,
     /// Re-attempt a previously-failed drv (expect it might pass now).
     pub retry: bool,
-    /// Ignore Cache/Hydra success; require a genuine local build.
+    /// Ignore a substitutable (cached) success; require a genuine local build.
     pub prefer_local: bool,
 }
 
@@ -183,7 +178,6 @@ mod tests {
             cached: None,
             machine: None,
             log_ref: None,
-            build_id: None,
         }
     }
 
@@ -234,9 +228,10 @@ mod tests {
     }
 
     #[test]
-    fn hydra_success_does_not_count_as_local() {
-        // A Hydra/Cache success is not a local build; without substitutable we still build.
-        let o = [obs(Source::HydraJob, Outcome::Built)];
+    fn cache_success_does_not_count_as_local() {
+        // A recorded Cache success is not a local build; without substitutable we
+        // still build (the caller folds a prior Cache-built obs into substitutable).
+        let o = [obs(Source::Cache, Outcome::Built)];
         assert_eq!(BuildPolicy::default().decide(&o, false), Decision::Build);
     }
 }

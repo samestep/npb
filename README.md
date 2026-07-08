@@ -13,32 +13,35 @@ to repeat work you already know the answer to.
 The Nix store + substituters already remember **successful** builds. What Nix
 throws away is everything else `npd` cares about:
 
-- **local failures** — Nix retries a failed build every time; Hydra solved this
-  with its global `FailedPaths` table. `npd` keeps the same memory for your loop.
+- **local failures** — Nix retries a failed build every time; `npd` remembers a
+  failed drv (direct failure vs. dependency cascade) so your loop doesn't repeat it.
 - **eval diffs** — the attr→drv map of a revision is expensive and uncached.
-- **Hydra facts** — job status, `narinfo` presence, and derivation *drift*.
+- **build logs** — kept for every build, success *and* failure.
 - **reports** — human-readable Markdown over all of the above.
 
-So `npd` is a thin **fact store + policy layer over `nix-eval-jobs` and
-`nix build`**, not a fork of a review tool. See [`DESIGN.md`](DESIGN.md).
+The one remote fact `npd` consults is `cache.nixos.org` (is this exact drv already
+built and substitutable?). So `npd` is a thin **fact store + policy layer over
+`nix-eval-jobs` and `nix build`**, not a fork of a review tool. See
+[`DESIGN.md`](DESIGN.md).
 
 ## Status
 
-Rust (edition 2024, à la [`npc`](https://github.com/samestep/npc)). The spine is
-implemented end-to-end:
+Rust (edition 2024, à la [`npc`](https://github.com/samestep/npc)). Implemented
+end-to-end; every command is **instant when its result is already known**.
 
-- `npd eval <commit>` — cached attr→drv map (SQLite; streamed `nix-eval-jobs`).
+- `npd eval <commit>` — cached attr→drv map (SQLite; streamed `nix-eval-jobs`,
+  evals run in parallel under a RAM budget).
 - `npd diff <base> <head> [--three-way]` — changed/added/removed, with merge-base
   attribution.
 - `npd build <commit> <attrs…>` / `--changed <base>` — observation-backed build
-  driver (remembers successes *and failures*), gc-roots outputs, `--dry-run`.
-- `npd hydra <commit> <attrs…>` — records `Cache` (narinfo, drv-precise) and
-  `HydraJob` (forward, drift-checked) observations.
-- `npd report <base> <head>` — classifies the changed set (regression / fixed /
-  pre-existing / dropped / …) from the observation log.
-
-Refinements still open: `substitutable` build pre-skip, `DepFailed`/cascade
-detection, parallel builds. See `DESIGN.md`.
+  driver (remembers successes *and failures*, keeps logs), one batched `nom`
+  build, parallel cache probing, `--dry-run` / `--recheck` / `--retry` /
+  `--prefer-local`.
+- `npd report [base] [head]` — classifies the changed set (regression / fixed /
+  pre-existing / dropped / …). With no args, `head` = `HEAD` and `base` =
+  merge-base of `HEAD` and `master`; it **builds whatever the verdicts need**
+  first (both sides), so there are no `?`. `--no-build` renders from existing
+  facts only.
 
 ## Development
 
