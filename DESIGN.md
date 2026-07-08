@@ -278,15 +278,20 @@ eval/diff/build/report primitives are internal modules, not subcommands).
 Open refinements: remote-builder fan-out; a `Local`-vs-`Cache` fidelity probe
 (from-source build vs. substitution).
 
-**Known gotcha — `nix-eval-jobs` on macOS is pathologically slow.** Measured
-~1.5 attrs/s on an `aarch64-darwin` VM vs ~155 attrs/s on `aarch64-linux` on the
-same hardware — ~100× — even though a plain `nix eval` of a single package is
-instant on both. So it's specific to `nix-eval-jobs`' worker-based full-set
-streaming on darwin, not core Nix eval, and it's not fixable by npd's
-worker/memory knobs (disabling the memory cap didn't help). Practical upshot:
-run `npd` on the Linux build boxes (its intended home); a full-set eval on a Mac
-is effectively a non-starter until this is fixed upstream. The eval progress bar
-shows a live timer so a slow eval reads as working, not hung.
+**Known gotcha (root-caused) — `nix-eval-jobs` restarts its worker after every
+job on macOS.** The ~100× darwin slowdown (measured ~1.5 attrs/s on an
+`aarch64-darwin` VM vs ~155 attrs/s on `aarch64-linux`, same hardware) is a
+units bug in `nix-eval-jobs`' worker-restart check (`shouldRestart`,
+`src/worker.cc`): it compares `getrusage`'s `ru_maxrss` against
+`--max-memory-size` (MiB) × 1024, which is correct on Linux (`ru_maxrss` in
+KiB) but off by 1024× on macOS (`ru_maxrss` in **bytes**). The effective cap
+becomes `--max-memory-size` *KiB*, every worker trips it after its first job,
+and each job pays a fork + full nixpkgs re-import (~0.6 s each; also why "huge"
+MB values didn't help — 999999 MB still reads as ~1 GB). It was never a GC or
+eval-engine problem: with the cap compensated ×1024, the same darwin VM
+evaluates *faster* than the Linux VM (7671 vs 5134 attrs/30 s, one worker).
+npd works around it by passing `--max-memory-size` ×1024 on macOS (see
+`stream_jobs` in `src/eval.rs`); drop that when the upstream fix lands.
 
 ## 10. Open questions
 
