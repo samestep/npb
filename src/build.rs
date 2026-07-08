@@ -221,10 +221,6 @@ pub fn build_targets(
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
     let obs_of = |drv: &str| obs_by_drv.get(drv).map(Vec::as_slice).unwrap_or(&[]);
 
-    // A drv already known built (locally or, from a prior run, in the cache) needs
-    // no cache probe at all. Everything else — unless we're forcing a rebuild —
-    // gets probed, and those probes run concurrently (see `cache::in_cache_many`)
-    // so a fully-cached changed set resolves in ~one round-trip, not N.
     let cache_built = |drv: &str| {
         obs_of(drv)
             .iter()
@@ -235,14 +231,21 @@ pub fn build_targets(
             .iter()
             .any(|o| o.source == Source::Local && o.outcome == Outcome::Built)
     };
+    // We only probe the cache for drvs we have *no fact* about — a probe can only
+    // change the decision there. A drv with any local observation is already
+    // decided (built → skip; failed/blocked → skip-fail, since a local failure
+    // outranks cache presence anyway), and a recorded cache hit is decided too.
+    // This is what keeps a re-run of an unchanged report near-instant: we don't
+    // re-probe (HTTP + `nix-store`) the failures every time. Probes that do run
+    // run concurrently (see `cache::in_cache_many`).
+    let has_fact = |drv: &str| {
+        obs_of(drv).iter().any(|o| o.source == Source::Local) || cache_built(drv)
+    };
     let mut to_probe: Vec<String> = Vec::new();
     if !force {
         let mut seen = HashSet::new();
         for t in targets {
-            if !local_built(&t.drv_path)
-                && !cache_built(&t.drv_path)
-                && seen.insert(t.drv_path.clone())
-            {
+            if !has_fact(&t.drv_path) && seen.insert(t.drv_path.clone()) {
                 to_probe.push(t.drv_path.clone());
             }
         }
