@@ -1,189 +1,176 @@
-//! Render a Markdown report of a change (base -> head): for each attr in the
-//! changed set, derive a *base* and *head* build verdict from the observation
-//! log, classify the delta, and group. Read-only over stored facts (DESIGN.md
-//! §8); `npd report` populates those facts itself by building first.
+//! Render a Markdown report of a change (`base → head`).
+//!
+//! Each attr in the changed set has a *state* on each side — reduced from the
+//! observation log (§8) — and the report groups attrs by the `(base, head)`
+//! state pair. The section header *is* a composable `before → after` token
+//! (one emoji per side); no per-row glyphs. Attrs that share a derivation are
+//! collapsed onto one line (`a = b = c`), like `nixpkgs-review`'s aliases.
 
-use crate::diff::{DiffEntry, DiffKind};
+use std::collections::{BTreeMap, HashMap};
+
 use crate::model::{Observation, Outcome, Source};
 
-/// A side's (base or head) build verdict, reduced from its observations.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Verdict {
+/// One side's build state, reduced from a drv's observations (or its absence).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum State {
+    /// Output valid — built locally, or substitutable from the cache.
     Built,
+    /// Its own build failed (a direct failure).
     Failed,
-    /// The attr has a derivation on this side but we have no build fact for it.
-    Unknown,
-    /// The attr does not exist on this side (no derivation) — a *known* fact,
-    /// not an unknown: rendered as `—`, never `?`.
+    /// A dependency failed, so this never ran (a transitive/cascade failure).
+    Blocked,
+    /// No derivation on this side (the attr doesn't exist there).
     Absent,
+    /// Has a derivation but no build fact yet (only reachable with `--no-build`).
+    Unknown,
 }
 
-/// A verdict plus the source that decided it (`L`ocal build / `C`ache) and
-/// whether local observations disagree (flaky).
-#[derive(Clone, Copy)]
-pub struct Side {
-    pub verdict: Verdict,
-    pub tag: &'static str,
-    pub flaky: bool,
+impl State {
+    fn glyph(self) -> &'static str {
+        match self {
+            State::Built => "✅",
+            State::Failed => "❌",
+            State::Blocked => "🚫",
+            State::Absent => "➖",
+            State::Unknown => "❓",
+        }
+    }
 }
 
-/// Reduce a drv's observations to a verdict. Local builds are ground truth and
-/// win over the cache; a local success beats a local failure (it *can* build)
-/// but the disagreement is flagged flaky.
-pub fn side_verdict(obs: &[Observation]) -> Side {
-    let is = |src: Source, built: bool| {
-        obs.iter().any(|o| {
-            o.source == src
-                && match o.outcome {
-                    Outcome::Built => built,
-                    Outcome::Failed | Outcome::DepFailed => !built,
-                    Outcome::NotAttempted => false,
-                }
-        })
+/// Reduce a side (its optional drv + that drv's observations) to a state.
+///
+/// Local observations are ground truth and win over the cache; a local success
+/// beats a local failure (it *can* build). A direct failure outranks a
+/// dependency failure (it's the more specific fact about this drv).
+pub fn side_state(drv: &Option<String>, obs: &[Observation]) -> State {
+    if drv.is_none() {
+        return State::Absent;
+    }
+    let has = |src: Source, out: Outcome| {
+        obs.iter().any(|o| o.source == src && o.outcome == out)
     };
-    let (lb, lf) = (is(Source::Local, true), is(Source::Local, false));
-    if lb || lf {
-        return Side {
-            verdict: if lb { Verdict::Built } else { Verdict::Failed },
-            tag: "L",
-            flaky: lb && lf,
-        };
-    }
-    if is(Source::Cache, true) {
-        return Side { verdict: Verdict::Built, tag: "C", flaky: false };
-    }
-    Side { verdict: Verdict::Unknown, tag: "", flaky: false }
-}
-
-/// The verdict for a side, given whether the attr has a derivation there.
-/// No drv ⇒ `Absent` (a fact); a drv with no observations ⇒ `Unknown`.
-fn side_for(drv: &Option<String>, obs: &[Observation]) -> Side {
-    match drv {
-        None => Side { verdict: Verdict::Absent, tag: "", flaky: false },
-        Some(_) => side_verdict(obs),
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Category {
-    Regression,
-    Unverified,
-    Fixed,
-    NewlyFails,
-    Dropped,
-    PreExisting,
-    NewlyBuilds,
-    Builds,
-}
-
-/// Emission order (worst/most-actionable first) with emoji + heading.
-pub const CATEGORIES: &[(Category, &str, &str)] = &[
-    (Category::Regression, "🔴", "regression — builds on base, fails here"),
-    (Category::Unverified, "❔", "unverified — need a base/head build to classify"),
-    (Category::Fixed, "🟢", "fixed — fails on base, builds here"),
-    (Category::NewlyFails, "🟣", "added but fails to build"),
-    (Category::Dropped, "🟠", "dropped — present on base, gone here"),
-    (Category::PreExisting, "⚪", "pre-existing failure — fails on base and here"),
-    (Category::NewlyBuilds, "🔵", "added, builds"),
-    (Category::Builds, "✅", "builds (unchanged or base already green)"),
-];
-
-pub fn classify(kind: DiffKind, base: Verdict, head: Verdict) -> Category {
-    use Verdict::{Built, Failed};
-    match kind {
-        DiffKind::Added => match head {
-            Built => Category::NewlyBuilds,
-            Failed => Category::NewlyFails,
-            _ => Category::Unverified,
-        },
-        DiffKind::Removed => Category::Dropped,
-        DiffKind::Changed | DiffKind::Unchanged => match (base, head) {
-            (Built, Failed) => Category::Regression,
-            (Failed, Built) => Category::Fixed,
-            (Failed, Failed) => Category::PreExisting,
-            (_, Built) => Category::Builds,
-            // head fails/unknown with an unknown-or-absent base -> needs a build
-            _ => Category::Unverified,
-        },
-    }
-}
-
-fn glyph(v: Verdict) -> &'static str {
-    match v {
-        Verdict::Built => "✓",
-        Verdict::Failed => "✗",
-        Verdict::Unknown => "?",
-        Verdict::Absent => "—",
-    }
-}
-
-fn fmt_side(s: Side) -> String {
-    if s.tag.is_empty() {
-        glyph(s.verdict).to_string()
+    if has(Source::Local, Outcome::Built) {
+        State::Built
+    } else if has(Source::Local, Outcome::Failed) {
+        State::Failed
+    } else if has(Source::Local, Outcome::DepFailed) {
+        State::Blocked
+    } else if has(Source::Cache, Outcome::Built) {
+        State::Built
     } else {
-        format!("{}({})", glyph(s.verdict), s.tag)
+        State::Unknown
     }
 }
 
-/// One classified attr for a system.
-pub struct Row {
+/// One changed attr for a system: its drv on each side and each side's state.
+pub struct Entry {
     pub attr: String,
-    pub category: Category,
-    pub base: Side,
-    pub head: Side,
+    pub base_drv: Option<String>,
+    pub head_drv: Option<String>,
+    pub base: State,
+    pub head: State,
 }
 
-/// Build a row from a diff entry, looking up each side's verdict. A side with no
-/// derivation is `Absent` (rendered `—`), distinct from a present-but-unbuilt
-/// `Unknown` (`?`).
-pub fn row_for(
-    entry: &DiffEntry,
-    base_obs: &[Observation],
-    head_obs: &[Observation],
-) -> Row {
-    let base = side_for(&entry.base_drv, base_obs);
-    let head = side_for(&entry.head_drv, head_obs);
-    Row {
-        attr: entry.attr.clone(),
-        category: classify(entry.kind, base.verdict, head.verdict),
-        base,
-        head,
+/// The section a `(base, head)` pair belongs to: an emission-priority index
+/// (lower = worse / more actionable, emitted first), a count noun, and a phrase.
+fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
+    use State::{Absent, Blocked, Built, Failed, Unknown};
+    // Nouns are singular count-nouns (pluralized with a trailing "s" by the
+    // renderer), so the phrase, not the noun, carries the before→after detail.
+    match (base, head) {
+        (Built, Failed) => (0, "regression", "build on the base, fail here"),
+        (Built, Blocked) => (1, "blocked package", "build on the base, a dependency fails here"),
+        (Absent, Failed) => (2, "new failure", "added here, fail to build"),
+        (Absent, Blocked) => (3, "new blocked package", "added here, blocked by a failed dependency"),
+        (Unknown, Failed) => (4, "failure", "fail here; base status unknown"),
+        (Unknown, Blocked) => (5, "blocked package", "blocked here; base status unknown"),
+        (Failed, Failed) => (6, "pre-existing failure", "fail on the base and here"),
+        (Failed, Blocked) => (7, "pre-existing failure", "fail on the base, blocked here"),
+        (Blocked, Failed) => (8, "pre-existing failure", "blocked on the base, fail here"),
+        (Blocked, Blocked) => (9, "pre-existing blocked package", "blocked on the base and here"),
+        (Built, Absent) => (10, "dropped package", "build on the base, gone here"),
+        (Failed, Absent) => (11, "removed package", "failed on the base, gone here"),
+        (Blocked, Absent) => (12, "removed package", "blocked on the base, gone here"),
+        (Failed, Built) => (13, "fixed package", "fail on the base, build here"),
+        (Blocked, Built) => (14, "fixed package", "blocked on the base, build here"),
+        (Absent, Built) => (15, "new package", "new here, build"),
+        (Unknown, Built) => (16, "built package", "build here; base status unknown"),
+        (Built, Built) => (17, "unchanged package", "build on the base and here"),
+        // Any leftover (e.g. Unknown↔Unknown under --no-build) — last, generic.
+        _ => (18, "package", "see the before → after glyphs"),
     }
 }
 
-/// Render the per-system rows to Markdown, grouped by category.
-pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Row>)]) -> String {
+/// Render one section: its `before → after` header, then one bullet per group
+/// of attrs sharing a derivation (`a = b = c`, shortest attr first).
+fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
+    // Group attrs by their (base, head) drv pair — same pair ⇒ same build.
+    let mut by_drv: BTreeMap<(Option<String>, Option<String>), Vec<String>> = BTreeMap::new();
+    for e in entries {
+        by_drv
+            .entry((e.base_drv.clone(), e.head_drv.clone()))
+            .or_default()
+            .push(e.attr.clone());
+    }
+    let groups = by_drv.len();
+    let attrs_total = entries.len();
+
+    let (_, noun, phrase) = cell(base, head);
+    let plural = if groups == 1 { "" } else { "s" };
+    // Note the raw attr count too, but only when grouping actually collapsed rows.
+    let note = if attrs_total != groups {
+        format!(" ({attrs_total} attrs)")
+    } else {
+        String::new()
+    };
+    // Collapsed unless the state changed — the reviewer's eye goes to the deltas.
+    let open = if base != head { " open" } else { "" };
+
+    let mut s = format!(
+        "<details{open}><summary>{} → {} · <b>{groups} {noun}{plural}</b>{note} — {phrase}</summary>\n\n",
+        base.glyph(),
+        head.glyph(),
+    );
+    // One line per drv-group; within a line, shortest attr first; lines sorted.
+    let mut lines: Vec<String> = by_drv
+        .values()
+        .map(|attrs| {
+            let mut a = attrs.clone();
+            a.sort_by(|x, y| x.len().cmp(&y.len()).then_with(|| x.cmp(y)));
+            a.iter().map(|x| format!("`{x}`")).collect::<Vec<_>>().join(" = ")
+        })
+        .collect();
+    lines.sort();
+    for line in lines {
+        s.push_str(&format!("- {line}\n"));
+    }
+    s.push_str("</details>\n\n");
+    s
+}
+
+/// Render the per-system entries to Markdown, grouped into `before → after`
+/// sections ordered worst-delta-first.
+pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Entry>)]) -> String {
     let mut out = format!("## `npd` report: `{base}` → `{head}`\n\n");
     out.push_str(
-        "Verdicts from the observation log — `base → head`, source tag `L` local build / \
-         `C` binary cache. `✓` builds, `✗` fails, `—` absent (no such attr on that side), \
-         `?` unbuilt.\n",
+        "Legend: ✅ built · ❌ failed · 🚫 blocked by a failed dependency · ➖ absent · \
+         ❓ unbuilt. Each section reads `before → after`; attrs joined by `=` share a derivation.\n",
     );
-    for (system, rows) in per_system {
-        out.push_str(&format!("\n### `{system}`\n"));
-        if rows.is_empty() {
-            out.push_str("\n_No changed attrs._\n");
+    for (system, entries) in per_system {
+        out.push_str(&format!("\n### `{system}`\n\n"));
+        if entries.is_empty() {
+            out.push_str("_No changed attrs._\n");
             continue;
         }
-        for (cat, emoji, heading) in CATEGORIES {
-            let group: Vec<&Row> = rows.iter().filter(|r| r.category == *cat).collect();
-            if group.is_empty() {
-                continue;
-            }
-            out.push_str(&format!("\n<b>{emoji} {} {heading}</b>\n\n", group.len()));
-            for r in group {
-                let flaky = if r.base.flaky || r.head.flaky {
-                    " · ⚠️ flaky locally"
-                } else {
-                    ""
-                };
-                out.push_str(&format!(
-                    "- `{}`: {} → {}{flaky}\n",
-                    r.attr,
-                    fmt_side(r.base),
-                    fmt_side(r.head)
-                ));
-            }
+        // Bucket by (base, head) state, then emit buckets in priority order.
+        let mut buckets: HashMap<(State, State), Vec<&Entry>> = HashMap::new();
+        for e in entries {
+            buckets.entry((e.base, e.head)).or_default().push(e);
+        }
+        let mut keys: Vec<(State, State)> = buckets.keys().copied().collect();
+        keys.sort_by_key(|(b, h)| cell(*b, *h).0);
+        for (b, h) in keys {
+            out.push_str(&render_section(b, h, &buckets[&(b, h)]));
         }
     }
     out
@@ -208,66 +195,61 @@ mod tests {
     }
 
     #[test]
-    fn verdict_prefers_local_and_flags_flaky() {
-        assert_eq!(side_verdict(&[]).verdict, Verdict::Unknown);
-        assert_eq!(
-            side_verdict(&[obs(Source::Cache, Outcome::Built)]).verdict,
-            Verdict::Built
+    fn state_reduction() {
+        // No drv on a side is Absent, not Unknown.
+        assert_eq!(side_state(&None, &[]), State::Absent);
+        // A drv with no facts is Unknown (distinct from Absent).
+        let d = Some("/nix/store/x.drv".to_string());
+        assert_eq!(side_state(&d, &[]), State::Unknown);
+        // Direct vs transitive failures are distinguished.
+        assert_eq!(side_state(&d, &[obs(Source::Local, Outcome::Failed)]), State::Failed);
+        assert_eq!(side_state(&d, &[obs(Source::Local, Outcome::DepFailed)]), State::Blocked);
+        // Cache success reads as Built; a local build wins over it.
+        assert_eq!(side_state(&d, &[obs(Source::Cache, Outcome::Built)]), State::Built);
+        let s = side_state(
+            &d,
+            &[obs(Source::Cache, Outcome::Built), obs(Source::Local, Outcome::Failed)],
         );
-        // local failure overrides a cache success as the "ground truth" source...
-        let s = side_verdict(&[
-            obs(Source::Cache, Outcome::Built),
-            obs(Source::Local, Outcome::Failed),
-        ]);
-        assert_eq!(s.verdict, Verdict::Failed);
-        assert_eq!(s.tag, "L");
-        // ...but a local success + local failure = flaky, and success wins.
-        let f = side_verdict(&[
-            obs(Source::Local, Outcome::Failed),
-            obs(Source::Local, Outcome::Built),
-        ]);
-        assert_eq!(f.verdict, Verdict::Built);
-        assert!(f.flaky);
+        assert_eq!(s, State::Failed);
+    }
+
+    fn entry(attr: &str, base: State, head: State, bd: Option<&str>, hd: Option<&str>) -> Entry {
+        Entry {
+            attr: attr.into(),
+            base_drv: bd.map(str::to_string),
+            head_drv: hd.map(str::to_string),
+            base,
+            head,
+        }
     }
 
     #[test]
-    fn render_shows_absent_as_dash_not_question() {
-        use crate::diff::{DiffEntry, DiffKind};
-        // A Removed attr: present (built) on base, absent on head.
-        let entry = DiffEntry {
-            attr: "gone".into(),
-            base_drv: Some("/nix/store/a.drv".into()),
-            head_drv: None,
-            kind: DiffKind::Removed,
-            attribution: None,
-        };
-        let row = row_for(&entry, &[obs(Source::Cache, Outcome::Built)], &[]);
-        let out = render("b", "h", &[("aarch64-linux".into(), vec![row])]);
-        assert!(out.contains("`gone`: ✓(C) → —"), "got:\n{out}");
-        assert!(!out.contains("→ ?"), "absent head must not render as `?`:\n{out}");
-    }
+    fn render_sections_tokens_grouping_and_folding() {
+        let entries = vec![
+            // regression (state changed → open)
+            entry("pkgA", State::Built, State::Failed, Some("/b/a.drv"), Some("/h/a.drv")),
+            // two distinct blocked drvs (state changed → open), transitive glyph 🚫
+            entry("dep1", State::Built, State::Blocked, Some("/b/d1"), Some("/h/d1")),
+            entry("dep2", State::Built, State::Blocked, Some("/b/d2"), Some("/h/d2")),
+            // two attrs sharing one drv, unchanged (state same → collapsed, grouped)
+            entry("z.foo", State::Built, State::Built, Some("/b/f"), Some("/h/f")),
+            entry("foo", State::Built, State::Built, Some("/b/f"), Some("/h/f")),
+        ];
+        let out = render("base", "head", &[("aarch64-linux".into(), entries)]);
 
-    #[test]
-    fn absent_side_is_not_unknown() {
-        // No drv on a side -> Absent (`—`), distinct from a present-but-unbuilt `?`.
-        let s = side_for(&None, &[]);
-        assert_eq!(s.verdict, Verdict::Absent);
-        let u = side_for(&Some("/nix/store/x.drv".into()), &[]);
-        assert_eq!(u.verdict, Verdict::Unknown);
-    }
-
-    #[test]
-    fn classify_grid() {
-        use Verdict::{Built, Failed, Unknown};
-        let c = DiffKind::Changed;
-        assert_eq!(classify(c, Built, Failed), Category::Regression);
-        assert_eq!(classify(c, Failed, Built), Category::Fixed);
-        assert_eq!(classify(c, Failed, Failed), Category::PreExisting);
-        assert_eq!(classify(c, Built, Built), Category::Builds);
-        assert_eq!(classify(c, Unknown, Failed), Category::Unverified);
-        assert_eq!(classify(c, Unknown, Built), Category::Builds);
-        assert_eq!(classify(DiffKind::Added, Unknown, Built), Category::NewlyBuilds);
-        assert_eq!(classify(DiffKind::Added, Unknown, Failed), Category::NewlyFails);
-        assert_eq!(classify(DiffKind::Removed, Built, Unknown), Category::Dropped);
+        // Composable tokens and the transitive distinction.
+        assert!(out.contains("✅ → ❌ · <b>1 regression</b>"), "{out}");
+        assert!(out.contains("✅ → 🚫 · <b>2 blocked packages</b>"), "{out}");
+        // Grouping: shared drv collapses to one equals-joined line, shortest first.
+        assert!(out.contains("- `foo` = `z.foo`"), "{out}");
+        assert!(out.contains("✅ → ✅ · <b>1 unchanged package</b> (2 attrs)"), "{out}");
+        // Folding: changed states open, unchanged collapsed.
+        assert!(out.contains("<details open><summary>✅ → ❌"), "{out}");
+        assert!(out.contains("<details><summary>✅ → ✅"), "{out}");
+        // Ordering: regression before blocked before unchanged.
+        let reg = out.find("→ ❌").unwrap();
+        let blk = out.find("→ 🚫").unwrap();
+        let unch = out.find("✅ → ✅").unwrap();
+        assert!(reg < blk && blk < unch, "{out}");
     }
 }

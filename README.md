@@ -37,11 +37,12 @@ end-to-end; every command is **instant when its result is already known**.
   driver (remembers successes *and failures*, keeps logs), one batched `nom`
   build, parallel cache probing, `--dry-run` / `--recheck` / `--retry` /
   `--prefer-local`.
-- `npd report [base] [head]` — classifies the changed set (regression / fixed /
-  pre-existing / dropped / …). With no args, `head` = `HEAD` and `base` =
-  merge-base of `HEAD` and `master`; it **builds whatever the verdicts need**
-  first (both sides), so there are no `?`. `--no-build` renders from existing
-  facts only.
+- `npd report [base] [head]` — groups the changed set by its `before → after`
+  delta (regression / blocked-by-a-regression / fixed / dropped / …), folded and
+  with drv-sharing attrs collapsed (`a = b = c`). With no args, `head` = `HEAD`
+  and `base` = merge-base of `HEAD` and `master`; it **builds whatever the states
+  need** first (both sides), so there are no unknowns. `--no-build` renders from
+  existing facts only.
 
 ## Development
 

@@ -555,11 +555,11 @@ fn cmd_report(
         }
     }
 
-    // Render from the (now-populated) log.
+    // Render from the (now-populated) log: reduce each side to a state.
     let store = store::Store::open(&eval::db_path()?)?;
     let mut per_system = Vec::new();
     for (sys, changed) in &per_system_diff {
-        let mut rows = Vec::new();
+        let mut entries = Vec::new();
         for e in changed {
             let base_obs = match &e.base_drv {
                 Some(d) => store.load_observations(d)?,
@@ -569,9 +569,15 @@ fn cmd_report(
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
-            rows.push(report::row_for(e, &base_obs, &head_obs));
+            entries.push(report::Entry {
+                attr: e.attr.clone(),
+                base_drv: e.base_drv.clone(),
+                head_drv: e.head_drv.clone(),
+                base: report::side_state(&e.base_drv, &base_obs),
+                head: report::side_state(&e.head_drv, &head_obs),
+            });
         }
-        per_system.push((sys.clone(), rows));
+        per_system.push((sys.clone(), entries));
     }
     print!("{}", report::render(&base, &head, &per_system));
     Ok(())

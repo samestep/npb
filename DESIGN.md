@@ -195,17 +195,22 @@ can change under us). Ground truth for anything a narinfo can't answer is a
 
 ## 8. Reports
 
-Markdown: group each attr by its **delta** (regression / fixed / dropped / added
-/ pre-existing / newly-builds / …) for triage, and render a **composed token**
-per row (`base → head`, tagged `L` local / `C` cache) so no information is lost.
-The glyphs are deliberately distinct: `✓` built, `✗` failed, `?` *unknown* (has a
-drv here, not yet built), `—` *absent* (no such attr on this side). Absence is a
-**known fact**, never a `?`.
+Markdown, grouped by the **delta** each attr underwent. Each side reduces to one
+of five states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependency
+failed — the transitive/cascade case, kept distinct from a direct failure), `➖`
+absent (no such attr on that side — a *known* fact, never a `?`), `❓` unbuilt
+(has a drv, no fact yet; only under `--no-build`). A section is one `(base, head)`
+state pair, and its header **is** a composable `before → after` token (one emoji
+per side) — no per-row glyphs; the section a row lands in carries all the meaning.
+Sections are ordered worst-delta-first and folded in `<details>` (open when the
+state changed, collapsed when `before == after`). Attrs that share a derivation
+are collapsed onto one line (`a = b = c`, shortest attr first), like
+`nixpkgs-review`'s aliases — npd gets this for free from its drvpath keying.
 
 `npd report` is not merely read-only: with defaults (`head` = `HEAD`, `base` =
 merge-base with `master`) it first **builds both sides of the changed set**
 (skipping anything already known or substitutable), so a fresh report has a real
-verdict for every row rather than a wall of `?`. `--no-build` opts back into pure
+state for every row rather than a wall of `❓`. `--no-build` opts back into pure
 read-only rendering.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
