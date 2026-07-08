@@ -10,7 +10,6 @@
 
 mod build;
 mod cache;
-mod diff;
 mod eval;
 mod model;
 mod report;
@@ -23,7 +22,6 @@ use std::process::Command as Proc;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser};
 
-use crate::diff::DiffKind;
 use crate::model::BuildPolicy;
 
 #[derive(Parser)]
@@ -146,15 +144,6 @@ fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-/// The attrs an eval produced for `sys` (empty if that system wasn't evaluated).
-fn attrs_for(evals: &[eval::Eval], sys: &str) -> Vec<model::AttrEval> {
-    evals
-        .iter()
-        .find(|e| e.system == sys)
-        .map(|e| e.attrs.clone())
-        .unwrap_or_default()
-}
-
 /// Resolve report revisions with ergonomic defaults: head defaults to `HEAD`,
 /// base to the merge-base of head and `master` (the fork point of this branch).
 fn resolve_base_head(
@@ -183,19 +172,28 @@ fn run(cli: Cli) -> Result<()> {
     let systems = resolve_systems(cli.system);
 
     let (base_evals, head_evals) =
-        eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, &[], opts)?;
+        eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, opts)?;
 
-    // The changed set per system, computed once and reused for both the build and
-    // the render so they can never disagree.
-    let mut per_system_diff: Vec<(String, Vec<diff::DiffEntry>)> = Vec::new();
-    for sys in &systems {
-        let b = attrs_for(&base_evals, sys);
-        let h = attrs_for(&head_evals, sys);
-        let changed: Vec<diff::DiffEntry> = diff::diff_evals(&b, &h, None)
-            .into_iter()
-            .filter(|e| e.kind != DiffKind::Unchanged)
-            .collect();
-        per_system_diff.push((sys.clone(), changed));
+    // The changed set per system — `(attr, base_drv, head_drv)` — diffed in
+    // SQLite from the two eval runs, so we never load the full attr maps into
+    // Rust. Computed once and reused for both the build and the render.
+    type Changed = Vec<(String, Option<String>, Option<String>)>;
+    let mut per_system_changed: Vec<(String, Changed)> = Vec::new();
+    {
+        let store = store::Store::open(&eval::db_path()?)?;
+        for sys in &systems {
+            let br = base_evals
+                .iter()
+                .find(|e| &e.system == sys)
+                .map(|e| e.run_id)
+                .context("base eval missing for a requested system")?;
+            let hr = head_evals
+                .iter()
+                .find(|e| &e.system == sys)
+                .map(|e| e.run_id)
+                .context("head eval missing for a requested system")?;
+            per_system_changed.push((sys.clone(), store.changed_drvs(br, hr)?));
+        }
     }
 
     // Build both sides of the changed set (skipping anything already known or
@@ -203,12 +201,12 @@ fn run(cli: Cli) -> Result<()> {
     if !cli.no_build {
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
-        for (sys, changed) in &per_system_diff {
-            for e in changed {
-                for drv in [&e.base_drv, &e.head_drv].into_iter().flatten() {
+        for (sys, changed) in &per_system_changed {
+            for (attr, base_drv, head_drv) in changed {
+                for drv in [base_drv, head_drv].into_iter().flatten() {
                     if seen.insert((drv.clone(), sys.clone())) {
                         targets.push(build::Target {
-                            attr: e.attr.clone(),
+                            attr: attr.clone(),
                             system: sys.clone(),
                             drv_path: drv.clone(),
                         });
@@ -224,23 +222,23 @@ fn run(cli: Cli) -> Result<()> {
     // Render from the (now-populated) log: reduce each side to a state.
     let store = store::Store::open(&eval::db_path()?)?;
     let mut per_system = Vec::new();
-    for (sys, changed) in &per_system_diff {
+    for (sys, changed) in &per_system_changed {
         let mut entries = Vec::new();
-        for e in changed {
-            let base_obs = match &e.base_drv {
+        for (attr, base_drv, head_drv) in changed {
+            let base_obs = match base_drv {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
-            let head_obs = match &e.head_drv {
+            let head_obs = match head_drv {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
             entries.push(report::Entry {
-                attr: e.attr.clone(),
-                base_drv: e.base_drv.clone(),
-                head_drv: e.head_drv.clone(),
-                base: report::side_state(&e.base_drv, &base_obs),
-                head: report::side_state(&e.head_drv, &head_obs),
+                attr: attr.clone(),
+                base_drv: base_drv.clone(),
+                head_drv: head_drv.clone(),
+                base: report::side_state(base_drv, &base_obs),
+                head: report::side_state(head_drv, &head_obs),
             });
         }
         per_system.push((sys.clone(), entries));

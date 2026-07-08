@@ -112,38 +112,15 @@ fn parse_jobs<R: std::io::Read>(reader: R) -> Result<Vec<AttrEval>> {
 
 // --- running the evaluator --------------------------------------------------
 
-/// Build the Nix expression `nix-eval-jobs` walks. The revision's source is
-/// fetched by `builtins.fetchGit`. With no `scope` it is the whole package set;
-/// with a scope it is just those (dotted) attrs.
-fn build_expr(
-    repo: &Path,
-    commit: &str,
-    system: &str,
-    profile: &str,
-    scope: &[String],
-) -> Result<String> {
+/// Build the whole-package-set Nix expression `nix-eval-jobs` walks. The
+/// revision's source is fetched by `builtins.fetchGit`.
+fn build_expr(repo: &Path, commit: &str, system: &str, profile: &str) -> Result<String> {
     let cfg = profile_config(profile)?;
-    let base = format!(
+    Ok(format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{commit}\"; }}) \
          {{ system = \"{system}\"; config = {cfg}; }}",
         repo.display()
-    );
-    if scope.is_empty() {
-        return Ok(base);
-    }
-    let entries: String = scope
-        .iter()
-        .map(|p| {
-            let path_list = p
-                .split('.')
-                .map(|s| format!("\"{s}\""))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("\"{p}\" = pkgs.lib.attrByPath [ {path_list} ] (throw \"missing attr {p}\") pkgs;")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(format!("let pkgs = {base}; in {{ {entries} }}"))
+    ))
 }
 
 /// Run one `nix-eval-jobs` invocation with `workers` worker processes, each
@@ -155,12 +132,11 @@ fn run_eval_pb(
     commit: &str,
     system: &str,
     profile: &str,
-    scope: &[String],
     workers: usize,
     per_worker_mb: u64,
     pb: &ProgressBar,
 ) -> Result<Vec<AttrEval>> {
-    let expr = build_expr(repo, commit, system, profile, scope)?;
+    let expr = build_expr(repo, commit, system, profile)?;
     // Send stderr to a log file rather than inheriting it: nix-eval-jobs prints a
     // full Nix traceback per errored attr (megabytes over a whole package set),
     // and the actionable per-attr error is already in the stdout JSON. A file
@@ -343,19 +319,20 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(cache_root()?.join("npd.sqlite"))
 }
 
-/// A completed evaluation and where its result came from.
+/// A completed evaluation: its `eval_run` id (the attr map stays in SQLite —
+/// callers diff/query it there) and where the result came from.
 #[derive(Clone)]
 pub struct Eval {
     pub commit: String,
     pub system: String,
-    pub attrs: Vec<AttrEval>,
+    pub run_id: i64,
     pub from_cache: bool,
 }
 
-/// Evaluate every `(commit, system)` pair. Full-set evals (`scope` empty) are
-/// cached read-through in SQLite and served without touching the evaluator;
-/// the rest run concurrently under a RAM-slot budget (see [`eval_plan`]) — no
-/// oversubscription, no killing in-flight work. Scoped evals always run fresh.
+/// Evaluate every `(commit, system)` pair, caching read-through in SQLite. A
+/// cache hit resolves to a `run_id` without loading its ~114k-row attr map (the
+/// caller diffs/queries in SQL); misses run concurrently under a RAM-slot budget
+/// (see [`eval_plan`]) — no oversubscription, no killing in-flight work.
 ///
 /// All SQLite access happens on this thread (reads before the fan-out, writes
 /// after the join), so the worker threads only run subprocesses and parse.
@@ -363,28 +340,25 @@ pub fn eval_pairs(
     repo: &Path,
     pairs: &[(String, String)],
     profile: &str,
-    scope: &[String],
     opts: EvalOpts,
 ) -> Result<Vec<Eval>> {
     let mut store = Store::open(&db_path()?)?;
     let now = chrono::Utc::now().timestamp();
 
-    // Split into cache hits (served now) and jobs to run.
-    let mut cached: Vec<Option<Vec<AttrEval>>> = vec![None; pairs.len()];
+    // Split into cache hits (a cheap run_id lookup) and jobs to run.
+    let mut cached: Vec<Option<i64>> = vec![None; pairs.len()];
     let mut todo: Vec<usize> = Vec::new();
     for (i, (commit, system)) in pairs.iter().enumerate() {
-        if scope.is_empty()
-            && let Some(attrs) = store.load_eval(commit, system, profile, EVAL_VERSION)?
-        {
-            // A cache hit is silent — a fully-cached run must print nothing.
-            cached[i] = Some(attrs);
+        if let Some(run_id) = store.eval_run_id(commit, system, profile, EVAL_VERSION)? {
+            cached[i] = Some(run_id);
         } else {
             todo.push(i);
         }
     }
 
-    // Run the uncached jobs concurrently, sharing one MultiProgress.
-    let mut computed: Vec<(usize, Vec<AttrEval>)> = Vec::new();
+    // Run the uncached jobs concurrently, sharing one MultiProgress; persist each
+    // and keep its run_id.
+    let mut computed_run: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
     if !todo.is_empty() {
         let plan = eval_plan(todo.len(), opts);
         eprintln!(
@@ -399,66 +373,50 @@ pub fn eval_pairs(
         );
         let sem = Semaphore::new(plan.concurrency);
         let mp = MultiProgress::new();
-        computed = thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
-            let mut handles = Vec::new();
-            for &i in &todo {
-                let (commit, system) = (&pairs[i].0, &pairs[i].1);
-                let pb = mp.add(ProgressBar::new_spinner());
-                let sem = &sem;
-                handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
-                    sem.acquire();
-                    let r = run_eval_pb(
-                        repo, commit, system, profile, scope, plan.workers, plan.per_worker_mb, &pb,
-                    );
-                    sem.release();
-                    Ok((i, r?))
-                }));
-            }
-            let mut out = Vec::new();
-            for h in handles {
-                out.push(h.join().expect("eval thread panicked")?);
-            }
-            Ok(out)
-        })?;
-        // Persist the freshly-computed full-set evals (scoped evals aren't cached).
-        if scope.is_empty() {
-            for (i, attrs) in &computed {
-                let (commit, system) = &pairs[*i];
-                store.store_eval(commit, system, profile, EVAL_VERSION, now, attrs)?;
-            }
+        let computed: Vec<(usize, Vec<AttrEval>)> =
+            thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
+                let mut handles = Vec::new();
+                for &i in &todo {
+                    let (commit, system) = (&pairs[i].0, &pairs[i].1);
+                    let pb = mp.add(ProgressBar::new_spinner());
+                    let sem = &sem;
+                    handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
+                        sem.acquire();
+                        let r = run_eval_pb(
+                            repo, commit, system, profile, plan.workers, plan.per_worker_mb, &pb,
+                        );
+                        sem.release();
+                        Ok((i, r?))
+                    }));
+                }
+                let mut out = Vec::new();
+                for h in handles {
+                    out.push(h.join().expect("eval thread panicked")?);
+                }
+                Ok(out)
+            })?;
+        for (i, attrs) in &computed {
+            let (commit, system) = &pairs[*i];
+            let run_id = store.store_eval(commit, system, profile, EVAL_VERSION, now, attrs)?;
+            computed_run.insert(*i, run_id);
         }
     }
 
     // Reassemble in the original pair order.
-    let mut computed: std::collections::HashMap<usize, Vec<AttrEval>> = computed.into_iter().collect();
     let mut results = Vec::with_capacity(pairs.len());
     for (i, (commit, system)) in pairs.iter().enumerate() {
-        let (attrs, from_cache) = match cached[i].take() {
-            Some(a) => (a, true),
-            None => (computed.remove(&i).expect("every job produced a result"), false),
+        let (run_id, from_cache) = match cached[i] {
+            Some(r) => (r, true),
+            None => (computed_run[&i], false),
         };
         results.push(Eval {
             commit: commit.clone(),
             system: system.clone(),
-            attrs,
+            run_id,
             from_cache,
         });
     }
     Ok(results)
-}
-
-/// Evaluate one `commit` for each `system` (a batch over the systems).
-pub fn eval_commit(
-    repo: &Path,
-    commit: &str,
-    systems: &[String],
-    profile: &str,
-    scope: &[String],
-    opts: EvalOpts,
-) -> Result<Vec<Eval>> {
-    let pairs: Vec<(String, String)> =
-        systems.iter().map(|s| (commit.to_string(), s.clone())).collect();
-    eval_pairs(repo, &pairs, profile, scope, opts)
 }
 
 /// Evaluate two commits across the same systems in one batch, so `base` and
@@ -470,7 +428,6 @@ pub fn eval_two(
     head: &str,
     systems: &[String],
     profile: &str,
-    scope: &[String],
     opts: EvalOpts,
 ) -> Result<(Vec<Eval>, Vec<Eval>)> {
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
@@ -480,7 +437,7 @@ pub fn eval_two(
     for s in systems {
         pairs.push((head.to_string(), s.clone()));
     }
-    let all = eval_pairs(repo, &pairs, profile, scope, opts)?;
+    let all = eval_pairs(repo, &pairs, profile, opts)?;
     let base_evals = all.iter().filter(|e| e.commit == base).cloned().collect();
     let head_evals = all.iter().filter(|e| e.commit == head).cloned().collect();
     Ok((base_evals, head_evals))
@@ -517,16 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn full_expr_fetches_and_imports_scoped_expr_selects() {
+    fn full_expr_fetches_and_imports() {
         let repo = Path::new("/repo");
-        let full = build_expr(repo, "abc123", "aarch64-linux", "default", &[]).unwrap();
+        let full = build_expr(repo, "abc123", "aarch64-linux", "default").unwrap();
         assert!(full.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
         assert!(full.contains("allowBroken = true"));
-
-        let scoped =
-            build_expr(repo, "abc123", "aarch64-linux", "default", &["python3Packages.numpy".into()])
-                .unwrap();
-        assert!(scoped.contains(r#"attrByPath [ "python3Packages" "numpy" ]"#));
     }
 
     #[test]

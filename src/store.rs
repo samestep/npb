@@ -138,6 +138,63 @@ impl Store {
             .optional()?)
     }
 
+    /// The `eval_run` id for this key, or `None` if never evaluated. Cheap — a
+    /// single indexed lookup, without loading the ~114k-row attr map.
+    pub fn eval_run_id(
+        &self,
+        commit: &str,
+        system: &str,
+        profile: &str,
+        version: u32,
+    ) -> Result<Option<i64>> {
+        Self::run_id(&self.conn, commit, system, profile, version)
+    }
+
+    /// The changed set between two eval runs, computed *in SQLite*: for each attr
+    /// whose drv differs (added / removed / changed), `(attr, base_drv, head_drv)`.
+    /// Returns only the ~hundreds of changed rows rather than loading both full
+    /// ~114k-row maps into Rust to diff them.
+    ///
+    /// Written as two PK-driven passes rather than a `FULL OUTER JOIN`: the join
+    /// key `attr` only lives in the `(run_id, attr)` primary key, and SQLite
+    /// won't index a derived subquery, so a join over two `WHERE run_id=?`
+    /// subqueries degrades to an O(n²) scan (13e9 comparisons here). Instead each
+    /// base row point-looks-up its head counterpart via the PK, and a second pass
+    /// finds head-only (added) attrs — both O(n log n). `IS NOT` is null-safe, so
+    /// a missing counterpart (NULL) counts as a difference.
+    pub fn changed_drvs(
+        &self,
+        base_run: i64,
+        head_run: i64,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.attr, b.drv_path, \
+                    (SELECT drv_path FROM attr_eval WHERE run_id = ?2 AND attr = b.attr) \
+             FROM attr_eval b \
+             WHERE b.run_id = ?1 \
+               AND b.drv_path IS NOT \
+                   (SELECT drv_path FROM attr_eval WHERE run_id = ?2 AND attr = b.attr) \
+             UNION ALL \
+             SELECT h.attr, NULL, h.drv_path \
+             FROM attr_eval h \
+             WHERE h.run_id = ?2 \
+               AND NOT EXISTS (SELECT 1 FROM attr_eval b WHERE b.run_id = ?1 AND b.attr = h.attr) \
+             ORDER BY 1",
+        )?;
+        let rows = stmt.query_map(params![base_run, head_run], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// The cached full-set eval for this key, or `None` if never evaluated.
     pub fn load_eval(
         &self,
@@ -175,7 +232,8 @@ impl Store {
         Ok(Some(out))
     }
 
-    /// Store (replacing any prior) the full-set eval for this key.
+    /// Store (replacing any prior) the full-set eval for this key; return its
+    /// `eval_run` id.
     pub fn store_eval(
         &mut self,
         commit: &str,
@@ -184,7 +242,7 @@ impl Store {
         version: u32,
         evaluated_at: i64,
         attrs: &[AttrEval],
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let tx = self.conn.transaction()?;
         // Upsert the run, then (re)populate its attrs. Deleting the run cascades
         // to its old attr_eval rows.
@@ -216,7 +274,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(run_id)
     }
 
     /// Append one observation to the log (never overwrites; DESIGN.md §3).
