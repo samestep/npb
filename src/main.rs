@@ -54,6 +54,13 @@ struct Cli {
     /// other attr. Ported from nixpkgs-review's `--tests` (#397).
     #[arg(long)]
     tests: bool,
+    /// Also build packages marked broken/unsupported/insecure (skipped and
+    /// reported as 🚧 by default, like nixpkgs-review).
+    #[arg(long)]
+    build_broken: bool,
+    /// Everything on: implies --tests and --build-broken.
+    #[arg(long)]
+    max: bool,
     #[command(flatten)]
     eval: EvalArgs,
 }
@@ -188,10 +195,14 @@ fn cached_test_drvs(
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // --max is simply "everything on".
+    let tests = cli.tests || cli.max;
+    let build_broken = cli.build_broken || cli.max;
     let policy = BuildPolicy {
         recheck: cli.recheck,
         retry: cli.retry,
         prefer_local: cli.prefer_local,
+        build_broken,
     };
     let opts = cli.eval.opts();
     let repo = resolve_repo(cli.nixpkgs)?;
@@ -200,9 +211,10 @@ fn run(cli: Cli) -> Result<()> {
 
     eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, opts)?;
 
-    // The changed set per system — `(attr, base_drv, head_drv)` — from a linear
-    // merge of the two sorted eval files. Computed once, reused for build+render.
-    let mut per_system_changed: Vec<(String, Vec<eval::ChangedDrv>)> = Vec::new();
+    // The changed set per system — each attr's drv + meta-blocked bit per side —
+    // from a linear merge of the two sorted eval files. Computed once, reused
+    // for build+render.
+    let mut per_system_changed: Vec<(String, Vec<eval::ChangedAttr>)> = Vec::new();
     for sys in &systems {
         let changed = eval::changed_set(&base, &head, sys, eval::DEFAULT_PROFILE)?;
         per_system_changed.push((sys.clone(), changed));
@@ -213,15 +225,28 @@ fn run(cli: Cli) -> Result<()> {
     // per-package SQLite cache — see `cached_test_drvs`) and keep a test as a
     // changed attr only when its drv actually differs base→head — exactly
     // `changed_set`'s own semantics, so the test rows classify (regression /
-    // fixed / new / …) like every other attr.
-    if cli.tests {
+    // fixed / new / …) like every other attr. A side where the package is
+    // marked broken contributes no tests (a test drv depends on the package,
+    // so building it would build the broken package) unless --build-broken.
+    if tests {
         let mut store = store::Store::open(&eval::db_path()?)?;
         for (sys, changed) in per_system_changed.iter_mut() {
-            let mut names: Vec<String> = changed.iter().map(|(a, _, _)| a.clone()).collect();
-            names.sort();
-            names.dedup();
-            let bmap = cached_test_drvs(&mut store, &repo, &base, sys, eval::DEFAULT_PROFILE, &names)?;
-            let hmap = cached_test_drvs(&mut store, &repo, &head, sys, eval::DEFAULT_PROFILE, &names)?;
+            let names_on = |unbroken: fn(&eval::ChangedAttr) -> bool| -> Vec<String> {
+                let mut v: Vec<String> = changed
+                    .iter()
+                    .filter(|c| build_broken || unbroken(c))
+                    .map(|c| c.attr.clone())
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            };
+            let base_names = names_on(|c| !c.base_broken);
+            let head_names = names_on(|c| !c.head_broken);
+            let bmap =
+                cached_test_drvs(&mut store, &repo, &base, sys, eval::DEFAULT_PROFILE, &base_names)?;
+            let hmap =
+                cached_test_drvs(&mut store, &repo, &head, sys, eval::DEFAULT_PROFILE, &head_names)?;
             let mut keys: Vec<String> = bmap.keys().chain(hmap.keys()).cloned().collect();
             keys.sort();
             keys.dedup();
@@ -231,25 +256,35 @@ fn run(cli: Cli) -> Result<()> {
                 // Maps hold only resolved drvs, so a differing pair always has a
                 // drv on at least one side (a test dropped/added/rebuilt).
                 if bd != hd {
-                    changed.push((k, bd, hd));
+                    changed.push(eval::ChangedAttr {
+                        attr: k,
+                        base_drv: bd,
+                        head_drv: hd,
+                        base_broken: false,
+                        head_broken: false,
+                    });
                 }
             }
         }
     }
 
-    // Build both sides of the changed set (skipping anything already known or
-    // substitutable) so the report has a real state for every row, not a `❓`.
+    // Build both sides of the changed set (skipping anything already known,
+    // substitutable, or marked broken) so the report has a real state for every
+    // row, not a `❓`.
     if !cli.no_build {
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
         for (sys, changed) in &per_system_changed {
-            for (attr, base_drv, head_drv) in changed {
-                for drv in [base_drv, head_drv].into_iter().flatten() {
+            for c in changed {
+                let sides = [(&c.base_drv, c.base_broken), (&c.head_drv, c.head_broken)];
+                for (drv, broken) in sides {
+                    let Some(drv) = drv else { continue };
                     if seen.insert((drv.clone(), sys.clone())) {
                         targets.push(build::Target {
-                            attr: attr.clone(),
+                            attr: c.attr.clone(),
                             system: sys.clone(),
                             drv_path: drv.clone(),
+                            broken,
                         });
                     }
                 }
@@ -265,21 +300,21 @@ fn run(cli: Cli) -> Result<()> {
     let mut per_system = Vec::new();
     for (sys, changed) in &per_system_changed {
         let mut entries = Vec::new();
-        for (attr, base_drv, head_drv) in changed {
-            let base_obs = match base_drv {
+        for c in changed {
+            let base_obs = match &c.base_drv {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
-            let head_obs = match head_drv {
+            let head_obs = match &c.head_drv {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
             entries.push(report::Entry {
-                attr: attr.clone(),
-                base_drv: base_drv.clone(),
-                head_drv: head_drv.clone(),
-                base: report::side_state(base_drv, &base_obs),
-                head: report::side_state(head_drv, &head_obs),
+                attr: c.attr.clone(),
+                base_drv: c.base_drv.clone(),
+                head_drv: c.head_drv.clone(),
+                base: report::side_state(&c.base_drv, c.base_broken, &base_obs),
+                head: report::side_state(&c.head_drv, c.head_broken, &head_obs),
             });
         }
         per_system.push((sys.clone(), entries));

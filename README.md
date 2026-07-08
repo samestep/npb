@@ -35,13 +35,17 @@ npd [BASE] [HEAD]
 
 With no arguments, `head` = `HEAD` and `base` = merge-base of `HEAD` and `master`.
 It **builds whatever the states need** first (both sides of the changed set,
-skipping anything already known or substitutable), then groups the result by its
-`before → after` delta (regression / blocked-by-a-regression / fixed / dropped /
-…), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
+skipping anything already known, substitutable, or marked
+broken/unsupported/insecure — the latter reported as 🚧, like nixpkgs-review),
+then groups the result by its `before → after` delta (regression /
+blocked-by-a-regression / newly-marked-broken / fixed / dropped / …), folded,
+with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
 (render from existing facts only), `--recheck` / `--retry` / `--prefer-local`
 (build-policy knobs), `--tests` (also build each changed package's
 `passthru.tests`, on both sides — ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),
+`--build-broken` (build meta-blocked packages too), `--max` (everything on:
+implies `--tests` and `--build-broken`),
 `--system` (repeatable), `--nixpkgs`, and RAM-sizing knobs
 for the parallel evaluator. Under the hood: evals cached as flat per-commit files
 (diffed by a linear merge), a tiny SQLite observation log, streamed

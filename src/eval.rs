@@ -28,7 +28,7 @@ use crate::model::{AttrEval, TestJob};
 /// different version are ignored (and regenerated), never parsed by newer code —
 /// this version tag is the *only* format-change mechanism (no migration code,
 /// see CLAUDE.md).
-pub const EVAL_VERSION: u32 = 3;
+pub const EVAL_VERSION: u32 = 4;
 
 /// The default (and, for now, only) eval profile. npd owns the config so the key
 /// stays a short enumerable label rather than arbitrary Nix (DESIGN.md §6). The
@@ -46,6 +46,16 @@ fn profile_config(profile: &str) -> Result<&'static str> {
 
 // --- nix-eval-jobs output ---------------------------------------------------
 
+/// The slice of `meta` we consume (from `--meta`): the availability bits
+/// nixpkgs' check-meta computes. The profile's allow-flags let these packages
+/// evaluate to a drv anyway; the bits say they shouldn't be *built* by default.
+#[derive(Deserialize, Default)]
+struct RawMeta {
+    broken: Option<bool>,
+    unsupported: Option<bool>,
+    insecure: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawJob {
@@ -57,12 +67,17 @@ struct RawJob {
     /// `None` when evaluation of the attr errored (the job line carries an
     /// `error` message instead, which we don't keep — `nix log`/re-eval has it).
     drv_path: Option<String>,
+    meta: Option<RawMeta>,
 }
 
 fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
+    let meta = raw.meta.unwrap_or_default();
     AttrEval {
         attr: raw.attr,
         drv_path: raw.drv_path,
+        broken: meta.broken == Some(true)
+            || meta.unsupported == Some(true)
+            || meta.insecure == Some(true),
     }
 }
 
@@ -131,10 +146,9 @@ fn stream_jobs<T>(
     // the last few lines for the fatal-error diagnostic below; draining it (vs. an
     // undrained pipe) also can't deadlock while we stream stdout.
 
-    // No `--meta`: we only keep `attr → drv`, and `--meta` forces each package's
-    // meta attrset (extra evaluation, plus extra allocation that inflates the
-    // GC-heavy heap — especially costly on macOS). It doesn't affect drvPaths, so
-    // cached eval files stay valid.
+    // `--meta` costs ~15% (each package's meta attrset is forced and emitted),
+    // but it's what carries `broken`/`unsupported`/`insecure` — the bits the
+    // build policy needs to skip meta-blocked packages by default.
 
     // nix-eval-jobs compares `--max-memory-size` (MiB) against `ru_maxrss`
     // scaled by 1024, which is correct on Linux (KiB) but off by 1024× on
@@ -151,6 +165,7 @@ fn stream_jobs<T>(
     };
     let mut child = Command::new("nix-eval-jobs")
         .args([
+            "--meta",
             "--workers",
             &workers.to_string(),
             "--max-memory-size",
@@ -498,8 +513,9 @@ pub fn db_path() -> Result<PathBuf> {
 // is diff two of them — so a flat file is both smaller (no per-row / index
 // overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file (drop
 // old commits' evals) without vacuuming a monolithic DB. The format is one
-// `attr\tdrv` line per attr, sorted by attr (empty drv = no derivation), so the
-// diff is a linear two-pointer merge.
+// `attr\tdrv` line per attr, sorted by attr (empty drv = no derivation), plus a
+// third field `b` on the few rows whose package is marked
+// broken/unsupported/insecure, so the diff is a linear two-pointer merge.
 //
 // The drv column is stored *stripped*: `/nix/store/<h>-<n>.drv` is written as
 // just `<h>-<n>` (see `strip_drv`), since that prefix/suffix is constant across
@@ -527,16 +543,20 @@ fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
 /// place. A crash can never leave a truncated file that would poison the cache,
 /// and concurrent writers of the same key can't tread on each other's temp.
 fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
-    let mut rows: Vec<(&str, &str)> = attrs
+    let mut rows: Vec<(&str, &str, bool)> = attrs
         .iter()
-        .map(|a| (a.attr.as_str(), a.drv_path.as_deref().map(strip_drv).unwrap_or("")))
+        .map(|a| (a.attr.as_str(), a.drv_path.as_deref().map(strip_drv).unwrap_or(""), a.broken))
         .collect();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut buf = String::with_capacity(rows.len() * 96);
-    for (attr, drv) in rows {
+    for (attr, drv, broken) in rows {
         buf.push_str(attr);
         buf.push('\t');
         buf.push_str(drv);
+        // A third field only on the (few) meta-blocked rows: `b`.
+        if broken {
+            buf.push_str("\tb");
+        }
         buf.push('\n');
     }
     // Level 0 = zstd's default level (currently 3); pass the sentinel rather than
@@ -575,28 +595,44 @@ fn restore_drv(field: Option<&str>) -> Option<String> {
     field.map(|s| format!("/nix/store/{s}.drv"))
 }
 
-/// Parse an eval file's bytes into `(attr, Option<stored-drv>)` pairs, borrowing
-/// from `buf` (no per-attr allocation). The drv is left in its stored form (see
-/// [`strip_drv`]); since that encoding is injective, the merge can compare stored
-/// fields directly and only [`restore_drv`] the few rows it emits. Assumes the
-/// file is already sorted by attr.
-fn parse_eval(buf: &str) -> Vec<(&str, Option<&str>)> {
+/// One parsed eval row, borrowing from the file buffer: attr, stored-form drv,
+/// and the meta-blocked bit.
+type EvalRow<'a> = (&'a str, Option<&'a str>, bool);
+
+/// Parse an eval file's bytes into [`EvalRow`]s, borrowing from `buf` (no
+/// per-attr allocation). The drv is left in its stored form (see [`strip_drv`]);
+/// since that encoding is injective, the merge can compare stored fields
+/// directly and only [`restore_drv`] the few rows it emits. Assumes the file is
+/// already sorted by attr.
+fn parse_eval(buf: &str) -> Vec<EvalRow<'_>> {
     buf.lines()
         .map(|l| {
-            let (attr, drv) = l.split_once('\t').unwrap_or((l, ""));
-            (attr, if drv.is_empty() { None } else { Some(drv) })
+            let mut fields = l.splitn(3, '\t');
+            let attr = fields.next().unwrap_or(l);
+            let drv = fields.next().unwrap_or("");
+            let broken = fields.next() == Some("b");
+            (attr, if drv.is_empty() { None } else { Some(drv) }, broken)
         })
         .collect()
 }
 
-/// One changed attr between two evals: its path and its drv on each side (`None`
-/// = absent/no derivation there).
-pub type ChangedDrv = (String, Option<String>, Option<String>);
+/// One changed attr between two evals: its drv and meta-blocked bit on each side
+/// (`None` = absent/no derivation there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedAttr {
+    pub attr: String,
+    pub base_drv: Option<String>,
+    pub head_drv: Option<String>,
+    pub base_broken: bool,
+    pub head_broken: bool,
+}
 
-/// The changed set between two cached evals — one [`ChangedDrv`] for each attr
-/// whose drv differs — via a linear two-pointer merge over the two sorted files.
-/// Only the (few) changed rows are allocated.
-pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Result<Vec<ChangedDrv>> {
+/// The changed set between two cached evals — one [`ChangedAttr`] for each attr
+/// whose drv *or* meta-blocked bit differs (meta isn't part of the drv hash, so
+/// (un)marking a package broken can change nothing but the bit — still a review
+/// event worth a row) — via a linear two-pointer merge over the two sorted
+/// files. Only the (few) changed rows are allocated.
+pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Result<Vec<ChangedAttr>> {
     let bp = eval_path(base, system, profile)?;
     let hp = eval_path(head, system, profile)?;
     let bbuf = read_eval(&bp)?;
@@ -604,25 +640,48 @@ pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Resul
     let b = parse_eval(&bbuf);
     let h = parse_eval(&hbuf);
 
+    // One side only: absent on the other (an attr with no drv — an eval error —
+    // is treated as absent, exactly as before).
+    let base_only = |r: &EvalRow| ChangedAttr {
+        attr: r.0.to_string(),
+        base_drv: restore_drv(r.1),
+        head_drv: None,
+        base_broken: r.2,
+        head_broken: false,
+    };
+    let head_only = |r: &EvalRow| ChangedAttr {
+        attr: r.0.to_string(),
+        base_drv: None,
+        head_drv: restore_drv(r.1),
+        base_broken: false,
+        head_broken: r.2,
+    };
+
     let mut out = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < b.len() && j < h.len() {
         match b[i].0.cmp(h[j].0) {
             std::cmp::Ordering::Less => {
                 if b[i].1.is_some() {
-                    out.push((b[i].0.to_string(), restore_drv(b[i].1), None));
+                    out.push(base_only(&b[i]));
                 }
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
                 if h[j].1.is_some() {
-                    out.push((h[j].0.to_string(), None, restore_drv(h[j].1)));
+                    out.push(head_only(&h[j]));
                 }
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                if b[i].1 != h[j].1 {
-                    out.push((b[i].0.to_string(), restore_drv(b[i].1), restore_drv(h[j].1)));
+                if b[i].1 != h[j].1 || b[i].2 != h[j].2 {
+                    out.push(ChangedAttr {
+                        attr: b[i].0.to_string(),
+                        base_drv: restore_drv(b[i].1),
+                        head_drv: restore_drv(h[j].1),
+                        base_broken: b[i].2,
+                        head_broken: h[j].2,
+                    });
                 }
                 i += 1;
                 j += 1;
@@ -631,12 +690,12 @@ pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Resul
     }
     for k in &b[i..] {
         if k.1.is_some() {
-            out.push((k.0.to_string(), restore_drv(k.1), None));
+            out.push(base_only(k));
         }
     }
     for k in &h[j..] {
         if k.1.is_some() {
-            out.push((k.0.to_string(), None, restore_drv(k.1)));
+            out.push(head_only(k));
         }
     }
     Ok(out)
@@ -726,23 +785,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_success_and_error_lines() {
-        // Unknown fields (meta, system, fatal, …) are simply ignored; an errored
-        // attr has no drvPath.
+    fn parses_success_broken_and_error_lines() {
+        // Any of meta.broken/unsupported/insecure folds into the one `broken`
+        // bit; an errored attr has no drvPath (and no meta). Unknown fields
+        // (system, fatal, …) are simply ignored.
         let stdout = concat!(
-            r#"{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/a-hello.drv","meta":{"broken":false},"system":"aarch64-linux"}"#,
+            r#"{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/a-hello.drv","meta":{"broken":false,"unsupported":false},"system":"aarch64-linux"}"#,
+            "\n",
+            r#"{"attr":"br","attrPath":["br"],"drvPath":"/nix/store/b-br.drv","meta":{"broken":true}}"#,
+            "\n",
+            r#"{"attr":"unsup","attrPath":["unsup"],"drvPath":"/nix/store/c-unsup.drv","meta":{"unsupported":true}}"#,
             "\n",
             r#"{"attr":"bad","attrPath":["bad"],"error":"boom","fatal":false}"#,
             "\n",
         );
         let attrs = parse_jobs(stdout.as_bytes()).unwrap();
-        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs.len(), 4);
 
         assert_eq!(attrs[0].attr, "hello");
         assert_eq!(attrs[0].drv_path.as_deref(), Some("/nix/store/a-hello.drv"));
+        assert!(!attrs[0].broken);
 
-        assert_eq!(attrs[1].attr, "bad");
-        assert_eq!(attrs[1].drv_path, None);
+        assert!(attrs[1].broken);
+        assert!(attrs[1].drv_path.is_some());
+        assert!(attrs[2].broken);
+
+        assert_eq!(attrs[3].attr, "bad");
+        assert_eq!(attrs[3].drv_path, None);
+        assert!(!attrs[3].broken);
     }
 
     #[test]
@@ -763,30 +833,35 @@ mod tests {
 
     #[test]
     fn write_eval_strips_and_parse_restores() {
-        let ae = |attr: &str, drv: Option<&str>| AttrEval {
+        let ae = |attr: &str, drv: Option<&str>, broken: bool| AttrEval {
             attr: attr.into(),
             drv_path: drv.map(str::to_string),
+            broken,
         };
         let attrs = [
-            ae("hello", Some("/nix/store/a-hello.drv")),
-            ae("bad", None),
+            ae("hello", Some("/nix/store/a-hello.drv"), false),
+            ae("br", Some("/nix/store/b-br.drv"), true),
+            ae("bad", None, false),
         ];
         let dir = std::env::temp_dir().join(format!("npd-eval-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("e.tsv");
         write_eval(&path, &attrs).unwrap();
 
-        // On disk the drv is stripped; a no-derivation attr is an empty field
-        // (sorted by attr: bad, hello). The file is zstd-compressed, so read it
-        // back through the same helper the diff uses.
+        // On disk the drv is stripped; a no-derivation attr is an empty field;
+        // only the meta-blocked row carries the third `b` field (sorted by attr:
+        // bad, br, hello). The file is zstd-compressed, so read it back through
+        // the same helper the diff uses.
         let raw = read_eval(&path).unwrap();
-        assert_eq!(raw, "bad\t\nhello\ta-hello\n");
+        assert_eq!(raw, "bad\t\nbr\tb-br\tb\nhello\ta-hello\n");
 
-        // Parsing + restoring recovers the original drv paths exactly.
+        // Parsing + restoring recovers the original rows exactly.
         let parsed = parse_eval(&raw);
-        let restored: Vec<_> = parsed.iter().map(|(a, d)| (*a, restore_drv(*d))).collect();
-        assert_eq!(restored[0], ("bad", None));
-        assert_eq!(restored[1], ("hello", Some("/nix/store/a-hello.drv".into())));
+        let restored: Vec<_> =
+            parsed.iter().map(|(a, d, br)| (*a, restore_drv(*d), *br)).collect();
+        assert_eq!(restored[0], ("bad", None, false));
+        assert_eq!(restored[1], ("br", Some("/nix/store/b-br.drv".into()), true));
+        assert_eq!(restored[2], ("hello", Some("/nix/store/a-hello.drv".into()), false));
         let _ = fs::remove_dir_all(&dir);
     }
 

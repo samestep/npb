@@ -103,7 +103,8 @@ again, Nix rebuilds or substitutes it.
 The two fact kinds have opposite access patterns, so they get different backends.
 
 **Evals → one flat file per `(commit, system, profile)`** under `evals/`, sorted
-`attr\tdrv` lines (empty drv = no derivation; `src/eval.rs`). The drv is stored
+`attr\tdrv` lines (empty drv = no derivation; a third field `b` marks the few
+attrs whose meta says broken/unsupported/insecure; `src/eval.rs`). The drv is stored
 stripped of its constant `/nix/store/…​.drv` prefix/suffix, and the whole file is
 zstd-compressed (default level) — together ~3× smaller (~11 MB → ~3.4 MB). An eval is bulk,
 write-once, read-as-a-whole data whose *only* use is to be diffed against another
@@ -155,6 +156,10 @@ Every local build appends an `Observation` (source, outcome, when, duration,
 machine). The ergonomics the workflow needs are then a **pure predicate**
 over that log plus substituter presence:
 
+- marked broken/unsupported/insecure, `--build-broken` off → **skip (broken)**
+  — never attempted, like nixpkgs-review; the report shows 🚧. (Checked first,
+  so `--retry`/`--recheck` alone don't build it; a real fact recorded by an
+  earlier `--build-broken` run still wins.)
 - never observed, or forced → **build**
 - a `LOCAL` success exists, `--recheck` off → **skip (ok)**
 - substitutable success, `--prefer-local`/`--recheck` off → **skip (ok)**
@@ -163,8 +168,9 @@ over that log plus substituter presence:
 
 So the cache-bypass knobs are just fields on the policy: `recheck` (rebuild a
 suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
-(don't trust a substituted success — build it here). See `BuildPolicy::decide`
-in `src/model.rs`.
+(don't trust a substituted success — build it here), `build_broken` (attempt
+meta-blocked packages too). See `BuildPolicy::decide` in `src/model.rs`.
+`--max` at the CLI is simply everything on: `--tests` + `--build-broken`.
 
 **Staying instant when cached.** The driver loads every target's history in one
 SQLite query, and only *probes the cache* for drvs it doesn't already know are
@@ -203,8 +209,12 @@ machines); IFD is still deterministic, and impurities like `currentSystem` are
 fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, once
 `npd` owns the config.
 
-`eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs` (cached, pure).
-A two-way diff is a set-diff on `(attr, drv_path)`. The **three-way** diff also
+`eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
+pure). Each attr carries its drv plus one meta bit — marked
+broken/unsupported/insecure — since meta is *not* part of the drv hash, so the
+build policy and report can't recover it from the drv alone. A two-way diff is
+a set-diff on `(attr, drv_path, broken)` — a meta-only (un)marking changes no
+drv but is still a review event and gets a row. The **three-way** diff also
 evaluates the **merge base** of the two commits, which classifies each changed
 attr the way a git three-way merge does:
 
@@ -270,8 +280,10 @@ can change under us). Ground truth for anything a narinfo can't answer is a
 ## 8. Reports
 
 Markdown, grouped by the **delta** each attr underwent. Each side reduces to one
-of five states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependency
-failed — the transitive/cascade case, kept distinct from a direct failure), `➖`
+of six states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependency
+failed — the transitive/cascade case, kept distinct from a direct failure), `🚧`
+marked broken (meta broken/unsupported/insecure — not attempted by default; a
+real build fact from a `--build-broken` run outranks the marking), `➖`
 absent (no such attr on that side — a *known* fact, never a `?`), `❓` unbuilt
 (has a drv, no fact yet; only under `--no-build`). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji

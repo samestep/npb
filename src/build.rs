@@ -28,6 +28,9 @@ pub struct Target {
     pub attr: String,
     pub system: String,
     pub drv_path: String,
+    /// Marked broken/unsupported/insecure in meta — skipped by the default
+    /// policy (`BuildPolicy::build_broken` overrides).
+    pub broken: bool,
 }
 
 /// What happened to one target.
@@ -263,11 +266,13 @@ fn build_targets_at(
     let has_fact = |drv: &str| {
         obs_of(drv).iter().any(|o| o.source == Source::Local) || cache_built(drv)
     };
+    // A broken target the policy will skip anyway isn't worth an HTTP probe.
+    let skipped_broken = |t: &Target| t.broken && !policy.build_broken;
     let mut to_probe: Vec<String> = Vec::new();
     if !force {
         let mut seen = HashSet::new();
         for t in targets {
-            if !has_fact(&t.drv_path) && seen.insert(t.drv_path.clone()) {
+            if !has_fact(&t.drv_path) && !skipped_broken(t) && seen.insert(t.drv_path.clone()) {
                 to_probe.push(t.drv_path.clone());
             }
         }
@@ -285,7 +290,7 @@ fn build_targets_at(
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
         let sub = substitutable(&t.drv_path);
-        let decision = policy.decide(observations, sub);
+        let decision = policy.decide(observations, sub, t.broken);
         match decision {
             Decision::Build if dry_run => println!("  would build           {} {}", t.system, t.attr),
             Decision::Build => to_build.push(i),
@@ -304,7 +309,7 @@ fn build_targets_at(
                     })?;
                 }
             }
-            Decision::SkipFail => {}
+            Decision::SkipFail | Decision::SkipBroken => {}
         }
         results.push(Built {
             attr: t.attr.clone(),
@@ -456,6 +461,7 @@ mod tests {
                 attr: attr.to_string(),
                 system: "testsys".to_string(),
                 drv_path: drv.clone(),
+                broken: false,
             })
             .collect();
         let db2 = db.clone();
