@@ -11,10 +11,12 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use indicatif::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar};
 use serde::Deserialize;
 
 use crate::model::{AttrEval, Existence};
@@ -144,46 +146,58 @@ fn build_expr(
     Ok(format!("let pkgs = {base}; in {{ {entries} }}"))
 }
 
-fn run_eval(
+/// Run one `nix-eval-jobs` invocation with `workers` worker processes, each
+/// heap-capped at `per_worker_mb` (nix-eval-jobs restarts a worker that exceeds
+/// it, so total memory ≈ `workers * per_worker_mb`). Progress is streamed onto
+/// the caller-supplied `pb`, letting several evals share one MultiProgress.
+fn run_eval_pb(
     repo: &Path,
     commit: &str,
     system: &str,
     profile: &str,
     scope: &[String],
+    workers: usize,
+    per_worker_mb: u64,
+    pb: &ProgressBar,
 ) -> Result<Vec<AttrEval>> {
     let expr = build_expr(repo, commit, system, profile, scope)?;
     // Send stderr to a log file rather than inheriting it: nix-eval-jobs prints a
     // full Nix traceback per errored attr (megabytes over a whole package set),
     // and the actionable per-attr error is already in the stdout JSON. A file
     // (unlike an undrained pipe) also can't deadlock while we stream stdout.
+    // One log per (commit, system) so concurrent evals don't clobber each other.
+    let short: String = commit.chars().take(12).collect();
     let log_dir = cache_root()?.join("logs");
     fs::create_dir_all(&log_dir).context("creating log dir")?;
-    let log_path = log_dir.join("eval.log");
+    let log_path = log_dir.join(format!("eval-{short}-{system}.log"));
     let log = File::create(&log_path).context("creating eval log")?;
 
     let mut child = Command::new("nix-eval-jobs")
-        .args(["--meta", "--workers", "4", "--expr", &expr])
+        .args([
+            "--meta",
+            "--workers",
+            &workers.to_string(),
+            "--max-memory-size",
+            &per_worker_mb.to_string(),
+            "--expr",
+            &expr,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log))
         .spawn()
         .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
 
-    // A full-set eval takes minutes; stream a live attr counter so it never
-    // looks hung. Progress goes to stderr (stdout stays clean for piping).
-    // A full-set eval takes minutes; a spinner keeps it visibly alive. Like npc,
-    // set_message per attr is cheap — the steady tick repaints (to stderr) every
-    // 100ms, so this both throttles redraws and shows the true running count.
-    let short: String = commit.chars().take(12).collect();
-    let spinner = ProgressBar::new_spinner();
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    spinner.set_message(format!("evaluating {short} ({system})…"));
+    // A full-set eval takes minutes; a per-attr message on a steady-tick spinner
+    // keeps it visibly alive (the tick throttles the repaint, like npc).
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message(format!("evaluating {short} ({system}, {workers}w)…"));
     let mut attrs = Vec::new();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
         attrs.push(raw_to_attr_eval(item.context("parsing nix-eval-jobs output")?));
-        spinner.set_message(format!("evaluating {short} ({system})… {} attrs", attrs.len()));
+        pb.set_message(format!("evaluating {short} ({system}, {workers}w)… {} attrs", attrs.len()));
     }
-    spinner.finish_with_message(format!("evaluated {short} ({system}): {} attrs", attrs.len()));
+    pb.finish_with_message(format!("evaluated {short} ({system}): {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
     // nix-eval-jobs exits non-zero if *any* attr errored but still emits the
@@ -197,6 +211,94 @@ fn run_eval(
         );
     }
     Ok(attrs)
+}
+
+// --- concurrency: a memory-slot budget over parallel evals -------------------
+
+/// Default per-worker heap cap (matches nix-eval-jobs' own 4 GiB default).
+const DEFAULT_WORKER_MEM_MB: u64 = 4096;
+/// A single eval sees diminishing returns past this many workers (each worker
+/// redundantly re-evaluates the package-set spine), so cap the auto-derived
+/// width here even when the RAM budget could afford more.
+const MAX_WORKERS_PER_EVAL: u64 = 8;
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+/// Total system RAM in MiB (Linux `/proc/meminfo`); a conservative fallback
+/// elsewhere (e.g. macOS) since we only auto-size on the Linux build boxes.
+fn total_mem_mb() -> u64 {
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(8192)
+}
+
+/// How to run a batch of `n_jobs` evals: how many at once, how wide each, and
+/// the per-worker heap cap. Derived from a RAM budget (default 80% of system
+/// RAM) divided into `per_worker_mb` slots; each knob is env-overridable so the
+/// scheme can be benchmarked point-by-point.
+struct EvalPlan {
+    concurrency: usize,
+    workers: usize,
+    per_worker_mb: u64,
+    budget_mb: u64,
+    slots: u64,
+}
+
+fn eval_plan(n_jobs: usize) -> EvalPlan {
+    let per_worker_mb = env_u64("NPD_WORKER_MEM_MB").unwrap_or(DEFAULT_WORKER_MEM_MB);
+    let budget_mb = env_u64("NPD_MEM_BUDGET_MB").unwrap_or_else(|| total_mem_mb() * 8 / 10);
+    let slots = (budget_mb / per_worker_mb).max(1);
+    // Run as many evals at once as fit in the budget (but no more than we have),
+    // splitting the slots evenly across them; each override wins if set.
+    let concurrency = env_u64("NPD_EVAL_CONCURRENCY")
+        .unwrap_or(slots)
+        .min(n_jobs.max(1) as u64)
+        .max(1);
+    let workers = env_u64("NPD_EVAL_WORKERS")
+        .unwrap_or_else(|| (slots / concurrency).clamp(1, MAX_WORKERS_PER_EVAL))
+        .max(1);
+    EvalPlan {
+        concurrency: concurrency as usize,
+        workers: workers as usize,
+        per_worker_mb,
+        budget_mb,
+        slots,
+    }
+}
+
+/// A counting semaphore (std has none): admits at most `permits` evals at once.
+struct Semaphore {
+    m: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Semaphore {
+            m: Mutex::new(permits),
+            cv: Condvar::new(),
+        }
+    }
+    fn acquire(&self) {
+        let mut n = self.m.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+    }
+    fn release(&self) {
+        *self.m.lock().unwrap() += 1;
+        self.cv.notify_one();
+    }
 }
 
 /// The last `lines` lines of a (possibly large) file; empty if unreadable.
@@ -223,14 +325,110 @@ pub fn db_path() -> Result<PathBuf> {
 }
 
 /// A completed evaluation and where its result came from.
+#[derive(Clone)]
 pub struct Eval {
+    pub commit: String,
     pub system: String,
     pub attrs: Vec<AttrEval>,
     pub from_cache: bool,
 }
 
-/// Evaluate `commit` for each `system`. Full-set evals (`scope` empty) are
-/// cached read-through in SQLite; scoped evals are ad-hoc and always run fresh.
+/// Evaluate every `(commit, system)` pair. Full-set evals (`scope` empty) are
+/// cached read-through in SQLite and served without touching the evaluator;
+/// the rest run concurrently under a RAM-slot budget (see [`eval_plan`]) — no
+/// oversubscription, no killing in-flight work. Scoped evals always run fresh.
+///
+/// All SQLite access happens on this thread (reads before the fan-out, writes
+/// after the join), so the worker threads only run subprocesses and parse.
+pub fn eval_pairs(
+    repo: &Path,
+    pairs: &[(String, String)],
+    profile: &str,
+    scope: &[String],
+) -> Result<Vec<Eval>> {
+    let mut store = Store::open(&db_path()?)?;
+    let now = chrono::Utc::now().timestamp();
+
+    // Split into cache hits (served now) and jobs to run.
+    let mut cached: Vec<Option<Vec<AttrEval>>> = vec![None; pairs.len()];
+    let mut todo: Vec<usize> = Vec::new();
+    for (i, (commit, system)) in pairs.iter().enumerate() {
+        if scope.is_empty()
+            && let Some(attrs) = store.load_eval(commit, system, profile, EVAL_VERSION)?
+        {
+            let short: String = commit.chars().take(12).collect();
+            eprintln!("  using cached eval: {short} ({system})");
+            cached[i] = Some(attrs);
+        } else {
+            todo.push(i);
+        }
+    }
+
+    // Run the uncached jobs concurrently, sharing one MultiProgress.
+    let mut computed: Vec<(usize, Vec<AttrEval>)> = Vec::new();
+    if !todo.is_empty() {
+        let plan = eval_plan(todo.len());
+        eprintln!(
+            "  eval plan: {} job(s), budget {}MB / {}MB per worker = {} slot(s) \
+             -> {} concurrent x {} worker(s)",
+            todo.len(),
+            plan.budget_mb,
+            plan.per_worker_mb,
+            plan.slots,
+            plan.concurrency,
+            plan.workers,
+        );
+        let sem = Semaphore::new(plan.concurrency);
+        let mp = MultiProgress::new();
+        computed = thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
+            let mut handles = Vec::new();
+            for &i in &todo {
+                let (commit, system) = (&pairs[i].0, &pairs[i].1);
+                let pb = mp.add(ProgressBar::new_spinner());
+                let sem = &sem;
+                handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
+                    sem.acquire();
+                    let r = run_eval_pb(
+                        repo, commit, system, profile, scope, plan.workers, plan.per_worker_mb, &pb,
+                    );
+                    sem.release();
+                    Ok((i, r?))
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.join().expect("eval thread panicked")?);
+            }
+            Ok(out)
+        })?;
+        // Persist the freshly-computed full-set evals (scoped evals aren't cached).
+        if scope.is_empty() {
+            for (i, attrs) in &computed {
+                let (commit, system) = &pairs[*i];
+                store.store_eval(commit, system, profile, EVAL_VERSION, now, attrs)?;
+            }
+        }
+    }
+
+    // Reassemble in the original pair order.
+    let mut computed: std::collections::HashMap<usize, Vec<AttrEval>> = computed.into_iter().collect();
+    let mut results = Vec::with_capacity(pairs.len());
+    for (i, (commit, system)) in pairs.iter().enumerate() {
+        let (attrs, from_cache) = match cached[i].take() {
+            Some(a) => (a, true),
+            None => (computed.remove(&i).expect("every job produced a result"), false),
+        };
+        results.push(Eval {
+            commit: commit.clone(),
+            system: system.clone(),
+            attrs,
+            from_cache,
+        });
+    }
+    Ok(results)
+}
+
+/// Evaluate one `commit` for each `system` (a batch over the systems).
 pub fn eval_commit(
     repo: &Path,
     commit: &str,
@@ -238,33 +436,33 @@ pub fn eval_commit(
     profile: &str,
     scope: &[String],
 ) -> Result<Vec<Eval>> {
-    let mut store = Store::open(&db_path()?)?;
-    let now = chrono::Utc::now().timestamp();
-    let mut results = Vec::new();
-    for system in systems {
-        if scope.is_empty()
-            && let Some(attrs) = store.load_eval(commit, system, profile, EVAL_VERSION)?
-        {
-            let short: String = commit.chars().take(12).collect();
-            eprintln!("  using cached eval: {short} ({system})");
-            results.push(Eval {
-                system: system.clone(),
-                attrs,
-                from_cache: true,
-            });
-            continue;
-        }
-        let attrs = run_eval(repo, commit, system, profile, scope)?;
-        if scope.is_empty() {
-            store.store_eval(commit, system, profile, EVAL_VERSION, now, &attrs)?;
-        }
-        results.push(Eval {
-            system: system.clone(),
-            attrs,
-            from_cache: false,
-        });
+    let pairs: Vec<(String, String)> =
+        systems.iter().map(|s| (commit.to_string(), s.clone())).collect();
+    eval_pairs(repo, &pairs, profile, scope)
+}
+
+/// Evaluate two commits across the same systems in one batch, so `base` and
+/// `head` run concurrently rather than one-then-the-other. Returns their evals
+/// split back out (base, head).
+pub fn eval_two(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    systems: &[String],
+    profile: &str,
+    scope: &[String],
+) -> Result<(Vec<Eval>, Vec<Eval>)> {
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
+    for s in systems {
+        pairs.push((base.to_string(), s.clone()));
     }
-    Ok(results)
+    for s in systems {
+        pairs.push((head.to_string(), s.clone()));
+    }
+    let all = eval_pairs(repo, &pairs, profile, scope)?;
+    let base_evals = all.iter().filter(|e| e.commit == base).cloned().collect();
+    let head_evals = all.iter().filter(|e| e.commit == head).cloned().collect();
+    Ok((base_evals, head_evals))
 }
 
 #[cfg(test)]

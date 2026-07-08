@@ -278,8 +278,7 @@ fn cmd_diff(
         None
     };
 
-    let base_evals = eval::eval_commit(&repo, &base, &systems, &profile, &attrs)?;
-    let head_evals = eval::eval_commit(&repo, &head, &systems, &profile, &attrs)?;
+    let (base_evals, head_evals) = eval::eval_two(&repo, &base, &head, &systems, &profile, &attrs)?;
     let mb_evals = match &merge_base {
         Some(c) => Some(eval::eval_commit(&repo, c, &systems, &profile, &attrs)?),
         None => None,
@@ -371,8 +370,8 @@ fn targets_from_diff(
     commit: &str,
     systems: &[String],
 ) -> Result<Vec<build::Target>> {
-    let base_evals = eval::eval_commit(repo, base, systems, eval::DEFAULT_PROFILE, &[])?;
-    let head_evals = eval::eval_commit(repo, commit, systems, eval::DEFAULT_PROFILE, &[])?;
+    let (base_evals, head_evals) =
+        eval::eval_two(repo, base, commit, systems, eval::DEFAULT_PROFILE, &[])?;
     let mut targets = Vec::new();
     for sys in systems {
         let b = attrs_for(&base_evals, sys);
@@ -481,9 +480,8 @@ fn cmd_hydra(
         (Some(_), false) => bail!("npd hydra: pass either attrs or --changed <base>, not both"),
         (Some(base), true) => {
             let base = resolve_commit(&repo, base)?;
-            let base_evals = eval::eval_commit(&repo, &base, &systems, eval::DEFAULT_PROFILE, &[])?;
-            let head_evals =
-                eval::eval_commit(&repo, &commit, &systems, eval::DEFAULT_PROFILE, &[])?;
+            let (base_evals, head_evals) =
+                eval::eval_two(&repo, &base, &commit, &systems, eval::DEFAULT_PROFILE, &[])?;
             for sys in &systems {
                 let b = attrs_for(&base_evals, sys);
                 let h = attrs_for(&head_evals, sys);
@@ -561,8 +559,8 @@ fn cmd_report(
     let systems = resolve_systems(system);
     let store = store::Store::open(&eval::db_path()?)?;
 
-    let base_evals = eval::eval_commit(&repo, &base, &systems, eval::DEFAULT_PROFILE, &[])?;
-    let head_evals = eval::eval_commit(&repo, &head, &systems, eval::DEFAULT_PROFILE, &[])?;
+    let (base_evals, head_evals) =
+        eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, &[])?;
 
     let mut per_system = Vec::new();
     for sys in &systems {
