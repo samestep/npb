@@ -218,39 +218,72 @@ pub struct EvalOpts {
     pub workers: Option<u64>,
 }
 
-/// Total system RAM in MiB, or a conservative 8 GiB fallback if neither probe
-/// works. Linux exposes it in `/proc/meminfo` (`MemTotal`, kiB); macOS has no
-/// such file, so we fall back to `sysctl -n hw.memsize` (bytes) — without which
-/// the auto-sizer would cap every Mac (however large) at 8 GiB → a single worker.
-fn total_mem_mb() -> u64 {
-    // Linux: /proc/meminfo.
-    if let Ok(s) = fs::read_to_string("/proc/meminfo")
-        && let Some(kb) = s
-            .lines()
-            .find(|l| l.starts_with("MemTotal:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|n| n.parse::<u64>().ok())
-    {
-        return kb / 1024;
+/// *Currently available* system RAM in MiB (not total), so the auto-sizer never
+/// oversubscribes what's actually free — otherwise a machine already using most
+/// of its RAM (e.g. a host whose VM holds half of it) would OOM/swap. Falls back
+/// to total, then to a conservative 8 GiB, if the available figure isn't
+/// obtainable. Linux: `/proc/meminfo`; macOS: `vm_stat` / `sysctl hw.memsize`.
+fn available_mem_mb() -> u64 {
+    // Linux: MemAvailable (kernel's estimate of allocatable-without-swap); fall
+    // back to MemTotal on kernels too old to report it.
+    if let Ok(s) = fs::read_to_string("/proc/meminfo") {
+        let field = |name: &str| {
+            s.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+        };
+        if let Some(kb) = field("MemAvailable:").or_else(|| field("MemTotal:")) {
+            return kb / 1024;
+        }
     }
-    // macOS: sysctl hw.memsize (total physical RAM, in bytes).
-    if let Some(bytes) = Command::new("sysctl")
+    // macOS: reclaimable pages from `vm_stat`, else total from `sysctl`.
+    macos_available_mb()
+        .or_else(macos_total_mb)
+        .unwrap_or(8192)
+}
+
+/// macOS available RAM (MiB): free + inactive + speculative + purgeable pages,
+/// per `vm_stat`. A heuristic (like Activity Monitor's "available"), but far
+/// better than assuming all of `hw.memsize` is free.
+fn macos_available_mb() -> Option<u64> {
+    let out = Command::new("vm_stat").output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    // Header: "Mach Virtual Memory Statistics: (page size of 16384 bytes)".
+    let page = text
+        .split("page size of ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(16384);
+    let pages = |name: &str| -> u64 {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .and_then(|l| l.rsplit(':').next())
+            .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let avail = pages("Pages free") + pages("Pages inactive")
+        + pages("Pages speculative") + pages("Pages purgeable");
+    (avail > 0).then_some(avail * page / 1024 / 1024)
+}
+
+/// macOS total physical RAM (MiB) via `sysctl -n hw.memsize` (bytes).
+fn macos_total_mb() -> Option<u64> {
+    Command::new("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
-    {
-        return bytes / 1024 / 1024;
-    }
-    8192
+        .map(|bytes| bytes / 1024 / 1024)
 }
 
 /// How to run a batch of `n_jobs` evals: how many at once, how wide each, and
-/// the per-worker heap cap. Derived from a RAM budget (default 80% of system
-/// RAM) divided into `per_worker_mb` slots; each knob is overridable via
-/// [`EvalOpts`] so the scheme can be benchmarked point-by-point.
+/// the per-worker heap cap. Derived from a RAM budget (default 80% of currently
+/// *available* RAM) divided into `per_worker_mb` slots; each knob is overridable
+/// via [`EvalOpts`] so the scheme can be benchmarked point-by-point.
 struct EvalPlan {
     concurrency: usize,
     workers: usize,
@@ -261,7 +294,7 @@ struct EvalPlan {
 
 fn eval_plan(n_jobs: usize, opts: EvalOpts) -> EvalPlan {
     let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
-    let budget_mb = opts.mem_budget_mb.unwrap_or_else(|| total_mem_mb() * 8 / 10);
+    let budget_mb = opts.mem_budget_mb.unwrap_or_else(|| available_mem_mb() * 8 / 10);
     let slots = (budget_mb / per_worker_mb).max(1);
     // Run as many evals at once as fit in the budget (but no more than we have),
     // splitting the slots evenly across them; each override wins if set.
@@ -562,5 +595,23 @@ mod tests {
         assert_eq!(tail(&path, 99), "l1\nl2\nl3\nl4");
         assert_eq!(tail(&dir.join("missing"), 5), "");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn available_mem_is_sane() {
+        // Whatever the platform, we must get a positive figure (never the 8 GiB
+        // fallback silently masking a probe bug on the CI host), and on Linux it
+        // can't exceed total RAM.
+        let avail = available_mem_mb();
+        assert!(avail > 0);
+        if let Ok(s) = fs::read_to_string("/proc/meminfo")
+            && let Some(total) = s
+                .lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+        {
+            assert!(avail <= total / 1024, "available {avail} MiB > total");
+        }
     }
 }

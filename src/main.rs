@@ -57,7 +57,7 @@ struct Cli {
 /// RAM (see `eval::eval_plan`).
 #[derive(Args, Clone, Copy, Default)]
 struct EvalArgs {
-    /// Total RAM budget for parallel evaluation, MiB (default: 80% of system RAM).
+    /// RAM budget for parallel evaluation, MiB (default: 80% of *available* RAM).
     #[arg(long)]
     mem_budget_mb: Option<u64>,
     /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
