@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
 use crate::model::{AttrEval, Existence};
@@ -163,16 +163,23 @@ fn run_eval_pb(
         .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
 
-    // A full-set eval takes minutes; a per-attr message on a steady-tick spinner
-    // keeps it visibly alive (the tick throttles the repaint, like npc).
+    // A full-set eval takes minutes (and is pathologically slow on macOS — see
+    // DESIGN); show a live elapsed timer next to the attr counter (like `nom`'s
+    // build timer) so a slow eval reads as "still working", not "hung". The
+    // `{elapsed}` field is re-rendered on every steady tick, so it ticks even
+    // between attrs; the counter updates as attrs stream in.
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} ⏱ {elapsed} {msg}").expect("valid template"),
+    );
+    pb.reset_elapsed();
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_message(format!("evaluating {short} ({system}, {workers}w)…"));
+    pb.set_message(format!("evaluating {short} ({system}, {workers}w)"));
     let mut attrs = Vec::new();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
         attrs.push(raw_to_attr_eval(item.context("parsing nix-eval-jobs output")?));
-        pb.set_message(format!("evaluating {short} ({system}, {workers}w)… {} attrs", attrs.len()));
+        pb.set_message(format!("evaluating {short} ({system}, {workers}w) — {} attrs", attrs.len()));
     }
-    pb.finish_with_message(format!("evaluated {short} ({system}): {} attrs", attrs.len()));
+    pb.finish_with_message(format!("evaluated {short} ({system}) — {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
     // Integrity gate. Per-attr eval errors are emitted *in band* as JSON

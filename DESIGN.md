@@ -237,6 +237,16 @@ eval/diff/build/report primitives are internal modules, not subcommands).
 Open refinements: remote-builder fan-out; a `Local`-vs-`Cache` fidelity probe
 (from-source build vs. substitution).
 
+**Known gotcha — `nix-eval-jobs` on macOS is pathologically slow.** Measured
+~1.5 attrs/s on an `aarch64-darwin` VM vs ~155 attrs/s on `aarch64-linux` on the
+same hardware — ~100× — even though a plain `nix eval` of a single package is
+instant on both. So it's specific to `nix-eval-jobs`' worker-based full-set
+streaming on darwin, not core Nix eval, and it's not fixable by npd's
+worker/memory knobs (disabling the memory cap didn't help). Practical upshot:
+run `npd` on the Linux build boxes (its intended home); a full-set eval on a Mac
+is effectively a non-starter until this is fixed upstream. The eval progress bar
+shows a live timer so a slow eval reads as working, not hung.
+
 ## 10. Open questions
 
 - The report classifier's eventual home (§8) — revisit when we get to reports.
