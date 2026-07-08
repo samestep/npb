@@ -185,7 +185,6 @@ mod tests {
             duration_s: None,
             cached: None,
             machine: None,
-            log_ref: None,
         }
     }
 

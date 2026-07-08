@@ -100,9 +100,6 @@ pub struct Observation {
     pub cached: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
-    /// Path (relative to the cache root) of the captured build log, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_ref: Option<String>,
 }
 
 /// What the build policy says to do about a derivation.
@@ -177,7 +174,6 @@ mod tests {
             duration_s: None,
             cached: None,
             machine: None,
-            log_ref: None,
         }
     }
 

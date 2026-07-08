@@ -16,7 +16,6 @@ throws away is everything else `npd` cares about:
 - **local failures** — Nix retries a failed build every time; `npd` remembers a
   failed drv (direct failure vs. dependency cascade) so your loop doesn't repeat it.
 - **eval diffs** — the attr→drv map of a revision is expensive and uncached.
-- **build logs** — kept for every build, success *and* failure.
 - **reports** — human-readable Markdown over all of the above.
 
 The one remote fact `npd` consults is `cache.nixos.org` (is this exact drv already
@@ -26,23 +25,24 @@ built and substitutable?). So `npd` is a thin **fact store + policy layer over
 
 ## Status
 
-Rust (edition 2024, à la [`npc`](https://github.com/samestep/npc)). Implemented
-end-to-end; every command is **instant when its result is already known**.
+Rust (edition 2024, à la [`npc`](https://github.com/samestep/npc)). `npd` is a
+single command: evaluate a `base → head` change, build whatever the changed set
+needs, and render the report — **instant when the result is already known**.
 
-- `npd eval <commit>` — cached attr→drv map (SQLite; streamed `nix-eval-jobs`,
-  evals run in parallel under a RAM budget).
-- `npd diff <base> <head> [--three-way]` — changed/added/removed, with merge-base
-  attribution.
-- `npd build <commit> <attrs…>` / `--changed <base>` — observation-backed build
-  driver (remembers successes *and failures*, keeps logs), one batched `nom`
-  build, parallel cache probing, `--dry-run` / `--recheck` / `--retry` /
-  `--prefer-local`.
-- `npd report [base] [head]` — groups the changed set by its `before → after`
-  delta (regression / blocked-by-a-regression / fixed / dropped / …), folded and
-  with drv-sharing attrs collapsed (`a = b = c`). With no args, `head` = `HEAD`
-  and `base` = merge-base of `HEAD` and `master`; it **builds whatever the states
-  need** first (both sides), so there are no unknowns. `--no-build` renders from
-  existing facts only.
+```
+npd [BASE] [HEAD]
+```
+
+With no arguments, `head` = `HEAD` and `base` = merge-base of `HEAD` and `master`.
+It **builds whatever the states need** first (both sides of the changed set,
+skipping anything already known or substitutable), then groups the result by its
+`before → after` delta (regression / blocked-by-a-regression / fixed / dropped /
+…), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
+(render from existing facts only), `--recheck` / `--retry` / `--prefer-local`
+(build-policy knobs), `--system` (repeatable), `--nixpkgs`, and RAM-sizing knobs
+for the parallel evaluator. Under the hood: a SQLite fact store, streamed
+`nix-eval-jobs` run in parallel under a RAM budget, one batched `nom` build with
+concurrent cache probing, and a three-way (merge-base) diff.
 
 ## Development
 

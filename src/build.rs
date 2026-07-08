@@ -8,9 +8,7 @@
 //! without this, a known-failing derivation gets retried on every run.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -40,14 +38,6 @@ pub struct Built {
     pub outcome: Option<Outcome>,
 }
 
-/// The 32-char store-path hash component of a `/nix/store/<hash>-name[.drv]` path.
-fn store_hash(path: &str) -> &str {
-    path.rsplit('/')
-        .next()
-        .and_then(|n| n.split('-').next())
-        .unwrap_or(path)
-}
-
 fn hostname() -> String {
     Command::new("hostname")
         .output()
@@ -71,17 +61,14 @@ struct NixEvent {
 
 /// The `actBuild` activity type in nix's internal-json log.
 const ACT_BUILD: i64 = 105;
-/// The `resBuildLogLine` result type — one line of a build's stdout/stderr,
-/// tagged with the build activity's id.
-const RES_BUILD_LOG_LINE: i64 = 101;
 
 /// What the batch build observed per drv: which ones nix actually attempted to
-/// build (a build activity started), how long each took, and its captured log
-/// lines (so we keep the log of *every* build, success or failure).
+/// build (a build activity started) and how long each took. (Nix keeps the build
+/// log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves it, so npd
+/// doesn't duplicate it.)
 struct BatchInfo {
     attempted: HashSet<String>,
     durations: HashMap<String, f64>,
-    logs: HashMap<String, Vec<String>>,
 }
 
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
@@ -122,12 +109,7 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
     let mut nom_in = nom.stdin.take().expect("stdin is piped");
     let mut attempted = HashSet::new();
     let mut durations = HashMap::new();
-    let mut logs: HashMap<String, Vec<String>> = HashMap::new();
     let mut starts: HashMap<u64, (String, Instant)> = HashMap::new();
-    // Activity id -> drv, kept for the whole run so log-line events (which arrive
-    // between a build's start and stop, tagged only with the activity id) can be
-    // attributed to their derivation.
-    let mut act_drv: HashMap<u64, String> = HashMap::new();
 
     for line in log.lines() {
         let line = line.context("reading nix build log")?;
@@ -144,15 +126,6 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
                 if let (Some(id), Some(drv)) = (ev.id, ev.fields.first().and_then(|v| v.as_str())) {
                     attempted.insert(drv.to_string());
                     starts.insert(id, (drv.to_string(), Instant::now()));
-                    act_drv.insert(id, drv.to_string());
-                }
-            }
-            "result" if ev.typ == Some(RES_BUILD_LOG_LINE) => {
-                if let Some(id) = ev.id
-                    && let Some(drv) = act_drv.get(&id)
-                    && let Some(text) = ev.fields.first().and_then(|v| v.as_str())
-                {
-                    logs.entry(drv.clone()).or_default().push(text.to_string());
                 }
             }
             "stop" => {
@@ -171,18 +144,7 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
     Ok(BatchInfo {
         attempted,
         durations,
-        logs,
     })
-}
-
-/// Persist a captured build log under `<cache>/logs/build/<drvhash>.log` and
-/// return its path relative to the cache root (for `Observation::log_ref`).
-fn write_build_log(cache: &Path, drv: &str, lines: &[String]) -> Result<String> {
-    let rel = format!("logs/build/{}.log", store_hash(drv));
-    let path = cache.join(&rel);
-    fs::create_dir_all(path.parent().unwrap()).context("creating build-log dir")?;
-    fs::write(&path, lines.join("\n")).with_context(|| format!("writing {}", path.display()))?;
-    Ok(rel)
 }
 
 /// The realised output paths of a derivation.
@@ -248,7 +210,6 @@ pub fn build_targets(
     dry_run: bool,
 ) -> Result<Vec<Built>> {
     let mut store = Store::open(&eval::db_path()?)?;
-    let cache = eval::cache_root()?;
     let host = hostname();
     // --recheck / --prefer-local force a genuine local build; otherwise a cached
     // (substitutable) output means we needn't build at all.
@@ -316,7 +277,6 @@ pub fn build_targets(
                         duration_s: None,
                         cached: Some(true),
                         machine: None,
-                        log_ref: None,
                     })?;
                 }
             }
@@ -331,8 +291,8 @@ pub fn build_targets(
         });
     }
 
-    // Pass 2: one nom build for the whole set; Pass 3: attribute, keep each log,
-    // and record the outcome.
+    // Pass 2: one nom build for the whole set; Pass 3: attribute and record the
+    // outcome. (Nix keeps the build log itself; `nix log <drv>` retrieves it.)
     if !to_build.is_empty() {
         let drvs: Vec<&str> = to_build.iter().map(|&i| targets[i].drv_path.as_str()).collect();
         println!("building {} derivation(s)…", drvs.len());
@@ -354,12 +314,6 @@ pub fn build_targets(
             } else {
                 (Outcome::DepFailed, "dep-failed")
             };
-            // Keep the log of every build we actually ran, pass or fail (a
-            // dep-failure never ran, so it has none).
-            let log_ref = match info.logs.get(&t.drv_path) {
-                Some(l) if !l.is_empty() => Some(write_build_log(&cache, &t.drv_path, l)?),
-                _ => None,
-            };
             let duration_s = info.durations.get(&t.drv_path).copied();
             store.add_observation(&Observation {
                 drv_path: t.drv_path.clone(),
@@ -370,7 +324,6 @@ pub fn build_targets(
                 duration_s,
                 cached: None,
                 machine: Some(host.clone()),
-                log_ref,
             })?;
             let dur = duration_s.map(|s| format!(" ({s:.0}s)")).unwrap_or_default();
             println!("  {label}  {} {}{dur}", t.system, t.attr);
@@ -380,21 +333,4 @@ pub fn build_targets(
     }
 
     Ok(results)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn store_hash_extracts_the_hash() {
-        assert_eq!(
-            store_hash("/nix/store/izk77azi9bcldnpdw4c62hc637q8xm27-hello-2.12.3.drv"),
-            "izk77azi9bcldnpdw4c62hc637q8xm27"
-        );
-        assert_eq!(
-            store_hash("/nix/store/qpp9968dpkv1c755nk13mrkrzpsvah18-hello-2.12.3"),
-            "qpp9968dpkv1c755nk13mrkrzpsvah18"
-        );
-    }
 }

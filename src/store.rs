@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS attr_eval (
 ) STRICT;
 
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
--- `local`/`cache` fact here per drv. (A legacy `build_id` column may linger on
--- old databases from the dropped Hydra source; it is simply never written now.)
+-- `local`/`cache` fact here per drv. (Legacy `build_id`/`log_ref` columns may
+-- linger on old databases; they are simply never written now.)
 CREATE TABLE IF NOT EXISTS observation (
     id         INTEGER PRIMARY KEY,
     drv_path   TEXT    NOT NULL,
@@ -48,8 +48,7 @@ CREATE TABLE IF NOT EXISTS observation (
     system     TEXT,
     duration_s REAL,
     cached     INTEGER,
-    machine    TEXT,
-    log_ref    TEXT
+    machine    TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 
@@ -224,8 +223,8 @@ impl Store {
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
         self.conn.execute(
             "INSERT INTO observation \
-             (drv_path, source, outcome, when_, system, duration_s, cached, machine, log_ref) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (drv_path, source, outcome, when_, system, duration_s, cached, machine) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 o.drv_path,
                 source_str(o.source),
@@ -235,7 +234,6 @@ impl Store {
                 o.duration_s,
                 o.cached,
                 o.machine,
-                o.log_ref,
             ],
         )?;
         Ok(())
@@ -267,7 +265,7 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT drv_path, source, outcome, when_, system, duration_s, cached, machine, log_ref \
+            "SELECT drv_path, source, outcome, when_, system, duration_s, cached, machine \
              FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -282,12 +280,10 @@ impl Store {
                 r.get::<_, Option<f64>>(5)?,
                 r.get::<_, Option<bool>>(6)?,
                 r.get::<_, Option<String>>(7)?,
-                r.get::<_, Option<String>>(8)?,
             ))
         })?;
         for row in rows {
-            let (drv_path, source, outcome, when, system, duration_s, cached, machine, log_ref) =
-                row?;
+            let (drv_path, source, outcome, when, system, duration_s, cached, machine) = row?;
             out.entry(drv_path.clone()).or_default().push(Observation {
                 drv_path,
                 source: source_from(&source)?,
@@ -297,7 +293,6 @@ impl Store {
                 duration_s,
                 cached,
                 machine,
-                log_ref,
             });
         }
         Ok(out)
@@ -369,7 +364,6 @@ mod tests {
             duration_s: Some(1.5),
             cached: None,
             machine: Some("host".into()),
-            log_ref: Some("logs/x/build.log".into()),
         };
         s.add_observation(&mk(Outcome::Failed, 100)).unwrap();
         s.add_observation(&mk(Outcome::Built, 200)).unwrap();

@@ -8,7 +8,7 @@ long-lived build machines with plenty of disk. It exists to make these cheap:
 - evaluate a revision → the set of `attr → derivation` on each platform;
 - diff two revisions (and, three-way, their merge base) to a set of changed attrs;
 - learn whether a derivation is already substitutable from `cache.nixos.org`;
-- build derivations locally, remembering the outcome and keeping the log;
+- build derivations locally, remembering the outcome (Nix keeps the log itself);
 - render human-readable Markdown reports from all of the above;
 
 …while **never repeating expensive work whose answer is already known**, and
@@ -88,9 +88,11 @@ name, an output hash, a drvpath — and **the eval fact is itself the join**
 of backend.
 
 **Backend: SQLite** (`npd.sqlite`, one file) for both eval maps and the
-observation log; **files** only for build logs (naturally large blobs). Schema
-lives in `src/store.rs`. Why SQLite over a pile of JSON files (a full-set eval
-is ~114k rows / ~27 MB of JSON, ~85% redundant — it compresses ~6.5×):
+observation log. Build logs are *not* stored — Nix keeps them itself under
+`/nix/var/log/nix/drvs` (`nix log <drv>` retrieves them, success or failure), so
+duplicating them would be pure redundancy. Schema lives in `src/store.rs`. Why
+SQLite over a pile of JSON files (a full-set eval is ~114k rows / ~27 MB of JSON,
+~85% redundant — it compresses ~6.5×):
 
 - indexes give O(log n) lookup by `drvpath` / output hash / `(job, system)` with
   no manual index files, and a normalized table captures that redundancy natively;
@@ -106,9 +108,8 @@ on load, so there is one source of truth for that mapping.
 
 ```
 ~/.cache/nix-npd/
-  npd.sqlite                 # evals + observation log
-  logs/build/<drv-hash>.log  # build logs (every build, success and failure)
-  logs/eval-<commit>-<sys>.log
+  npd.sqlite                    # evals + observation log
+  logs/eval-<commit>-<sys>.log  # nix-eval-jobs stderr (tracebacks), per eval
 ```
 
 `<drv-hash>` is the 32-char hash component of the drvpath.
@@ -137,7 +138,7 @@ run concurrently (`cache::in_cache_many`). So a changed set whose facts are all
 known costs one query and no network — the whole build set is decided in
 milliseconds. The actual build is a single batched `nix build` piped through
 `nom` for the live tree, from which we recover, per drv, its outcome (built /
-direct failure / dependency cascade), duration, and full log.
+direct failure / dependency cascade) and duration.
 
 ## 6. Evaluation, its cache key, and the three-way diff
 
@@ -222,13 +223,16 @@ The spine is implemented (✓).
 2. ✓ two-way diff, then the three-way (merge-base) diff.
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,
-   `DepFailed`/cascade detection, per-drv duration, and a kept log per build.
+   `DepFailed`/cascade detection, and per-drv duration.
 4. ✓ `Cache` facts (narinfo), recorded as observations.
 5. ✓ Markdown report classifying the changed set, building both sides first so
    there are no `?`.
 
+All of the above is driven by a single `npd [base] [head]` command (the
+eval/diff/build/report primitives are internal modules, not subcommands).
+
 Open refinements: remote-builder fan-out; a `Local`-vs-`Cache` fidelity probe
-(from-source build vs. substitution); pruning old build logs.
+(from-source build vs. substitution).
 
 ## 10. Open questions
 
