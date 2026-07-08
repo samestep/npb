@@ -49,6 +49,11 @@ struct Cli {
     /// Ignore a substitutable (cached) success; require a genuine local build.
     #[arg(long)]
     prefer_local: bool,
+    /// For each changed package, also evaluate and build its `passthru.tests`
+    /// (on both sides), classifying each test's `base → head` delta like any
+    /// other attr. Ported from nixpkgs-review's `--tests` (#397).
+    #[arg(long)]
+    tests: bool,
     #[command(flatten)]
     eval: EvalArgs,
 }
@@ -179,6 +184,36 @@ fn run(cli: Cli) -> Result<()> {
     for sys in &systems {
         let changed = eval::changed_set(&base, &head, sys, eval::DEFAULT_PROFILE)?;
         per_system_changed.push((sys.clone(), changed));
+    }
+
+    // --tests: expand each system's changed set with the changed packages'
+    // `passthru.tests`. We evaluate the tests on *both* sides (a targeted eval,
+    // recomputed each run) and keep a test as a changed attr only when its drv
+    // actually differs base→head — exactly `changed_set`'s own semantics, so the
+    // test rows classify (regression / fixed / new / …) like every other attr.
+    if cli.tests {
+        for (sys, changed) in per_system_changed.iter_mut() {
+            let mut names: Vec<String> = changed.iter().map(|(a, _, _)| a.clone()).collect();
+            names.sort();
+            names.dedup();
+            let base_tests = eval::eval_tests(&repo, &base, sys, eval::DEFAULT_PROFILE, &names)?;
+            let head_tests = eval::eval_tests(&repo, &head, sys, eval::DEFAULT_PROFILE, &names)?;
+            let drv_map = |ts: &[model::AttrEval]| -> std::collections::HashMap<String, Option<String>> {
+                ts.iter().map(|t| (t.attr.clone(), t.drv_path.clone())).collect()
+            };
+            let bmap = drv_map(&base_tests);
+            let hmap = drv_map(&head_tests);
+            let mut keys: Vec<String> = bmap.keys().chain(hmap.keys()).cloned().collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                let bd = bmap.get(&k).cloned().flatten();
+                let hd = hmap.get(&k).cloned().flatten();
+                if bd != hd && (bd.is_some() || hd.is_some()) {
+                    changed.push((k, bd, hd));
+                }
+            }
+        }
     }
 
     // Build both sides of the changed set (skipping anything already known or

@@ -180,6 +180,22 @@ attr the way a git three-way merge does:
 This is the main capability nixpkgs-review lacks; it is nearly free once
 `eval` is a cached primitive.
 
+**`--tests` — the changed set's `passthru.tests`.** Ported from
+[nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397): for each
+changed package, also build its `passthru.tests` (building a test derivation *is*
+running it). The full-set eval never reaches these — a package's `tests` is a
+plain attrset without `recurseForDerivations`, so `nix-eval-jobs` doesn't descend
+into it — so `--tests` runs a **targeted, un-cached second eval** over just the
+changed set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a
+thunk `nix-eval-jobs` forces in a worker (so a package that fails to evaluate
+errors only its own subtree, never the whole run — the same per-attr isolation
+the full-set walk relies on). It is *not* cached like the full-set eval — it
+doesn't fit the `(commit, system, profile)` key, and the changed set is small, so
+it's recomputed each run rather than polluting the pure eval cache. npd evaluates
+the tests on **both** sides and keeps a test only where its drv actually differs
+base→head, so the resulting rows classify (regression / fixed / new / …) exactly
+like any other attr — a delta view, a superset of #397's one-shot head-only build.
+
 ## 7. Cache facts — the one remote signal
 
 The only remote fact `npd` gathers is **narinfo presence** on `cache.nixos.org`:

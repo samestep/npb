@@ -56,6 +56,10 @@ struct RawMeta {
 #[serde(rename_all = "camelCase")]
 struct RawJob {
     attr: String,
+    /// The attr path as an array of *unquoted* elements. Preferred over `attr`
+    /// (which nix-eval-jobs quotes when an element contains a `.`) when a clean,
+    /// dotted label is wanted — see the test eval. Absent on older output.
+    attr_path: Option<Vec<String>>,
     drv_path: Option<String>,
     error: Option<String>,
     meta: Option<RawMeta>,
@@ -64,6 +68,7 @@ struct RawJob {
 fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     let RawJob {
         attr,
+        attr_path: _,
         drv_path,
         error,
         meta,
@@ -140,13 +145,31 @@ fn run_eval_pb(
     pb: &ProgressBar,
 ) -> Result<Vec<AttrEval>> {
     let expr = build_expr(repo, commit, system, profile)?;
+    let short: String = commit.chars().take(12).collect();
+    let label = format!("{short} ({system}, {workers}w)");
+    stream_jobs(&expr, workers, per_worker_mb, pb, &label, raw_to_attr_eval)
+}
+
+/// Run one `nix-eval-jobs --expr <expr>` (with `workers` workers each capped at
+/// `per_worker_mb`), streaming its NDJSON stdout through `map_job` into
+/// `AttrEval`s and rendering progress onto `pb`. `label` names the run in the
+/// progress bar and the integrity-gate error. Shared by the cached full-set eval
+/// (which keys on `attr`) and the targeted test eval (which relabels from
+/// `attrPath`) — both stream the same job shape and want the same truncation gate.
+fn stream_jobs(
+    expr: &str,
+    workers: usize,
+    per_worker_mb: u64,
+    pb: &ProgressBar,
+    label: &str,
+    map_job: impl Fn(RawJob) -> AttrEval,
+) -> Result<Vec<AttrEval>> {
     // nix-eval-jobs prints a full Nix traceback per errored attr (megabytes over a
     // whole package set), and the actionable per-attr error is already in the
     // stdout JSON — so we neither inherit its stderr (terminal spam) nor persist
     // it to disk. A thread drains stderr into a bounded ring buffer, keeping only
     // the last few lines for the fatal-error diagnostic below; draining it (vs. an
     // undrained pipe) also can't deadlock while we stream stdout.
-    let short: String = commit.chars().take(12).collect();
 
     // No `--meta`: we only keep `attr → drv`, and `--meta` forces each package's
     // meta attrset (extra evaluation, plus extra allocation that inflates the
@@ -159,7 +182,7 @@ fn run_eval_pb(
             "--max-memory-size",
             &per_worker_mb.to_string(),
             "--expr",
-            &expr,
+            expr,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -189,13 +212,13 @@ fn run_eval_pb(
     );
     pb.reset_elapsed();
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_message(format!("evaluating {short} ({system}, {workers}w)"));
+    pb.set_message(format!("evaluating {label}"));
     let mut attrs = Vec::new();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
-        attrs.push(raw_to_attr_eval(item.context("parsing nix-eval-jobs output")?));
-        pb.set_message(format!("evaluating {short} ({system}, {workers}w) — {} attrs", attrs.len()));
+        attrs.push(map_job(item.context("parsing nix-eval-jobs output")?));
+        pb.set_message(format!("evaluating {label} — {} attrs", attrs.len()));
     }
-    pb.finish_with_message(format!("evaluated {short} ({system}) — {} attrs", attrs.len()));
+    pb.finish_with_message(format!("evaluated {label} — {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
     let stderr_tail = stderr_tail.join().unwrap_or_default();
@@ -209,7 +232,7 @@ fn run_eval_pb(
     // "removed" packages, so we refuse it outright rather than trust a partial.
     if !status.success() {
         bail!(
-            "nix-eval-jobs did not finish evaluating {commit} ({system}): it exited \
+            "nix-eval-jobs did not finish evaluating {label}: it exited \
              {status} after streaming {} attr(s), so the result is truncated and \
              will NOT be cached. A worker most likely died — commonly out-of-memory: \
              reduce the worker count or --max-memory-size so their caps fit in RAM. \
@@ -219,6 +242,114 @@ fn run_eval_pb(
         );
     }
     Ok(attrs)
+}
+
+// --- targeted test eval (passthru.tests of the changed set) ------------------
+//
+// The `--tests` feature (ported from nixpkgs-review#397): for the packages in a
+// change's *changed set*, also build their `passthru.tests`. Unlike the full-set
+// eval, this is NOT cached — it's a small, targeted eval over the (few) changed
+// attrs, recomputed each run (DESIGN §6: the pure full-set eval cache stays
+// untouched; a test eval doesn't fit its `(commit, system, profile)` key).
+//
+// The full-set `nix-eval-jobs` walk never reaches these drvs: a package's
+// `passthru.tests` is a plain attrset without `recurseForDerivations`, so it's
+// not descended into. We surface them with a targeted expression: a job tree
+// `<pkg>.tests.<name>` where each package's `.tests` is a *thunk* forced by
+// `nix-eval-jobs` in its per-attr worker — so a package that fails to evaluate
+// (even an uncatchable parse error `tryEval` can't trap) is isolated to its own
+// attr, exactly as in the full-set walk, rather than aborting the whole eval.
+
+/// Escape a string for embedding inside a Nix `"..."` literal: backslashes,
+/// double quotes, and the `${` interpolation opener. (Package attr names
+/// virtually never contain these, but a changed set is untrusted input.)
+fn nix_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace("${", "\\${")
+}
+
+/// Nix expression exposing the `passthru.tests` of `attrs` at one revision as a
+/// `nix-eval-jobs` job tree. Each requested `<pkg>` becomes a recursable node
+/// `{ recurseForDerivations = true; tests = <thunk>; }`; the `tests` thunk (which
+/// is what forces the package) is evaluated per-attr in a worker, so a throwing
+/// package errors only its own subtree. `tests` resolves to the package's
+/// `passthru.tests` — a derivation (emitted as `<pkg>.tests`) or an attrset made
+/// recursable (emitted as `<pkg>.tests.<name>`); anything else yields no jobs.
+fn build_tests_expr(
+    repo: &Path,
+    commit: &str,
+    system: &str,
+    profile: &str,
+    attrs: &[String],
+) -> Result<String> {
+    let cfg = profile_config(profile)?;
+    let list: String = attrs
+        .iter()
+        .map(|a| format!("\"{}\" ", nix_escape(a)))
+        .collect();
+    const TEMPLATE: &str = r#"
+let
+  pkgs = import (builtins.fetchGit { url = "@REPO@"; rev = "@COMMIT@"; }) { system = "@SYSTEM@"; config = @CFG@; };
+  lib = pkgs.lib;
+  attrs = [ @ATTRS@];
+  node = name: {
+    recurseForDerivations = true;
+    # Forced per-attr in a nix-eval-jobs worker: a package that fails to evaluate
+    # errors only its own `<pkg>.tests`, never the whole run.
+    tests =
+      let
+        pkg = lib.attrByPath (lib.splitString "." name) null pkgs;
+        t = if pkg == null then null else (pkg.tests or null);
+      in
+        if lib.isDerivation t then t
+        else if lib.isAttrs t then t // { recurseForDerivations = true; }
+        else { recurseForDerivations = true; };
+  };
+in
+lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
+// { recurseForDerivations = true; }
+"#;
+    Ok(TEMPLATE
+        .replace("@REPO@", &nix_escape(&repo.display().to_string()))
+        .replace("@COMMIT@", &nix_escape(commit))
+        .replace("@SYSTEM@", &nix_escape(system))
+        .replace("@CFG@", cfg)
+        .replace("@ATTRS@", &list))
+}
+
+/// Evaluate the `passthru.tests` of `attrs` at `commit`/`system` into an
+/// `attr → drv` map (attrs labelled `<pkg>.tests.<name>`). Recomputed each run
+/// (see the section comment). Returns an empty vec for an empty `attrs`.
+pub fn eval_tests(
+    repo: &Path,
+    commit: &str,
+    system: &str,
+    profile: &str,
+    attrs: &[String],
+) -> Result<Vec<AttrEval>> {
+    if attrs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expr = build_tests_expr(repo, commit, system, profile, attrs)?;
+    // A targeted eval over a small changed set: a couple of workers is plenty,
+    // and each still re-evaluates the nixpkgs spine, so more would only waste RAM.
+    let workers = attrs.len().clamp(1, 4);
+    let short: String = commit.chars().take(12).collect();
+    let label = format!("tests {short} ({system})");
+    let pb = ProgressBar::new_spinner();
+    // Relabel from `attrPath` (unquoted elements joined by `.`) rather than `attr`
+    // (which nix-eval-jobs quotes for the dotted package component, e.g.
+    // `"python3Packages.requests".tests.foo`) — giving a clean `pkg.tests.name`.
+    let map = |raw: RawJob| {
+        let path = raw.attr_path.clone();
+        let mut ae = raw_to_attr_eval(raw);
+        if let Some(p) = path {
+            ae.attr = p.join(".");
+        }
+        ae
+    };
+    let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &pb, &label, map);
+    pb.finish_and_clear();
+    r
 }
 
 // --- concurrency: a memory-slot budget over parallel evals -------------------
