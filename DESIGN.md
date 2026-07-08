@@ -155,6 +155,15 @@ milliseconds. The actual build is a single batched `nix build` piped through
 `nom` for the live tree, from which we recover, per drv, its outcome (built /
 direct failure / dependency cascade) and duration.
 
+**Surviving ^C.** Each outcome is recorded (and committed — every observation is
+its own SQLite autocommit) the moment that drv's build activity stops, not after
+the batch: nix registers a successful build's outputs *before* emitting the
+activity's stop event, so output validity at stop time is the build's own
+result. Interrupting the batch therefore keeps every fact observed so far —
+including the failures nix itself forgets — and a re-run only re-pays for the
+in-flight and never-started builds. Drvs with no build activity (blocked by a
+failed dep, or valid without a build) are attributed in a post-batch sweep.
+
 ## 6. Evaluation, its cache key, and the three-way diff
 
 **The cache key is `(commit, system, config)`, and it is not a can of worms —

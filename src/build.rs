@@ -1,7 +1,9 @@
 //! The observation-backed build driver (DESIGN.md §5): decide per target
 //! (build / skip-known-ok / skip-cached / skip-known-failure), then build the
-//! whole build set in ONE `nom build` invocation and attribute each drv's
-//! outcome from a post-build output-validity check.
+//! whole build set in ONE `nom build` invocation. Each drv's outcome is
+//! recorded the moment its build activity stops — so an interrupted (^C) batch
+//! keeps every fact observed so far — and drvs nix never attempted are
+//! attributed from a post-build output-validity check.
 //!
 //! This is the first writer to the observation log, and the reason it exists:
 //! Nix remembers successful builds (the store), but *forgets failures* — so
@@ -62,15 +64,6 @@ struct NixEvent {
 /// The `actBuild` activity type in nix's internal-json log.
 const ACT_BUILD: i64 = 105;
 
-/// What the batch build observed per drv: which ones nix actually attempted to
-/// build (a build activity started) and how long each took. (Nix keeps the build
-/// log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves it, so npd
-/// doesn't duplicate it.)
-struct BatchInfo {
-    attempted: HashSet<String>,
-    durations: HashMap<String, f64>,
-}
-
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
 /// together with its own parallelism — while acting as a middleman: nix emits
 /// `--log-format internal-json`, we forward it to `nom --json` for the live
@@ -78,7 +71,22 @@ struct BatchInfo {
 /// gives us, per drv, whether it was *attempted* (start seen ⇒ a later failure
 /// is its own, not a dependency's) and its build duration — neither of which a
 /// plain batch build exposes. `--keep-going` so every drv is attempted.
-fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
+///
+/// `on_finish(drv, secs)` fires as each of `drvs`'s build activities stops.
+/// Nix registers a successful build's outputs *before* emitting the stop event
+/// (both the local and build-hook goals `registerValidPaths` before destroying
+/// the `actBuild` Activity — nix 2.34 `derivation-building-goal.cc`), so the
+/// callback can attribute the outcome from output validity right away.
+///
+/// Returns every drv nix attempted (build started), dependencies included.
+/// (Nix keeps the build log itself under `/nix/var/log/nix/drvs`; `nix log
+/// <drv>` retrieves it, so npd doesn't duplicate it.)
+fn batch_build(
+    drvs: &[&str],
+    force: bool,
+    mut on_finish: impl FnMut(&str, f64) -> Result<()>,
+) -> Result<HashSet<String>> {
+    let requested: HashSet<&str> = drvs.iter().copied().collect();
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
     nix.arg("build")
@@ -108,7 +116,6 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
     let log = BufReader::new(nix.stderr.take().expect("stderr is piped"));
     let mut nom_in = nom.stdin.take().expect("stdin is piped");
     let mut attempted = HashSet::new();
-    let mut durations = HashMap::new();
     let mut starts: HashMap<u64, (String, Instant)> = HashMap::new();
 
     for line in log.lines() {
@@ -131,8 +138,9 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
             "stop" => {
                 if let Some(id) = ev.id
                     && let Some((drv, t0)) = starts.remove(&id)
+                    && requested.contains(drv.as_str())
                 {
-                    durations.insert(drv, t0.elapsed().as_secs_f64());
+                    on_finish(&drv, t0.elapsed().as_secs_f64())?;
                 }
             }
             _ => {}
@@ -141,10 +149,7 @@ fn batch_build(drvs: &[&str], force: bool) -> Result<BatchInfo> {
     drop(nom_in); // EOF -> nom finishes rendering and exits
     let _ = nix.wait();
     let _ = nom.wait();
-    Ok(BatchInfo {
-        attempted,
-        durations,
-    })
+    Ok(attempted)
 }
 
 /// The realised output paths of a derivation.
@@ -172,6 +177,13 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
         .output()
         .context("running nix-store --check-validity")?;
     Ok(lines(&out.stdout).into_iter().collect())
+}
+
+/// Did this drv's build succeed — are all its outputs valid in the local
+/// store? Sound at stop-event time; see `batch_build`.
+fn drv_built(drv: &str) -> Result<bool> {
+    let outs = drv_outputs(drv)?;
+    Ok(!outs.is_empty() && invalid_paths(&outs)?.is_empty())
 }
 
 /// Map each built drv to whether all its outputs are now valid (i.e. it built).
@@ -209,7 +221,17 @@ pub fn build_targets(
     policy: BuildPolicy,
     dry_run: bool,
 ) -> Result<Vec<Built>> {
-    let mut store = Store::open(&eval::db_path()?)?;
+    build_targets_at(&eval::db_path()?, targets, policy, dry_run)
+}
+
+/// [`build_targets`] against an explicit observation DB (separable for tests).
+fn build_targets_at(
+    db: &std::path::Path,
+    targets: &[Target],
+    policy: BuildPolicy,
+    dry_run: bool,
+) -> Result<Vec<Built>> {
+    let mut store = Store::open(db)?;
     let host = hostname();
     // --recheck / --prefer-local force a genuine local build; otherwise a cached
     // (substitutable) output means we needn't build at all.
@@ -294,40 +316,81 @@ pub fn build_targets(
         });
     }
 
-    // Pass 2: one nom build for the whole set; Pass 3: attribute and record the
-    // outcome. (Nix keeps the build log itself; `nix log <drv>` retrieves it.)
+    // Pass 2: one nom build for the whole set, recording each drv's outcome the
+    // moment its build activity stops — its outputs' validity at that instant is
+    // the build's own result (see `batch_build`). Recording incrementally is
+    // what makes ^C mid-batch safe: every fact observed so far is already
+    // committed, so only in-flight and never-started builds cost anything on
+    // the next run. (Nix keeps the build log itself; `nix log <drv>` gets it.)
     if !to_build.is_empty() {
         let drvs: Vec<&str> = to_build.iter().map(|&i| targets[i].drv_path.as_str()).collect();
+        // Several targets can share a drv (aliased attrs); record it once.
+        let system_of: HashMap<&str, &str> = to_build
+            .iter()
+            .map(|&i| (targets[i].drv_path.as_str(), targets[i].system.as_str()))
+            .collect();
         println!("building {} derivation(s)…", drvs.len());
         let start = Instant::now();
-        let info = batch_build(&drvs, force)?;
-        let secs = start.elapsed().as_secs_f64();
-
-        let built_map = build_outcomes(&drvs)?;
-        let now = chrono::Utc::now().timestamp();
-        for &i in &to_build {
-            let t = &targets[i];
-            let built = built_map.get(&t.drv_path).copied().unwrap_or(false);
-            // A failed drv nix *attempted* (a build activity started) failed on
-            // its own; one it never attempted was blocked by a failed dependency.
-            let (outcome, label) = if built {
-                (Outcome::Built, "built ")
-            } else if info.attempted.contains(&t.drv_path) {
-                (Outcome::Failed, "FAILED")
-            } else {
-                (Outcome::DepFailed, "dep-failed")
-            };
-            let duration_s = info.durations.get(&t.drv_path).copied();
+        let mut recorded: HashMap<String, (Outcome, f64)> = HashMap::new();
+        let attempted = batch_build(&drvs, force, |drv, secs| {
+            let outcome = if drv_built(drv)? { Outcome::Built } else { Outcome::Failed };
             store.add_observation(&Observation {
-                drv_path: t.drv_path.clone(),
+                drv_path: drv.to_string(),
                 source: Source::Local,
                 outcome,
-                when: now,
-                system: Some(t.system.clone()),
-                duration_s,
+                when: chrono::Utc::now().timestamp(),
+                system: system_of.get(drv).copied().map(str::to_string),
+                duration_s: Some(secs),
                 cached: None,
                 machine: Some(host.clone()),
             })?;
+            recorded.insert(drv.to_string(), (outcome, secs));
+            Ok(())
+        })?;
+        let secs = start.elapsed().as_secs_f64();
+
+        // Pass 3: attribute the drvs that had no build activity — a drv nix
+        // *attempted* failed on its own; one it never attempted either had valid
+        // outputs already (substituted, or a prior interrupted run built it) or
+        // was blocked by a failed dependency — then print every target's summary
+        // line. Printing waits until here so it doesn't interleave with nom's
+        // live tree on the terminal.
+        let leftover: Vec<&str> =
+            drvs.iter().copied().filter(|d| !recorded.contains_key(*d)).collect();
+        let built_map = build_outcomes(&leftover)?;
+        let now = chrono::Utc::now().timestamp();
+        for &i in &to_build {
+            let t = &targets[i];
+            let (outcome, duration_s) = match recorded.get(&t.drv_path) {
+                Some(&(outcome, secs)) => (outcome, Some(secs)),
+                None => {
+                    let built = built_map.get(&t.drv_path).copied().unwrap_or(false);
+                    let outcome = if built {
+                        Outcome::Built
+                    } else if attempted.contains(&t.drv_path) {
+                        Outcome::Failed
+                    } else {
+                        Outcome::DepFailed
+                    };
+                    store.add_observation(&Observation {
+                        drv_path: t.drv_path.clone(),
+                        source: Source::Local,
+                        outcome,
+                        when: now,
+                        system: Some(t.system.clone()),
+                        duration_s: None,
+                        cached: None,
+                        machine: Some(host.clone()),
+                    })?;
+                    (outcome, None)
+                }
+            };
+            let label = match outcome {
+                Outcome::Built => "built ",
+                Outcome::Failed => "FAILED",
+                Outcome::DepFailed => "dep-failed",
+                Outcome::NotAttempted => unreachable!("batch attribution is built/failed/dep-failed"),
+            };
             let dur = duration_s.map(|s| format!(" ({s:.0}s)")).unwrap_or_default();
             println!("  {label}  {} {}{dur}", t.system, t.attr);
             results[i].outcome = Some(outcome);
@@ -336,4 +399,110 @@ pub fn build_targets(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Instantiate a nix expression, returning its .drv path.
+    fn instantiate(expr: &str, attr: &str) -> String {
+        let out = Command::new("nix-instantiate")
+            .args(["--expr", expr, "-A", attr])
+            .output()
+            .expect("running nix-instantiate");
+        assert!(
+            out.status.success(),
+            "nix-instantiate -A {attr} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// End-to-end against real nix (hence ignored; `cargo test -- --ignored`):
+    /// build a set with a fast failure, a slow success, and a drv blocked by the
+    /// failure. Asserts the attribution of all three outcomes AND the property
+    /// that makes ^C safe: the failure's observation is committed to SQLite
+    /// while the batch is still building, not after it finishes.
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom, and ~10s"]
+    fn records_outcomes_while_batch_still_building() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("npd-build-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npd.sqlite");
+
+        // Nonce'd names so nothing is valid in the store from a previous run.
+        let expr = format!(
+            r#"let
+                 mk = name: cmd: derivation {{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh"; args = ["-c" cmd];
+                 }};
+                 fail = mk "npd-test-fail-{nonce}" "exit 1";
+                 # Spin on shell builtins (~10s): the sandbox has no `sleep`
+                 # (PATH is /path-not-set), and the delay must outlast the poll
+                 # below that watches for the failure's row.
+                 slow = mk "npd-test-slow-{nonce}"
+                   "i=0; while [ $i -lt 15000000 ]; do i=$((i+1)); done; echo ok > $out";
+                 blocked = mk "npd-test-blocked-{nonce}" "cat ${{fail}} > $out";
+               in {{ inherit fail slow blocked; }}"#
+        );
+        let fail = instantiate(&expr, "fail");
+        let slow = instantiate(&expr, "slow");
+        let blocked = instantiate(&expr, "blocked");
+
+        let targets: Vec<Target> = [("fail", &fail), ("slow", &slow), ("blocked", &blocked)]
+            .into_iter()
+            .map(|(attr, drv)| Target {
+                attr: attr.to_string(),
+                system: "testsys".to_string(),
+                drv_path: drv.clone(),
+            })
+            .collect();
+        let db2 = db.clone();
+        let builder = std::thread::spawn(move || {
+            build_targets_at(&db2, &targets, BuildPolicy::default(), false)
+        });
+
+        // The failure is near-instant, the success sleeps 8s; its Failed row
+        // must land while the batch (and the thread driving it) still runs.
+        let mut seen_mid_batch = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !builder.is_finished() {
+            // Concurrent open can transiently fail (writer holds the lock).
+            if let Ok(s) = Store::open(&db)
+                && let Ok(obs) = s.load_observations(&fail)
+                && obs.iter().any(|o| o.outcome == Outcome::Failed)
+            {
+                seen_mid_batch = !builder.is_finished();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(seen_mid_batch, "failure was not recorded while the batch was still building");
+
+        let results = builder.join().unwrap().unwrap();
+        let outcome_of = |attr: &str| {
+            results.iter().find(|b| b.attr == attr).unwrap().outcome.unwrap()
+        };
+        assert_eq!(outcome_of("fail"), Outcome::Failed);
+        assert_eq!(outcome_of("slow"), Outcome::Built);
+        assert_eq!(outcome_of("blocked"), Outcome::DepFailed);
+
+        // The incrementally-recorded facts carry a duration and the system.
+        let s = Store::open(&db).unwrap();
+        let fail_obs = s.load_observations(&fail).unwrap();
+        assert_eq!(fail_obs.len(), 1);
+        assert_eq!(fail_obs[0].source, Source::Local);
+        assert!(fail_obs[0].duration_s.is_some());
+        assert_eq!(fail_obs[0].system.as_deref(), Some("testsys"));
+        let blocked_obs = s.load_observations(&blocked).unwrap();
+        assert_eq!(blocked_obs.len(), 1);
+        assert_eq!(blocked_obs[0].outcome, Outcome::DepFailed);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
