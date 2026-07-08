@@ -200,14 +200,24 @@ fn run_eval_pb(
     pb.finish_with_message(format!("evaluated {short} ({system}): {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
-    // nix-eval-jobs exits non-zero if *any* attr errored but still emits the
-    // rest, so a non-zero status with parsed attrs is normal (a full nixpkgs
-    // eval always has some). Only fail if it produced nothing at all.
-    if !status.success() && attrs.is_empty() {
+    // Integrity gate. Per-attr eval errors are emitted *in band* as JSON
+    // (`{"attr":…,"error":…}`) and do NOT affect the exit code — a complete
+    // full-set eval exits 0 even with thousands of `throw`n attrs. A non-zero
+    // exit means a *fatal* abort: a worker died mid-eval (most often an OOM
+    // SIGKILL when the workers' memory caps oversubscribe RAM), in which case
+    // the streamed output is silently TRUNCATED — we got some attrs but not
+    // all. Caching that would poison every future diff/report with phantom
+    // "removed" packages, so we refuse it outright rather than trust a partial.
+    if !status.success() {
         bail!(
-            "nix-eval-jobs failed ({status}) and produced no output. Last stderr from {}:\n{}",
+            "nix-eval-jobs did not finish evaluating {commit} ({system}): it exited \
+             {status} after streaming {} attr(s), so the result is truncated and \
+             will NOT be cached. A worker most likely died — commonly out-of-memory: \
+             reduce the worker count or --max-memory-size so their caps fit in RAM. \
+             Last stderr from {}:\n{}",
+            attrs.len(),
             log_path.display(),
-            tail(&log_path, 40),
+            tail(&log_path, 20),
         );
     }
     Ok(attrs)
