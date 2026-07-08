@@ -123,11 +123,9 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     } else {
         String::new()
     };
-    // Collapsed unless the state changed — the reviewer's eye goes to the deltas.
-    let open = if base != head { " open" } else { "" };
 
     let mut s = format!(
-        "<details{open}><summary>{} → {} · <b>{groups} {noun}{plural}</b>{note} — {phrase}</summary>\n\n",
+        "<details><summary>{} → {} · <b>{groups} {noun}{plural}</b>{note} — {phrase}</summary>\n\n",
         base.glyph(),
         head.glyph(),
     );
@@ -151,11 +149,8 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
 /// Render the per-system entries to Markdown, grouped into `before → after`
 /// sections ordered worst-delta-first.
 pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Entry>)]) -> String {
-    let mut out = format!("## `npd` report: `{base}` → `{head}`\n\n");
-    out.push_str(
-        "Legend: ✅ built · ❌ failed · 🚫 blocked by a failed dependency · ➖ absent · \
-         ❓ unbuilt. Each section reads `before → after`; attrs joined by `=` share a derivation.\n",
-    );
+    // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
+    let mut out = format!("## `npd` report: {base} → {head}\n");
     for (system, entries) in per_system {
         out.push_str(&format!("\n### `{system}`\n\n"));
         if entries.is_empty() {
@@ -243,9 +238,10 @@ mod tests {
         // Grouping: shared drv collapses to one equals-joined line, shortest first.
         assert!(out.contains("- `foo` = `z.foo`"), "{out}");
         assert!(out.contains("✅ → ✅ · <b>1 unchanged package</b> (2 attrs)"), "{out}");
-        // Folding: changed states open, unchanged collapsed.
-        assert!(out.contains("<details open><summary>✅ → ❌"), "{out}");
+        // All sections are folded closed.
+        assert!(out.contains("<details><summary>✅ → ❌"), "{out}");
         assert!(out.contains("<details><summary>✅ → ✅"), "{out}");
+        assert!(!out.contains("<details open>"), "{out}");
         // Ordering: regression before blocked before unchanged.
         let reg = out.find("→ ❌").unwrap();
         let blk = out.find("→ 🚫").unwrap();

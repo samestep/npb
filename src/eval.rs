@@ -376,8 +376,7 @@ pub fn eval_pairs(
         if scope.is_empty()
             && let Some(attrs) = store.load_eval(commit, system, profile, EVAL_VERSION)?
         {
-            let short: String = commit.chars().take(12).collect();
-            eprintln!("  using cached eval: {short} ({system})");
+            // A cache hit is silent — a fully-cached run must print nothing.
             cached[i] = Some(attrs);
         } else {
             todo.push(i);

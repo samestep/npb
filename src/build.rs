@@ -291,13 +291,11 @@ pub fn build_targets(
         !force && (cache_built(drv) || probed.get(drv).copied().unwrap_or(false))
     };
 
-    // Pass 1: decide per target. Skips are tallied into a one-line summary (a
-    // fully-cached set would otherwise bury the useful output under N lines);
-    // dry-run still lists each would-build target, since that's its whole point.
+    // Pass 1: decide per target. Skips are silent — a fully-cached run must print
+    // nothing; dry-run still lists each would-build target, since that's its point.
     let now = chrono::Utc::now().timestamp();
     let mut results: Vec<Built> = Vec::with_capacity(targets.len());
     let mut to_build: Vec<usize> = Vec::new();
-    let (mut skip_ok, mut skip_cache, mut skip_fail) = (0, 0, 0);
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
         let sub = substitutable(&t.drv_path);
@@ -305,30 +303,24 @@ pub fn build_targets(
         match decision {
             Decision::Build if dry_run => println!("  would build           {} {}", t.system, t.attr),
             Decision::Build => to_build.push(i),
+            // Substitutable but not built here: record a Cache fact (deduped) so
+            // the report reflects it and a re-run needn't probe the cache again.
             Decision::SkipOk => {
-                if sub && !local_built(&t.drv_path) {
-                    // In the cache, not built here — record a Cache fact (deduped)
-                    // so the report shows `C`, never a bogus `L`, and a re-run needn't
-                    // probe again.
-                    if !cache_built(&t.drv_path) {
-                        store.add_observation(&Observation {
-                            drv_path: t.drv_path.clone(),
-                            source: Source::Cache,
-                            outcome: Outcome::Built,
-                            when: now,
-                            system: Some(t.system.clone()),
-                            duration_s: None,
-                            cached: Some(true),
-                            machine: None,
-                            log_ref: None,
-                        })?;
-                    }
-                    skip_cache += 1;
-                } else {
-                    skip_ok += 1;
+                if sub && !local_built(&t.drv_path) && !cache_built(&t.drv_path) {
+                    store.add_observation(&Observation {
+                        drv_path: t.drv_path.clone(),
+                        source: Source::Cache,
+                        outcome: Outcome::Built,
+                        when: now,
+                        system: Some(t.system.clone()),
+                        duration_s: None,
+                        cached: Some(true),
+                        machine: None,
+                        log_ref: None,
+                    })?;
                 }
             }
-            Decision::SkipFail => skip_fail += 1,
+            Decision::SkipFail => {}
         }
         results.push(Built {
             attr: t.attr.clone(),
@@ -337,13 +329,6 @@ pub fn build_targets(
             decision,
             outcome: None,
         });
-    }
-    if skip_ok + skip_cache + skip_fail > 0 {
-        println!(
-            "skipping {} target(s): {skip_ok} known-ok, {skip_cache} in binary cache, \
-             {skip_fail} known-failure",
-            skip_ok + skip_cache + skip_fail
-        );
     }
 
     // Pass 2: one nom build for the whole set; Pass 3: attribute, keep each log,
