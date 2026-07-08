@@ -49,10 +49,10 @@ where they are the right key (narinfo / substituter presence).
 There are only two, and collapsing everything else into the second is a
 deliberate simplification (it dropped out of the design discussion):
 
-| fact | key | discipline |
-| --- | --- | --- |
-| **eval** — attr→drv map + meta | `(commit, system, config)` | **pure** → cache forever, never invalidate |
-| **observation** — one build/lookup event | `drvpath` (or output path for `Cache`) | **append-only log** — never overwrite |
+| fact | key | discipline | storage |
+| --- | --- | --- | --- |
+| **eval** — attr→drv map | `(commit, system, config)` | **pure** → cache forever, never invalidate | one flat file per key |
+| **observation** — one build/probe event | `drvpath` (or output path for `Cache`) | **append-only log** — never overwrite | SQLite |
 
 An eval at a fixed `(commit, system, config)` is deterministic, so its result is
 valid forever. Everything else is an **observation**: a single event, from some
@@ -81,34 +81,37 @@ keeps **no gcroots** — a built output may be GC'd, but the *observation* that 
 built survives, and that's the fact we actually need; if the output is wanted
 again, Nix rebuilds or substitutes it.
 
-**First, a non-problem to dispel:** we never need to build an in-memory reverse
-index at startup. We only ever look facts up by keys we already hold — an attr
-name, an output hash, a drvpath — and **the eval fact is itself the join**
-(given an eval, `attr ⇄ drv ⇄ outputs`). So per-key access is direct regardless
-of backend.
+The two fact kinds have opposite access patterns, so they get different backends.
 
-**Backend: SQLite** (`npd.sqlite`, one file) for both eval maps and the
-observation log. Build logs are *not* stored — Nix keeps them itself under
-`/nix/var/log/nix/drvs` (`nix log <drv>` retrieves them, success or failure), so
-duplicating them would be pure redundancy. Schema lives in `src/store.rs`. Why
-SQLite over a pile of JSON files (a full-set eval is ~114k rows / ~27 MB of JSON,
-~85% redundant — it compresses ~6.5×):
+**Evals → one flat file per `(commit, system, profile)`** under `evals/`, sorted
+`attr\tdrv` lines (empty drv = no derivation; `src/eval.rs`). An eval is bulk,
+write-once, read-as-a-whole data whose *only* use is to be diffed against another
+eval, so a file beats SQLite on every axis that matters here:
 
-- indexes give O(log n) lookup by `drvpath` / output hash / `(job, system)` with
-  no manual index files, and a normalized table captures that redundancy natively;
-- it avoids the millions-of-tiny-files failure mode (inode pressure, slow
-  `readdir`, directory sharding) that a fact-per-file scheme hits over time;
-- transactional appends avoid torn writes;
-- the two-way / three-way eval diff and cross-cutting queries ("everything that
-  fails locally but is substitutable from the cache", "all flaky drvs") are one
-  SQL query rather than loading and parsing multiple 27 MB blobs.
+- **smaller** — ~11 MB vs ~22 MB in SQLite (no per-row overhead, no `(run_id,
+  attr)` index duplicating the data);
+- **faster to diff** — both files are sorted by attr, so the changed set is a
+  linear two-pointer merge over borrowed slices (~16 ms) rather than ~114k
+  primary-key point-lookups (~94 ms). The cross-cutting SQL queries that would
+  have justified a table never materialised (we only ever diff);
+- **evictable** — when the cache grows too big, delete whole eval files for old
+  commits; no `VACUUM` of a monolith. (The "millions of tiny files" failure mode
+  is about a file *per attr*; one file per *eval* is ~two files per review.)
 
-`existence` is not persisted — it is recomputed from `drv_path` + the meta flags
-on load, so there is one source of truth for that mapping.
+Writes are atomic (temp + `rename`) so a crash can't leave a truncated file that
+would poison the cache. Compression (zstd, ~7×) is left off for now: it would
+trade the fast mmap-and-merge for decompression time, and disk is cheap.
+
+**Observations → SQLite** (`npd.sqlite`), where the append-only log actually
+wants an engine: indexed lookup by `drvpath`, transactional appends, no torn
+writes. It stays tiny (KBs) — this is what SQLite is *for* here, and nothing
+else lives in it. Build logs are stored nowhere: Nix keeps them under
+`/nix/var/log/nix/drvs` (`nix log <drv>`, success or failure).
 
 ```
 ~/.cache/nix-npd/
-  npd.sqlite                    # evals + observation log
+  npd.sqlite                    # observation log (tiny)
+  evals/<commit>-<sys>-<profile>-v<n>.tsv   # attr→drv maps, one file per eval
   logs/eval-<commit>-<sys>.log  # nix-eval-jobs stderr (tracebacks), per eval
 ```
 

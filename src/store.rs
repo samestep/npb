@@ -1,41 +1,17 @@
-//! The SQLite fact store: pure eval facts and (later) the append-only
-//! observation log, in one `~/.cache/nix-npd/npd.sqlite` (DESIGN.md §3–§4).
-//!
-//! `existence` is not persisted — it is recomputed from `drv_path` + the meta
-//! flags on load, so there is one source of truth for that mapping.
+//! The SQLite fact store: the append-only observation log, in
+//! `~/.cache/nix-npd/npd.sqlite` (DESIGN.md §3–§4). Evals do *not* live here —
+//! they're standalone files (see `eval.rs`), so this DB stays tiny and holds
+//! only the small, index-worthy, append-only observation log.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
-use crate::model::{AttrEval, Existence, Observation, Outcome, Source};
+use crate::model::{Observation, Outcome, Source};
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS eval_run (
-    id           INTEGER PRIMARY KEY,
-    commit_      TEXT    NOT NULL,
-    system       TEXT    NOT NULL,
-    profile      TEXT    NOT NULL,
-    eval_version INTEGER NOT NULL,
-    evaluated_at INTEGER NOT NULL,
-    UNIQUE (commit_, system, profile, eval_version)
-) STRICT;
-
--- attr rows reference the run by its small integer id rather than repeating the
--- (40-char commit, system, profile, version) key in every row and its index.
-CREATE TABLE IF NOT EXISTS attr_eval (
-    run_id       INTEGER NOT NULL REFERENCES eval_run (id) ON DELETE CASCADE,
-    attr         TEXT    NOT NULL,
-    drv_path     TEXT,
-    broken       INTEGER,
-    unsupported  INTEGER,
-    insecure     INTEGER,
-    error        TEXT,
-    PRIMARY KEY (run_id, attr)
-) STRICT;
-
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
 -- `local`/`cache` fact here per drv. (Legacy `build_id`/`log_ref` columns may
 -- linger on old databases; they are simply never written now.)
@@ -91,18 +67,6 @@ fn outcome_from(s: &str) -> Result<Outcome> {
     })
 }
 
-fn recompute_existence(a: &AttrEval) -> Existence {
-    if a.drv_path.is_some() {
-        if a.broken == Some(true) || a.unsupported == Some(true) || a.insecure == Some(true) {
-            Existence::Blocked
-        } else {
-            Existence::Buildable
-        }
-    } else {
-        Existence::Error
-    }
-}
-
 pub struct Store {
     conn: Connection,
 }
@@ -116,165 +80,22 @@ impl Store {
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // WAL: readers don't block the writer; better for a durable local store.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
-        conn.pragma_update(None, "foreign_keys", "ON").ok();
+        // Migration: evals used to live here (a ~200 MB `attr_eval` table); they're
+        // files now. Drop the dead tables and VACUUM once to reclaim the space.
+        let had_evals = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attr_eval'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if had_evals {
+            conn.execute_batch("DROP TABLE IF EXISTS attr_eval; DROP TABLE IF EXISTS eval_run;")
+                .ok();
+            conn.execute_batch("VACUUM").ok();
+        }
         conn.execute_batch(SCHEMA).context("initializing schema")?;
         Ok(Self { conn })
-    }
-
-    fn run_id(
-        conn: &Connection,
-        commit: &str,
-        system: &str,
-        profile: &str,
-        version: u32,
-    ) -> Result<Option<i64>> {
-        Ok(conn
-            .query_row(
-                "SELECT id FROM eval_run \
-                 WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND eval_version = ?4",
-                params![commit, system, profile, version],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
-
-    /// The `eval_run` id for this key, or `None` if never evaluated. Cheap — a
-    /// single indexed lookup, without loading the ~114k-row attr map.
-    pub fn eval_run_id(
-        &self,
-        commit: &str,
-        system: &str,
-        profile: &str,
-        version: u32,
-    ) -> Result<Option<i64>> {
-        Self::run_id(&self.conn, commit, system, profile, version)
-    }
-
-    /// The changed set between two eval runs, computed *in SQLite*: for each attr
-    /// whose drv differs (added / removed / changed), `(attr, base_drv, head_drv)`.
-    /// Returns only the ~hundreds of changed rows rather than loading both full
-    /// ~114k-row maps into Rust to diff them.
-    ///
-    /// Written as two PK-driven passes rather than a `FULL OUTER JOIN`: the join
-    /// key `attr` only lives in the `(run_id, attr)` primary key, and SQLite
-    /// won't index a derived subquery, so a join over two `WHERE run_id=?`
-    /// subqueries degrades to an O(n²) scan (13e9 comparisons here). Instead each
-    /// base row point-looks-up its head counterpart via the PK, and a second pass
-    /// finds head-only (added) attrs — both O(n log n). `IS NOT` is null-safe, so
-    /// a missing counterpart (NULL) counts as a difference.
-    pub fn changed_drvs(
-        &self,
-        base_run: i64,
-        head_run: i64,
-    ) -> Result<Vec<(String, Option<String>, Option<String>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT b.attr, b.drv_path, \
-                    (SELECT drv_path FROM attr_eval WHERE run_id = ?2 AND attr = b.attr) \
-             FROM attr_eval b \
-             WHERE b.run_id = ?1 \
-               AND b.drv_path IS NOT \
-                   (SELECT drv_path FROM attr_eval WHERE run_id = ?2 AND attr = b.attr) \
-             UNION ALL \
-             SELECT h.attr, NULL, h.drv_path \
-             FROM attr_eval h \
-             WHERE h.run_id = ?2 \
-               AND NOT EXISTS (SELECT 1 FROM attr_eval b WHERE b.run_id = ?1 AND b.attr = h.attr) \
-             ORDER BY 1",
-        )?;
-        let rows = stmt.query_map(params![base_run, head_run], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
-    /// The cached full-set eval for this key, or `None` if never evaluated.
-    pub fn load_eval(
-        &self,
-        commit: &str,
-        system: &str,
-        profile: &str,
-        version: u32,
-    ) -> Result<Option<Vec<AttrEval>>> {
-        let Some(run_id) = Self::run_id(&self.conn, commit, system, profile, version)? else {
-            return Ok(None);
-        };
-
-        let mut stmt = self.conn.prepare(
-            "SELECT attr, drv_path, broken, unsupported, insecure, error FROM attr_eval \
-             WHERE run_id = ?1 ORDER BY attr",
-        )?;
-        let rows = stmt.query_map(params![run_id], |r| {
-            let mut a = AttrEval {
-                attr: r.get(0)?,
-                existence: Existence::Error, // fixed up below
-                drv_path: r.get(1)?,
-                broken: r.get(2)?,
-                unsupported: r.get(3)?,
-                insecure: r.get(4)?,
-                hydra_platforms_ok: None,
-                error: r.get(5)?,
-            };
-            a.existence = recompute_existence(&a);
-            Ok(a)
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(Some(out))
-    }
-
-    /// Store (replacing any prior) the full-set eval for this key; return its
-    /// `eval_run` id.
-    pub fn store_eval(
-        &mut self,
-        commit: &str,
-        system: &str,
-        profile: &str,
-        version: u32,
-        evaluated_at: i64,
-        attrs: &[AttrEval],
-    ) -> Result<i64> {
-        let tx = self.conn.transaction()?;
-        // Upsert the run, then (re)populate its attrs. Deleting the run cascades
-        // to its old attr_eval rows.
-        if let Some(old) = Self::run_id(&tx, commit, system, profile, version)? {
-            tx.execute("DELETE FROM eval_run WHERE id = ?1", params![old])?;
-        }
-        tx.execute(
-            "INSERT INTO eval_run (commit_, system, profile, eval_version, evaluated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![commit, system, profile, version, evaluated_at],
-        )?;
-        let run_id = tx.last_insert_rowid();
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO attr_eval \
-                 (run_id, attr, drv_path, broken, unsupported, insecure, error) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for a in attrs {
-                stmt.execute(params![
-                    run_id,
-                    a.attr,
-                    a.drv_path,
-                    a.broken,
-                    a.unsupported,
-                    a.insecure,
-                    a.error,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(run_id)
     }
 
     /// Append one observation to the log (never overwrites; DESIGN.md §3).
@@ -360,50 +181,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ev(attr: &str, drv: Option<&str>, broken: Option<bool>) -> AttrEval {
-        AttrEval {
-            attr: attr.into(),
-            existence: Existence::Buildable,
-            drv_path: drv.map(str::to_string),
-            broken,
-            unsupported: None,
-            insecure: None,
-            hydra_platforms_ok: None,
-            error: if drv.is_none() { Some("boom".into()) } else { None },
-        }
-    }
-
-    #[test]
-    fn eval_round_trips_and_recomputes_existence() {
-        let dir = std::env::temp_dir().join(format!("npd-store-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
-
-        // absent before storing
-        assert!(s.load_eval("c1", "aarch64-linux", "default", 1).unwrap().is_none());
-
-        let attrs = vec![
-            ev("hello", Some("/nix/store/a-hello.drv"), Some(false)),
-            ev("br", Some("/nix/store/b-br.drv"), Some(true)),
-            ev("bad", None, None),
-        ];
-        s.store_eval("c1", "aarch64-linux", "default", 1, 123, &attrs).unwrap();
-
-        let got = s.load_eval("c1", "aarch64-linux", "default", 1).unwrap().unwrap();
-        assert_eq!(got.len(), 3);
-        // existence recomputed from drv + flags
-        let by = |n: &str| got.iter().find(|a| a.attr == n).unwrap().existence;
-        assert_eq!(by("hello"), Existence::Buildable);
-        assert_eq!(by("br"), Existence::Blocked);
-        assert_eq!(by("bad"), Existence::Error);
-
-        // a different key is still absent; wrong version misses
-        assert!(s.load_eval("c2", "aarch64-linux", "default", 1).unwrap().is_none());
-        assert!(s.load_eval("c1", "aarch64-linux", "default", 2).unwrap().is_none());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn observations_append_and_load() {

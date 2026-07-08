@@ -20,7 +20,6 @@ use indicatif::{MultiProgress, ProgressBar};
 use serde::Deserialize;
 
 use crate::model::{AttrEval, Existence};
-use crate::store::Store;
 
 /// Bumped if we change *how* we invoke `nix-eval-jobs` in a way that could alter
 /// the attr->drv map; cache entries under a different version are ignored.
@@ -319,109 +318,170 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(cache_root()?.join("npd.sqlite"))
 }
 
-/// A completed evaluation: its `eval_run` id (the attr map stays in SQLite —
-/// callers diff/query it there) and where the result came from.
-#[derive(Clone)]
-pub struct Eval {
-    pub commit: String,
-    pub system: String,
-    pub run_id: i64,
-    pub from_cache: bool,
+// --- eval files -------------------------------------------------------------
+//
+// Each eval is a standalone file under `<cache>/evals/`, not SQLite rows. It's a
+// bulk, write-once, read-as-a-whole artifact — the only thing we ever do with it
+// is diff two of them — so a flat file is both smaller (no per-row / index
+// overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file (drop
+// old commits' evals) without vacuuming a monolithic DB. The format is one
+// `attr\tdrv` line per attr, sorted by attr (empty drv = no derivation), so the
+// diff is a linear two-pointer merge.
+
+fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
+    Ok(cache_root()?
+        .join("evals")
+        .join(format!("{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv")))
 }
 
-/// Evaluate every `(commit, system)` pair, caching read-through in SQLite. A
-/// cache hit resolves to a `run_id` without loading its ~114k-row attr map (the
-/// caller diffs/queries in SQL); misses run concurrently under a RAM-slot budget
-/// (see [`eval_plan`]) — no oversubscription, no killing in-flight work.
-///
-/// All SQLite access happens on this thread (reads before the fan-out, writes
-/// after the join), so the worker threads only run subprocesses and parse.
+/// Write an eval to its file, sorted by attr, atomically (temp + rename) so a
+/// crash can never leave a truncated file that would poison the cache.
+fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
+    let mut rows: Vec<(&str, &str)> = attrs
+        .iter()
+        .map(|a| (a.attr.as_str(), a.drv_path.as_deref().unwrap_or("")))
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut buf = String::with_capacity(rows.len() * 96);
+    for (attr, drv) in rows {
+        buf.push_str(attr);
+        buf.push('\t');
+        buf.push_str(drv);
+        buf.push('\n');
+    }
+    fs::create_dir_all(path.parent().unwrap()).context("creating evals dir")?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &buf).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).context("renaming eval into place")?;
+    Ok(())
+}
+
+/// Parse an eval file's bytes into `(attr, Option<drv>)` pairs, borrowing from
+/// `buf` (no per-attr allocation). Assumes the file is already sorted by attr.
+fn parse_eval(buf: &str) -> Vec<(&str, Option<&str>)> {
+    buf.lines()
+        .map(|l| {
+            let (attr, drv) = l.split_once('\t').unwrap_or((l, ""));
+            (attr, if drv.is_empty() { None } else { Some(drv) })
+        })
+        .collect()
+}
+
+/// One changed attr between two evals: its path and its drv on each side (`None`
+/// = absent/no derivation there).
+pub type ChangedDrv = (String, Option<String>, Option<String>);
+
+/// The changed set between two cached evals — one [`ChangedDrv`] for each attr
+/// whose drv differs — via a linear two-pointer merge over the two sorted files.
+/// Only the (few) changed rows are allocated.
+pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Result<Vec<ChangedDrv>> {
+    let bp = eval_path(base, system, profile)?;
+    let hp = eval_path(head, system, profile)?;
+    let bbuf = fs::read_to_string(&bp).with_context(|| format!("reading {}", bp.display()))?;
+    let hbuf = fs::read_to_string(&hp).with_context(|| format!("reading {}", hp.display()))?;
+    let b = parse_eval(&bbuf);
+    let h = parse_eval(&hbuf);
+
+    let own = |s: Option<&str>| s.map(str::to_string);
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < b.len() && j < h.len() {
+        match b[i].0.cmp(h[j].0) {
+            std::cmp::Ordering::Less => {
+                if b[i].1.is_some() {
+                    out.push((b[i].0.to_string(), own(b[i].1), None));
+                }
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                if h[j].1.is_some() {
+                    out.push((h[j].0.to_string(), None, own(h[j].1)));
+                }
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if b[i].1 != h[j].1 {
+                    out.push((b[i].0.to_string(), own(b[i].1), own(h[j].1)));
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    for k in &b[i..] {
+        if k.1.is_some() {
+            out.push((k.0.to_string(), own(k.1), None));
+        }
+    }
+    for k in &h[j..] {
+        if k.1.is_some() {
+            out.push((k.0.to_string(), None, own(k.1)));
+        }
+    }
+    Ok(out)
+}
+
+/// Ensure every `(commit, system)` pair has a cached eval file, computing the
+/// misses concurrently under a RAM-slot budget (see [`eval_plan`]) — no
+/// oversubscription, no killing in-flight work.
 pub fn eval_pairs(
     repo: &Path,
     pairs: &[(String, String)],
     profile: &str,
     opts: EvalOpts,
-) -> Result<Vec<Eval>> {
-    let mut store = Store::open(&db_path()?)?;
-    let now = chrono::Utc::now().timestamp();
-
-    // Split into cache hits (a cheap run_id lookup) and jobs to run.
-    let mut cached: Vec<Option<i64>> = vec![None; pairs.len()];
+) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     for (i, (commit, system)) in pairs.iter().enumerate() {
-        if let Some(run_id) = store.eval_run_id(commit, system, profile, EVAL_VERSION)? {
-            cached[i] = Some(run_id);
-        } else {
+        if !eval_path(commit, system, profile)?.exists() {
             todo.push(i);
         }
     }
-
-    // Run the uncached jobs concurrently, sharing one MultiProgress; persist each
-    // and keep its run_id.
-    let mut computed_run: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
-    if !todo.is_empty() {
-        let plan = eval_plan(todo.len(), opts);
-        eprintln!(
-            "  eval plan: {} job(s), budget {}MB / {}MB per worker = {} slot(s) \
-             -> {} concurrent x {} worker(s)",
-            todo.len(),
-            plan.budget_mb,
-            plan.per_worker_mb,
-            plan.slots,
-            plan.concurrency,
-            plan.workers,
-        );
-        let sem = Semaphore::new(plan.concurrency);
-        let mp = MultiProgress::new();
-        let computed: Vec<(usize, Vec<AttrEval>)> =
-            thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
-                let mut handles = Vec::new();
-                for &i in &todo {
-                    let (commit, system) = (&pairs[i].0, &pairs[i].1);
-                    let pb = mp.add(ProgressBar::new_spinner());
-                    let sem = &sem;
-                    handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
-                        sem.acquire();
-                        let r = run_eval_pb(
-                            repo, commit, system, profile, plan.workers, plan.per_worker_mb, &pb,
-                        );
-                        sem.release();
-                        Ok((i, r?))
-                    }));
-                }
-                let mut out = Vec::new();
-                for h in handles {
-                    out.push(h.join().expect("eval thread panicked")?);
-                }
-                Ok(out)
-            })?;
-        for (i, attrs) in &computed {
-            let (commit, system) = &pairs[*i];
-            let run_id = store.store_eval(commit, system, profile, EVAL_VERSION, now, attrs)?;
-            computed_run.insert(*i, run_id);
-        }
+    if todo.is_empty() {
+        return Ok(());
     }
 
-    // Reassemble in the original pair order.
-    let mut results = Vec::with_capacity(pairs.len());
-    for (i, (commit, system)) in pairs.iter().enumerate() {
-        let (run_id, from_cache) = match cached[i] {
-            Some(r) => (r, true),
-            None => (computed_run[&i], false),
-        };
-        results.push(Eval {
-            commit: commit.clone(),
-            system: system.clone(),
-            run_id,
-            from_cache,
-        });
+    let plan = eval_plan(todo.len(), opts);
+    eprintln!(
+        "  eval plan: {} job(s), budget {}MB / {}MB per worker = {} slot(s) \
+         -> {} concurrent x {} worker(s)",
+        todo.len(),
+        plan.budget_mb,
+        plan.per_worker_mb,
+        plan.slots,
+        plan.concurrency,
+        plan.workers,
+    );
+    let sem = Semaphore::new(plan.concurrency);
+    let mp = MultiProgress::new();
+    let computed: Vec<(usize, Vec<AttrEval>)> =
+        thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
+            let mut handles = Vec::new();
+            for &i in &todo {
+                let (commit, system) = (&pairs[i].0, &pairs[i].1);
+                let pb = mp.add(ProgressBar::new_spinner());
+                let sem = &sem;
+                handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
+                    sem.acquire();
+                    let r =
+                        run_eval_pb(repo, commit, system, profile, plan.workers, plan.per_worker_mb, &pb);
+                    sem.release();
+                    Ok((i, r?))
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.join().expect("eval thread panicked")?);
+            }
+            Ok(out)
+        })?;
+    for (i, attrs) in &computed {
+        let (commit, system) = &pairs[*i];
+        write_eval(&eval_path(commit, system, profile)?, attrs)?;
     }
-    Ok(results)
+    Ok(())
 }
 
-/// Evaluate two commits across the same systems in one batch, so `base` and
-/// `head` run concurrently rather than one-then-the-other. Returns their evals
-/// split back out (base, head).
+/// Ensure both commits are evaluated across all systems (they run concurrently).
 pub fn eval_two(
     repo: &Path,
     base: &str,
@@ -429,7 +489,7 @@ pub fn eval_two(
     systems: &[String],
     profile: &str,
     opts: EvalOpts,
-) -> Result<(Vec<Eval>, Vec<Eval>)> {
+) -> Result<()> {
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
     for s in systems {
         pairs.push((base.to_string(), s.clone()));
@@ -437,10 +497,7 @@ pub fn eval_two(
     for s in systems {
         pairs.push((head.to_string(), s.clone()));
     }
-    let all = eval_pairs(repo, &pairs, profile, opts)?;
-    let base_evals = all.iter().filter(|e| e.commit == base).cloned().collect();
-    let head_evals = all.iter().filter(|e| e.commit == head).cloned().collect();
-    Ok((base_evals, head_evals))
+    eval_pairs(repo, &pairs, profile, opts)
 }
 
 #[cfg(test)]

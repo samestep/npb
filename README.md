@@ -40,9 +40,10 @@ skipping anything already known or substitutable), then groups the result by its
 …), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
 (render from existing facts only), `--recheck` / `--retry` / `--prefer-local`
 (build-policy knobs), `--system` (repeatable), `--nixpkgs`, and RAM-sizing knobs
-for the parallel evaluator. Under the hood: a SQLite fact store, streamed
-`nix-eval-jobs` run in parallel under a RAM budget, one batched `nom` build with
-concurrent cache probing, and a three-way (merge-base) diff.
+for the parallel evaluator. Under the hood: evals cached as flat per-commit files
+(diffed by a linear merge), a tiny SQLite observation log, streamed
+`nix-eval-jobs` run in parallel under a RAM budget, and one batched `nom` build
+with concurrent cache probing.
 
 ## Development
 

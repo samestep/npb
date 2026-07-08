@@ -171,29 +171,14 @@ fn run(cli: Cli) -> Result<()> {
     let (base, head) = resolve_base_head(&repo, cli.base, cli.head)?;
     let systems = resolve_systems(cli.system);
 
-    let (base_evals, head_evals) =
-        eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, opts)?;
+    eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, opts)?;
 
-    // The changed set per system — `(attr, base_drv, head_drv)` — diffed in
-    // SQLite from the two eval runs, so we never load the full attr maps into
-    // Rust. Computed once and reused for both the build and the render.
-    type Changed = Vec<(String, Option<String>, Option<String>)>;
-    let mut per_system_changed: Vec<(String, Changed)> = Vec::new();
-    {
-        let store = store::Store::open(&eval::db_path()?)?;
-        for sys in &systems {
-            let br = base_evals
-                .iter()
-                .find(|e| &e.system == sys)
-                .map(|e| e.run_id)
-                .context("base eval missing for a requested system")?;
-            let hr = head_evals
-                .iter()
-                .find(|e| &e.system == sys)
-                .map(|e| e.run_id)
-                .context("head eval missing for a requested system")?;
-            per_system_changed.push((sys.clone(), store.changed_drvs(br, hr)?));
-        }
+    // The changed set per system — `(attr, base_drv, head_drv)` — from a linear
+    // merge of the two sorted eval files. Computed once, reused for build+render.
+    let mut per_system_changed: Vec<(String, Vec<eval::ChangedDrv>)> = Vec::new();
+    for sys in &systems {
+        let changed = eval::changed_set(&base, &head, sys, eval::DEFAULT_PROFILE)?;
+        per_system_changed.push((sys.clone(), changed));
     }
 
     // Build both sides of the changed set (skipping anything already known or
