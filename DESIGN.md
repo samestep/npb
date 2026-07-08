@@ -106,13 +106,20 @@ trade the fast mmap-and-merge for decompression time, and disk is cheap.
 
 **Observations → SQLite** (`npd.sqlite`), where the append-only log actually
 wants an engine: indexed lookup by `drvpath`, transactional appends, no torn
-writes. It stays tiny (KBs) — this is what SQLite is *for* here, and nothing
-else lives in it. Build logs are stored nowhere: Nix keeps them under
-`/nix/var/log/nix/drvs` (`nix log <drv>`, success or failure).
+writes. It stays tiny (KBs) — this is what SQLite is *for* here. Build logs are
+stored nowhere: Nix keeps them under `/nix/var/log/nix/drvs` (`nix log <drv>`,
+success or failure).
+
+**The `--tests` cache → SQLite too** (`test_pkg` / `test_drv` tables, §6). Same
+reasoning inverted from evals: it's a *keyed, incremental, partial* fact (look up
+a package, append new ones), not a bulk write-once map to diff — so it wants the
+engine, not a file. It's small (a handful of short strings per changed package;
+KBs–single-digit MB per commit, dwarfed by the eval files) and evictable by
+commit, and full drv paths are stored as-is like the observation log.
 
 ```
 ~/.cache/nix-npd/
-  npd.sqlite                    # observation log (tiny)
+  npd.sqlite                    # observation log + --tests cache (tiny)
   evals/<commit>-<sys>-<profile>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
 ```
 
@@ -185,16 +192,29 @@ This is the main capability nixpkgs-review lacks; it is nearly free once
 changed package, also build its `passthru.tests` (building a test derivation *is*
 running it). The full-set eval never reaches these — a package's `tests` is a
 plain attrset without `recurseForDerivations`, so `nix-eval-jobs` doesn't descend
-into it — so `--tests` runs a **targeted, un-cached second eval** over just the
-changed set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a
-thunk `nix-eval-jobs` forces in a worker (so a package that fails to evaluate
-errors only its own subtree, never the whole run — the same per-attr isolation
-the full-set walk relies on). It is *not* cached like the full-set eval — it
-doesn't fit the `(commit, system, profile)` key, and the changed set is small, so
-it's recomputed each run rather than polluting the pure eval cache. npd evaluates
-the tests on **both** sides and keeps a test only where its drv actually differs
-base→head, so the resulting rows classify (regression / fixed / new / …) exactly
-like any other attr — a delta view, a superset of #397's one-shot head-only build.
+into it — so `--tests` runs a **targeted second eval** over just the changed
+set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a thunk
+`nix-eval-jobs` forces in a worker (so a package that fails to evaluate errors
+only its own subtree, never the whole run — the same per-attr isolation the
+full-set walk relies on). npd evaluates the tests on **both** sides and keeps a
+test only where its drv actually differs base→head, so the resulting rows
+classify (regression / fixed / new / …) exactly like any other attr — a delta
+view, a superset of #397's one-shot head-only build.
+
+This eval **is cached**, but *per package* rather than as a whole-set file. A
+test's drv is a pure function of `(commit, system, profile, package-attr)` — it
+does not depend on the base/head pairing — so the cache keys on the package, not
+the changed set, which means a package evaluated in one review is reused in any
+other at that commit. Each run looks up which changed packages are already
+cached and evaluates only the misses (in one batched `nix-eval-jobs`, so the
+nixpkgs-spine cost is paid once, not per package); a fully-cached re-run touches
+no `nix-eval-jobs` at all. Caching matters here because evaluating a test's drv
+means evaluating its whole derivation graph, and a `nixosTest` in `passthru.tests`
+pulls in an entire NixOS system — seconds and hundreds of MB *per test* — so a
+changed set with a few dozen server/library packages is a minute of evaluation
+that would otherwise repeat on every run, defeating "instant when cached". It
+lives in SQLite, not a flat eval file, because the access pattern is
+keyed/incremental (§4).
 
 ## 7. Cache facts — the one remote signal
 

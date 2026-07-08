@@ -55,6 +55,20 @@ pub struct AttrEval {
     pub error: Option<String>,
 }
 
+/// One resolved `passthru.tests` entry from a targeted test eval (`--tests`).
+///
+/// Pure fact like [`AttrEval`], but decomposed for the per-package test cache:
+/// `pkg_attr` is the package the test hangs off (the attr-path's first element),
+/// `test_attr` is the full `<pkg>.tests.<name>` label, and `drv_path` is `None`
+/// when the test errored (no derivation) — the same shape the full-set walk gives
+/// an errored attr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestJob {
+    pub pkg_attr: String,
+    pub test_attr: String,
+    pub drv_path: Option<String>,
+}
+
 /// Where a build observation came from. Local builds and substituter presence
 /// are both observations in one append-only log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
-use crate::model::{AttrEval, Existence};
+use crate::model::{AttrEval, Existence, TestJob};
 
 /// Bumped when the eval file format or *how* we invoke `nix-eval-jobs` changes in
 /// a way that could alter the stored attr->drv map; cache entries under a
@@ -154,16 +154,17 @@ fn run_eval_pb(
 /// `per_worker_mb`), streaming its NDJSON stdout through `map_job` into
 /// `AttrEval`s and rendering progress onto `pb`. `label` names the run in the
 /// progress bar and the integrity-gate error. Shared by the cached full-set eval
-/// (which keys on `attr`) and the targeted test eval (which relabels from
-/// `attrPath`) — both stream the same job shape and want the same truncation gate.
-fn stream_jobs(
+/// (`map_job` → [`AttrEval`], keyed on `attr`) and the targeted test eval
+/// (`map_job` → [`TestJob`], relabelled from `attrPath`) — both stream the same
+/// job shape and want the same truncation gate, so it's generic over the output.
+fn stream_jobs<T>(
     expr: &str,
     workers: usize,
     per_worker_mb: u64,
     pb: &ProgressBar,
     label: &str,
-    map_job: impl Fn(RawJob) -> AttrEval,
-) -> Result<Vec<AttrEval>> {
+    map_job: impl Fn(RawJob) -> T,
+) -> Result<Vec<T>> {
     // nix-eval-jobs prints a full Nix traceback per errored attr (megabytes over a
     // whole package set), and the actionable per-attr error is already in the
     // stdout JSON — so we neither inherit its stderr (terminal spam) nor persist
@@ -247,10 +248,15 @@ fn stream_jobs(
 // --- targeted test eval (passthru.tests of the changed set) ------------------
 //
 // The `--tests` feature (ported from nixpkgs-review#397): for the packages in a
-// change's *changed set*, also build their `passthru.tests`. Unlike the full-set
-// eval, this is NOT cached — it's a small, targeted eval over the (few) changed
-// attrs, recomputed each run (DESIGN §6: the pure full-set eval cache stays
-// untouched; a test eval doesn't fit its `(commit, system, profile)` key).
+// change's *changed set*, also build their `passthru.tests`. This is a small,
+// targeted eval over the (few) changed attrs, distinct from the full-set eval —
+// and it *is* cached, per package, in SQLite (see `store::Store` and `main`): a
+// test's drv is a pure function of `(commit, system, profile, package-attr)`, so
+// `eval_tests` runs only over the packages a run hasn't cached yet (the misses),
+// and a fully-cached re-run touches no `nix-eval-jobs` at all. It's a SQLite
+// fact, not a flat eval file, because the access pattern is keyed/incremental
+// (look up a package, append new ones) rather than the full-set eval's
+// bulk/write-once/read-whole-and-diff (DESIGN §4).
 //
 // The full-set `nix-eval-jobs` walk never reaches these drvs: a package's
 // `passthru.tests` is a plain attrset without `recurseForDerivations`, so it's
@@ -316,16 +322,17 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
         .replace("@ATTRS@", &list))
 }
 
-/// Evaluate the `passthru.tests` of `attrs` at `commit`/`system` into an
-/// `attr → drv` map (attrs labelled `<pkg>.tests.<name>`). Recomputed each run
-/// (see the section comment). Returns an empty vec for an empty `attrs`.
+/// Evaluate the `passthru.tests` of `attrs` at `commit`/`system` into [`TestJob`]s
+/// (one per resolved `<pkg>.tests.<name>`). This is the *miss* path of the cache:
+/// callers pass only the packages not already cached (see `main`). Returns an
+/// empty vec for an empty `attrs`.
 pub fn eval_tests(
     repo: &Path,
     commit: &str,
     system: &str,
     profile: &str,
     attrs: &[String],
-) -> Result<Vec<AttrEval>> {
+) -> Result<Vec<TestJob>> {
     if attrs.is_empty() {
         return Ok(Vec::new());
     }
@@ -336,16 +343,20 @@ pub fn eval_tests(
     let short: String = commit.chars().take(12).collect();
     let label = format!("tests {short} ({system})");
     let pb = ProgressBar::new_spinner();
-    // Relabel from `attrPath` (unquoted elements joined by `.`) rather than `attr`
+    // Label and split from `attrPath` (unquoted elements) rather than `attr`
     // (which nix-eval-jobs quotes for the dotted package component, e.g.
-    // `"python3Packages.requests".tests.foo`) — giving a clean `pkg.tests.name`.
+    // `"python3Packages.requests".tests.foo`): element 0 is the package we asked
+    // for (the job tree is keyed by it), and the whole path joined is the clean
+    // `<pkg>.tests.<name>` label.
     let map = |raw: RawJob| {
-        let path = raw.attr_path.clone();
-        let mut ae = raw_to_attr_eval(raw);
-        if let Some(p) = path {
-            ae.attr = p.join(".");
+        let path = raw.attr_path.clone().unwrap_or_else(|| vec![raw.attr.clone()]);
+        let pkg_attr = path.first().cloned().unwrap_or_default();
+        let test_attr = path.join(".");
+        TestJob {
+            pkg_attr,
+            test_attr,
+            drv_path: raw_to_attr_eval(raw).drv_path,
         }
-        ae
     };
     let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &pb, &label, map);
     pb.finish_and_clear();

@@ -165,6 +165,28 @@ fn resolve_base_head(
     Ok((base, head))
 }
 
+/// Test drvs for `pkgs` at one revision, via the per-package SQLite cache: look
+/// up which packages are already evaluated, `eval_tests` only the misses, persist
+/// them, then return `test_attr → drv` for the whole set. A fully-cached call
+/// runs no `nix-eval-jobs` — just two queries — so a re-run stays instant; a
+/// package evaluated in any prior review at this commit is reused for free.
+fn cached_test_drvs(
+    store: &mut store::Store,
+    repo: &std::path::Path,
+    commit: &str,
+    system: &str,
+    profile: &str,
+    pkgs: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let done = store.tests_cached_pkgs(commit, system, profile, pkgs)?;
+    let misses: Vec<String> = pkgs.iter().filter(|p| !done.contains(*p)).cloned().collect();
+    if !misses.is_empty() {
+        let jobs = eval::eval_tests(repo, commit, system, profile, &misses)?;
+        store.cache_test_eval(commit, system, profile, &misses, &jobs)?;
+    }
+    store.tests_drvs_for(commit, system, profile, pkgs)
+}
+
 fn run(cli: Cli) -> Result<()> {
     let policy = BuildPolicy {
         recheck: cli.recheck,
@@ -187,29 +209,28 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // --tests: expand each system's changed set with the changed packages'
-    // `passthru.tests`. We evaluate the tests on *both* sides (a targeted eval,
-    // recomputed each run) and keep a test as a changed attr only when its drv
-    // actually differs base→head — exactly `changed_set`'s own semantics, so the
-    // test rows classify (regression / fixed / new / …) like every other attr.
+    // `passthru.tests`. We resolve the tests on *both* sides (through the
+    // per-package SQLite cache — see `cached_test_drvs`) and keep a test as a
+    // changed attr only when its drv actually differs base→head — exactly
+    // `changed_set`'s own semantics, so the test rows classify (regression /
+    // fixed / new / …) like every other attr.
     if cli.tests {
+        let mut store = store::Store::open(&eval::db_path()?)?;
         for (sys, changed) in per_system_changed.iter_mut() {
             let mut names: Vec<String> = changed.iter().map(|(a, _, _)| a.clone()).collect();
             names.sort();
             names.dedup();
-            let base_tests = eval::eval_tests(&repo, &base, sys, eval::DEFAULT_PROFILE, &names)?;
-            let head_tests = eval::eval_tests(&repo, &head, sys, eval::DEFAULT_PROFILE, &names)?;
-            let drv_map = |ts: &[model::AttrEval]| -> std::collections::HashMap<String, Option<String>> {
-                ts.iter().map(|t| (t.attr.clone(), t.drv_path.clone())).collect()
-            };
-            let bmap = drv_map(&base_tests);
-            let hmap = drv_map(&head_tests);
+            let bmap = cached_test_drvs(&mut store, &repo, &base, sys, eval::DEFAULT_PROFILE, &names)?;
+            let hmap = cached_test_drvs(&mut store, &repo, &head, sys, eval::DEFAULT_PROFILE, &names)?;
             let mut keys: Vec<String> = bmap.keys().chain(hmap.keys()).cloned().collect();
             keys.sort();
             keys.dedup();
             for k in keys {
-                let bd = bmap.get(&k).cloned().flatten();
-                let hd = hmap.get(&k).cloned().flatten();
-                if bd != hd && (bd.is_some() || hd.is_some()) {
+                let bd = bmap.get(&k).cloned();
+                let hd = hmap.get(&k).cloned();
+                // Maps hold only resolved drvs, so a differing pair always has a
+                // drv on at least one side (a test dropped/added/rebuilt).
+                if bd != hd {
                     changed.push((k, bd, hd));
                 }
             }
