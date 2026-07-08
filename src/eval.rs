@@ -218,19 +218,33 @@ pub struct EvalOpts {
     pub workers: Option<u64>,
 }
 
-/// Total system RAM in MiB (Linux `/proc/meminfo`); a conservative fallback
-/// elsewhere (e.g. macOS) since we only auto-size on the Linux build boxes.
+/// Total system RAM in MiB, or a conservative 8 GiB fallback if neither probe
+/// works. Linux exposes it in `/proc/meminfo` (`MemTotal`, kiB); macOS has no
+/// such file, so we fall back to `sysctl -n hw.memsize` (bytes) — without which
+/// the auto-sizer would cap every Mac (however large) at 8 GiB → a single worker.
 fn total_mem_mb() -> u64 {
-    fs::read_to_string("/proc/meminfo")
+    // Linux: /proc/meminfo.
+    if let Ok(s) = fs::read_to_string("/proc/meminfo")
+        && let Some(kb) = s
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|n| n.parse::<u64>().ok())
+    {
+        return kb / 1024;
+    }
+    // macOS: sysctl hw.memsize (total physical RAM, in bytes).
+    if let Some(bytes) = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
         .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse::<u64>().ok())
-        })
-        .map(|kb| kb / 1024)
-        .unwrap_or(8192)
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return bytes / 1024 / 1024;
+    }
+    8192
 }
 
 /// How to run a batch of `n_jobs` evals: how many at once, how wide each, and
