@@ -21,9 +21,11 @@ use serde::Deserialize;
 
 use crate::model::{AttrEval, Existence};
 
-/// Bumped if we change *how* we invoke `nix-eval-jobs` in a way that could alter
-/// the attr->drv map; cache entries under a different version are ignored.
-pub const EVAL_VERSION: u32 = 1;
+/// Bumped when the eval file format or *how* we invoke `nix-eval-jobs` changes in
+/// a way that could alter the stored attr->drv map; cache entries under a
+/// different version are ignored (and regenerated), never parsed by newer code.
+/// v2: drv paths stored stripped of the `/nix/store/` prefix and `.drv` suffix.
+pub const EVAL_VERSION: u32 = 2;
 
 /// The default (and, for now, only) eval profile. npd owns the config so the key
 /// stays a short enumerable label rather than arbitrary Nix (DESIGN.md §6). The
@@ -383,12 +385,13 @@ pub fn db_path() -> Result<PathBuf> {
 // diff is a linear two-pointer merge.
 //
 // The drv column is stored *stripped*: `/nix/store/<h>-<n>.drv` is written as
-// just `<h>-<n>`, since that prefix/suffix is constant across every line (~15 B
-// saved per drv, ~15% of the file). Reconstruction is a per-changed-row concat,
-// so it costs nothing on the unchanged majority the merge skips. A stripped drv
-// never starts with `/`, so a field that does is a verbatim path (a non-default
-// store, or an old unstripped file) and is passed through untouched — the format
-// is thus self-describing and backward-compatible without an EVAL_VERSION bump.
+// just `<h>-<n>` (see `strip_drv`), since that prefix/suffix is constant across
+// every line — ~15 B/line, ~15% off the file. Reconstruction (`restore_drv`) is
+// one concat per changed row, so it costs nothing on the unchanged majority the
+// merge skips. The format is strict — every drv is a `/nix/store` `.drv` or
+// absent, matching the rest of npd (e.g. `cache::store_hash`) — with no fallback
+// for other shapes: changing it is an EVAL_VERSION bump, so pre-v2 files are
+// ignored and regenerated, never mis-parsed as if they were stripped.
 
 fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
     Ok(cache_root()?
@@ -401,7 +404,7 @@ fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
 fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     let mut rows: Vec<(&str, &str)> = attrs
         .iter()
-        .map(|a| (a.attr.as_str(), strip_drv(a.drv_path.as_deref().unwrap_or(""))))
+        .map(|a| (a.attr.as_str(), a.drv_path.as_deref().map(strip_drv).unwrap_or("")))
         .collect();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut buf = String::with_capacity(rows.len() * 96);
@@ -419,26 +422,20 @@ fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
 }
 
 /// The on-disk form of a drv path: strip the constant `/nix/store/` prefix and
-/// `.drv` suffix (re-added by [`restore_drv`]). Anything not of that exact shape
-/// — empty, or a path in some non-default store — is stored verbatim; a stripped
-/// drv is never empty and never starts with `/`, so the two stay unambiguous.
+/// `.drv` suffix; [`restore_drv`] re-adds them. Every drv `nix-eval-jobs` emits
+/// has this exact shape (an errored attr carries no drv and is stored as an empty
+/// field, so this is only ever called on a real path).
 fn strip_drv(drv: &str) -> &str {
-    drv.strip_prefix("/nix/store/")
-        .and_then(|s| s.strip_suffix(".drv"))
-        .filter(|s| !s.is_empty())
-        .unwrap_or(drv)
+    let stripped = drv
+        .strip_prefix("/nix/store/")
+        .and_then(|s| s.strip_suffix(".drv"));
+    debug_assert!(stripped.is_some(), "drv not /nix/store/<hash>-<name>.drv: {drv}");
+    stripped.unwrap_or(drv)
 }
 
-/// Reconstruct a full drv path from its stored form (see [`strip_drv`]). A field
-/// that already starts with `/` is a verbatim path and passes through unchanged.
+/// Reconstruct a full drv path from its stored (stripped) form — see [`strip_drv`].
 fn restore_drv(field: Option<&str>) -> Option<String> {
-    field.map(|s| {
-        if s.starts_with('/') {
-            s.to_string()
-        } else {
-            format!("/nix/store/{s}.drv")
-        }
-    })
+    field.map(|s| format!("/nix/store/{s}.drv"))
 }
 
 /// Parse an eval file's bytes into `(attr, Option<stored-drv>)` pairs, borrowing
@@ -619,25 +616,17 @@ mod tests {
 
     #[test]
     fn drv_paths_round_trip_stripped() {
-        // Standard store paths lose their prefix/suffix on disk...
+        // A drv loses its prefix/suffix on disk...
         assert_eq!(strip_drv("/nix/store/abc-hello.drv"), "abc-hello");
         assert_eq!(
             restore_drv(Some("abc-hello")).as_deref(),
             Some("/nix/store/abc-hello.drv")
         );
-        // ...and a full round trip is the identity.
+        // ...and strip -> restore is the identity for any /nix/store drv.
         for drv in ["/nix/store/abc-hello.drv", "/nix/store/d.drv"] {
             assert_eq!(restore_drv(Some(strip_drv(drv))).as_deref(), Some(drv));
         }
-        // Anything not of the exact shape is stored (and read) verbatim: a
-        // non-default store, a path without `.drv`, and the degenerate empty
-        // middle. Each still starts with `/`, so read never re-prepends a store.
-        for verbatim in ["/other/store/abc-hello.drv", "/nix/store/x", "/nix/store/.drv"] {
-            assert_eq!(strip_drv(verbatim), verbatim);
-            assert_eq!(restore_drv(Some(verbatim)).as_deref(), Some(verbatim));
-        }
-        // Empty drv (no derivation) is None on both sides.
-        assert_eq!(strip_drv(""), "");
+        // No drv (errored attr) is None on both sides.
         assert_eq!(restore_drv(None), None);
     }
 
@@ -656,24 +645,22 @@ mod tests {
         let attrs = [
             ae("hello", Some("/nix/store/a-hello.drv")),
             ae("bad", None),
-            ae("weird", Some("/other/store/z.drv")),
         ];
         let dir = std::env::temp_dir().join(format!("npd-eval-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("e.tsv");
         write_eval(&path, &attrs).unwrap();
 
-        // On disk the standard drv is stripped; the empty and non-default ones
-        // are verbatim (sorted by attr: bad, hello, weird).
+        // On disk the drv is stripped; a no-derivation attr is an empty field
+        // (sorted by attr: bad, hello).
         let raw = fs::read_to_string(&path).unwrap();
-        assert_eq!(raw, "bad\t\nhello\ta-hello\nweird\t/other/store/z.drv\n");
+        assert_eq!(raw, "bad\t\nhello\ta-hello\n");
 
         // Parsing + restoring recovers the original drv paths exactly.
         let parsed = parse_eval(&raw);
         let restored: Vec<_> = parsed.iter().map(|(a, d)| (*a, restore_drv(*d))).collect();
         assert_eq!(restored[0], ("bad", None));
         assert_eq!(restored[1], ("hello", Some("/nix/store/a-hello.drv".into())));
-        assert_eq!(restored[2], ("weird", Some("/other/store/z.drv".into())));
         let _ = fs::remove_dir_all(&dir);
     }
 
