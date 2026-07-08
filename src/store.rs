@@ -11,10 +11,13 @@ use rusqlite::{Connection, params};
 
 use crate::model::{Observation, Outcome, Source, TestJob};
 
+// This schema is the only one npd has ever had, and it must stay that way:
+// there is no migration code here by design (see CLAUDE.md). Change it freely
+// and in place — the whole store is a re-derivable cache, so the remedy for an
+// incompatible change is deleting `~/.cache/nix-npd`, never a compat shim.
 const SCHEMA: &str = "
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
--- `local`/`cache` fact here per drv. (Legacy `build_id`/`log_ref` columns may
--- linger on old databases; they are simply never written now.)
+-- `local`/`cache` fact here per drv.
 CREATE TABLE IF NOT EXISTS observation (
     id         INTEGER PRIMARY KEY,
     drv_path   TEXT    NOT NULL,
@@ -23,14 +26,9 @@ CREATE TABLE IF NOT EXISTS observation (
     when_      INTEGER NOT NULL,
     system     TEXT,
     duration_s REAL,
-    cached     INTEGER,
     machine    TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
-
--- npd once recorded Hydra facts; that source is gone. Purge its rows so the
--- verdict logic (which no longer knows `hydra-job`) never trips over them.
-DELETE FROM observation WHERE source = 'hydra-job';
 
 -- The `--tests` passthru.tests eval cache (DESIGN.md §4, §6). A test's drv is a
 -- pure function of (commit, system, profile, package-attr), so we cache per
@@ -77,7 +75,6 @@ fn outcome_str(o: Outcome) -> &'static str {
         Outcome::Built => "built",
         Outcome::Failed => "failed",
         Outcome::DepFailed => "dep-failed",
-        Outcome::NotAttempted => "not-attempted",
     }
 }
 
@@ -86,7 +83,6 @@ fn outcome_from(s: &str) -> Result<Outcome> {
         "built" => Outcome::Built,
         "failed" => Outcome::Failed,
         "dep-failed" => Outcome::DepFailed,
-        "not-attempted" => Outcome::NotAttempted,
         other => anyhow::bail!("unknown observation outcome in store: {other:?}"),
     })
 }
@@ -104,20 +100,6 @@ impl Store {
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // WAL: readers don't block the writer; better for a durable local store.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
-        // Migration: evals used to live here (a ~200 MB `attr_eval` table); they're
-        // files now. Drop the dead tables and VACUUM once to reclaim the space.
-        let had_evals = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attr_eval'",
-                [],
-                |_| Ok(()),
-            )
-            .is_ok();
-        if had_evals {
-            conn.execute_batch("DROP TABLE IF EXISTS attr_eval; DROP TABLE IF EXISTS eval_run;")
-                .ok();
-            conn.execute_batch("VACUUM").ok();
-        }
         conn.execute_batch(SCHEMA).context("initializing schema")?;
         Ok(Self { conn })
     }
@@ -126,8 +108,8 @@ impl Store {
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
         self.conn.execute(
             "INSERT INTO observation \
-             (drv_path, source, outcome, when_, system, duration_s, cached, machine) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (drv_path, source, outcome, when_, system, duration_s, machine) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 o.drv_path,
                 source_str(o.source),
@@ -135,7 +117,6 @@ impl Store {
                 o.when,
                 o.system,
                 o.duration_s,
-                o.cached,
                 o.machine,
             ],
         )?;
@@ -168,7 +149,7 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT drv_path, source, outcome, when_, system, duration_s, cached, machine \
+            "SELECT drv_path, source, outcome, when_, system, duration_s, machine \
              FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -181,12 +162,11 @@ impl Store {
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<f64>>(5)?,
-                r.get::<_, Option<bool>>(6)?,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         for row in rows {
-            let (drv_path, source, outcome, when, system, duration_s, cached, machine) = row?;
+            let (drv_path, source, outcome, when, system, duration_s, machine) = row?;
             out.entry(drv_path.clone()).or_default().push(Observation {
                 drv_path,
                 source: source_from(&source)?,
@@ -194,7 +174,6 @@ impl Store {
                 when,
                 system,
                 duration_s,
-                cached,
                 machine,
             });
         }
@@ -318,7 +297,6 @@ mod tests {
             when,
             system: Some("aarch64-linux".into()),
             duration_s: Some(1.5),
-            cached: None,
             machine: Some("host".into()),
         };
         s.add_observation(&mk(Outcome::Failed, 100)).unwrap();

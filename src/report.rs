@@ -183,7 +183,6 @@ mod tests {
             when: 0,
             system: None,
             duration_s: None,
-            cached: None,
             machine: None,
         }
     }

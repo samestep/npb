@@ -26,6 +26,25 @@ you expect to just repeat).
   `nix-eval-jobs`; building goes through `nix build` + the existing remote
   builders. `npd` owns the **memory** and the **orchestration**, not the plumbing.
 
+### No backward compatibility, ever
+
+`npd` has exactly one user, no releases, and no deployments, and everything it
+stores is a re-derivable cache (§4). So there is no such thing as "legacy data"
+or an "old format" to support:
+
+- **Never write migration code** — no schema upgrades, no purges of rows an
+  older version wrote, no readers for previous file formats, no "this column
+  may linger" tolerance. Change the current format in place.
+- If a format change would make existing cached data wrong to read, the remedy
+  is invalidation, not compatibility: bump `EVAL_VERSION` (eval files under a
+  different version are simply never read) or delete `~/.cache/nix-npd`.
+- When a feature is removed, remove **all** of it in the same change: enum
+  variants, struct fields, table columns, parsing, and doc references. Dead
+  "maybe useful later" fields are cruft; re-add them when they're actually used.
+
+(Design *rationale* for dropped approaches — e.g. why Hydra isn't consulted,
+§7 — is worth keeping in this document. Code paths for them are not.)
+
 ## 2. The one load-bearing decision: key facts on `drvpath`
 
 A **derivation path** (`/nix/store/<hash>-name.drv`) is the identity of a build
@@ -100,9 +119,10 @@ eval, so a file beats SQLite on every axis that matters here:
   commits; no `VACUUM` of a monolith. (The "millions of tiny files" failure mode
   is about a file *per attr*; one file per *eval* is ~two files per review.)
 
-Writes are atomic (temp + `rename`) so a crash can't leave a truncated file that
-would poison the cache. Compression (zstd, ~7×) is left off for now: it would
-trade the fast mmap-and-merge for decompression time, and disk is cheap.
+Writes are atomic — a uniquely-named temp file in the same directory (rename is
+only atomic within one filesystem), then `rename` into place — so a crash can't
+leave a truncated file that would poison the cache, and concurrent writers of
+the same eval can't collide.
 
 **Observations → SQLite** (`npd.sqlite`), where the append-only log actually
 wants an engine: indexed lookup by `drvpath`, transactional appends, no torn
@@ -132,7 +152,7 @@ and surface only its tail if the eval aborts fatally.
 ## 5. The observation log and the build-policy predicate
 
 Every local build appends an `Observation` (source, outcome, when, duration,
-machine, log). The ergonomics the workflow needs are then a **pure predicate**
+machine). The ergonomics the workflow needs are then a **pure predicate**
 over that log plus substituter presence:
 
 - never observed, or forced → **build**

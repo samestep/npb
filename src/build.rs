@@ -300,7 +300,6 @@ fn build_targets_at(
                         when: now,
                         system: Some(t.system.clone()),
                         duration_s: None,
-                        cached: Some(true),
                         machine: None,
                     })?;
                 }
@@ -341,7 +340,6 @@ fn build_targets_at(
                 when: chrono::Utc::now().timestamp(),
                 system: system_of.get(drv).copied().map(str::to_string),
                 duration_s: Some(secs),
-                cached: None,
                 machine: Some(host.clone()),
             })?;
             recorded.insert(drv.to_string(), (outcome, secs));
@@ -379,7 +377,6 @@ fn build_targets_at(
                         when: now,
                         system: Some(t.system.clone()),
                         duration_s: None,
-                        cached: None,
                         machine: Some(host.clone()),
                     })?;
                     (outcome, None)
@@ -389,7 +386,6 @@ fn build_targets_at(
                 Outcome::Built => "built ",
                 Outcome::Failed => "FAILED",
                 Outcome::DepFailed => "dep-failed",
-                Outcome::NotAttempted => unreachable!("batch attribution is built/failed/dep-failed"),
             };
             let dur = duration_s.map(|s| format!(" ({s:.0}s)")).unwrap_or_default();
             println!("  {label}  {} {}{dur}", t.system, t.attr);

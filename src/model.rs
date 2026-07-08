@@ -9,50 +9,16 @@
 //! keeps the model deterministic and trivially testable and lets the
 //! orchestration layer own all the impurity.
 
-use serde::{Deserialize, Serialize};
-
-/// Whether an attribute evaluates to something buildable on a platform.
-/// Determined purely by evaluation, before any build is attempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Existence {
-    /// Attr path not present in this revision (determined at diff time by set
-    /// membership — `nix-eval-jobs` simply doesn't emit a line for it).
-    Absent,
-    /// Present but meta.broken / badPlatforms / unsupported / insecure. We still
-    /// get a `drv_path` (npd evaluates with the allow-flags on), so it can be
-    /// built via a bypass; it's just marked not-to-build.
-    Blocked,
-    /// Present and eligible to build on this platform.
-    Buildable,
-    /// Present but evaluation itself errored (no drv) — e.g. an assertion or IFD
-    /// failure that survives the allow-flags. Distinct from a *build* failure.
-    Error,
-}
-
 /// Result of evaluating one attribute on one platform at one commit.
 ///
-/// Pure fact: fully determined by (commit, system, config). `drv_path` is set
-/// iff `existence` is `Buildable`. Meta flags are cached for later
-/// classification; `None` means we did not (or could not) determine them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Pure fact: fully determined by (commit, system, config). `drv_path` is
+/// `None` when evaluation itself errored (assertion, IFD failure, …) — distinct
+/// from a *build* failure, which is an [`Observation`]. That's the entire fact:
+/// the eval files store exactly `attr → drv` and the diff needs nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrEval {
     pub attr: String,
-    pub existence: Existence,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub drv_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub broken: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unsupported: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub insecure: Option<bool>,
-    /// Per meta.hydraPlatforms for this system — whether Hydra is *expected* to build it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hydra_platforms_ok: Option<bool>,
-    /// The evaluation error message, when `existence` is `Error`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// One resolved `passthru.tests` entry from a targeted test eval (`--tests`).
@@ -71,8 +37,7 @@ pub struct TestJob {
 
 /// Where a build observation came from. Local builds and substituter presence
 /// are both observations in one append-only log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// We ran `nix build` on one of our machines.
     Local,
@@ -81,16 +46,13 @@ pub enum Source {
 }
 
 /// The result of a single build attempt/observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Built,
     /// The derivation itself failed to build.
     Failed,
     /// A (transitive) dependency failed; this drv never ran.
     DepFailed,
-    /// The source has no record (narinfo 404, queued job, ...).
-    NotAttempted,
 }
 
 /// One append-only fact about one derivation, keyed externally by `drv_path`.
@@ -98,21 +60,15 @@ pub enum Outcome {
 /// We never overwrite an observation; flakiness is simply multiple observations
 /// of the same `drv_path` with differing outcomes. `when` is unix seconds,
 /// passed in by the caller (the model never reads the clock).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     pub drv_path: String,
     pub source: Source,
     pub outcome: Outcome,
     pub when: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
-    /// ~0 for a substituted/cached result.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Wall-clock build time; `None` when the fact came from a cache probe.
     pub duration_s: Option<f64>,
-    /// True when the result was substituted from the cache rather than built here.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
 }
 
@@ -186,7 +142,6 @@ mod tests {
             when: 0,
             system: None,
             duration_s: None,
-            cached: None,
             machine: None,
         }
     }

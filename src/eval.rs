@@ -1,6 +1,7 @@
 //! Evaluate a nixpkgs revision into an `attr -> drv` map via `nix-eval-jobs`,
-//! cached in the SQLite store. This is the first spine primitive (DESIGN.md §6,
-//! §9): a pure fact keyed by `(commit, system, profile)`, computed at most once.
+//! cached as one flat file per eval under `evals/` (DESIGN.md §4). This is the
+//! first spine primitive (DESIGN.md §6, §9): a pure fact keyed by
+//! `(commit, system, profile)`, computed at most once.
 //!
 //! The revision's source comes from `builtins.fetchGit`, so Nix fetches and
 //! caches it in the store — npd manages no worktrees. `nix-eval-jobs` output is
@@ -9,7 +10,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
@@ -20,13 +21,13 @@ use anyhow::{Context, Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
-use crate::model::{AttrEval, Existence, TestJob};
+use crate::model::{AttrEval, TestJob};
 
 /// Bumped when the eval file format or *how* we invoke `nix-eval-jobs` changes in
 /// a way that could alter the stored attr->drv map; cache entries under a
-/// different version are ignored (and regenerated), never parsed by newer code.
-/// v2: drv paths stored stripped of the `/nix/store/` prefix and `.drv` suffix.
-/// v3: the (stripped) TSV is zstd-compressed on disk.
+/// different version are ignored (and regenerated), never parsed by newer code —
+/// this version tag is the *only* format-change mechanism (no migration code,
+/// see CLAUDE.md).
 pub const EVAL_VERSION: u32 = 3;
 
 /// The default (and, for now, only) eval profile. npd owns the config so the key
@@ -45,65 +46,23 @@ fn profile_config(profile: &str) -> Result<&'static str> {
 
 // --- nix-eval-jobs output ---------------------------------------------------
 
-#[derive(Deserialize, Default)]
-struct RawMeta {
-    broken: Option<bool>,
-    unsupported: Option<bool>,
-    insecure: Option<bool>,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawJob {
     attr: String,
     /// The attr path as an array of *unquoted* elements. Preferred over `attr`
     /// (which nix-eval-jobs quotes when an element contains a `.`) when a clean,
-    /// dotted label is wanted — see the test eval. Absent on older output.
-    attr_path: Option<Vec<String>>,
+    /// dotted label is wanted — see the test eval.
+    attr_path: Vec<String>,
+    /// `None` when evaluation of the attr errored (the job line carries an
+    /// `error` message instead, which we don't keep — `nix log`/re-eval has it).
     drv_path: Option<String>,
-    error: Option<String>,
-    meta: Option<RawMeta>,
 }
 
 fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
-    let RawJob {
-        attr,
-        attr_path: _,
-        drv_path,
-        error,
-        meta,
-    } = raw;
-    match drv_path {
-        Some(drv) => {
-            let meta = meta.unwrap_or_default();
-            let blocked = matches!(meta.broken, Some(true))
-                || matches!(meta.unsupported, Some(true))
-                || matches!(meta.insecure, Some(true));
-            AttrEval {
-                attr,
-                existence: if blocked {
-                    Existence::Blocked
-                } else {
-                    Existence::Buildable
-                },
-                drv_path: Some(drv),
-                broken: meta.broken,
-                unsupported: meta.unsupported,
-                insecure: meta.insecure,
-                hydra_platforms_ok: None,
-                error: None,
-            }
-        }
-        None => AttrEval {
-            attr,
-            existence: Existence::Error,
-            drv_path: None,
-            broken: None,
-            unsupported: None,
-            insecure: None,
-            hydra_platforms_ok: None,
-            error,
-        },
+    AttrEval {
+        attr: raw.attr,
+        drv_path: raw.drv_path,
     }
 }
 
@@ -363,13 +322,12 @@ pub fn eval_tests(
     // for (the job tree is keyed by it), and the whole path joined is the clean
     // `<pkg>.tests.<name>` label.
     let map = |raw: RawJob| {
-        let path = raw.attr_path.clone().unwrap_or_else(|| vec![raw.attr.clone()]);
-        let pkg_attr = path.first().cloned().unwrap_or_default();
-        let test_attr = path.join(".");
+        let pkg_attr = raw.attr_path.first().cloned().unwrap_or_default();
+        let test_attr = raw.attr_path.join(".");
         TestJob {
             pkg_attr,
             test_attr,
-            drv_path: raw_to_attr_eval(raw).drv_path,
+            drv_path: raw.drv_path,
         }
     };
     let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &pb, &label, map);
@@ -563,8 +521,11 @@ fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
         .join(format!("{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv.zst")))
 }
 
-/// Write an eval to its file, sorted by attr, zstd-compressed, atomically (temp +
-/// rename) so a crash can never leave a truncated file that would poison the cache.
+/// Write an eval to its file, sorted by attr, zstd-compressed, atomically: a
+/// uniquely-named temp file in the *same directory* (rename is only atomic
+/// within one filesystem, so the system temp dir won't do), then rename into
+/// place. A crash can never leave a truncated file that would poison the cache,
+/// and concurrent writers of the same key can't tread on each other's temp.
 fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     let mut rows: Vec<(&str, &str)> = attrs
         .iter()
@@ -581,10 +542,11 @@ fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     // Level 0 = zstd's default level (currently 3); pass the sentinel rather than
     // a number so we track the library's default rather than pinning it.
     let compressed = zstd::encode_all(buf.as_bytes(), 0).context("compressing eval")?;
-    fs::create_dir_all(path.parent().unwrap()).context("creating evals dir")?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &compressed).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).context("renaming eval into place")?;
+    let dir = path.parent().expect("eval path has a parent");
+    fs::create_dir_all(dir).context("creating evals dir")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).context("creating temp eval file")?;
+    tmp.write_all(&compressed).context("writing temp eval file")?;
+    tmp.persist(path).context("renaming eval into place")?;
     Ok(())
 }
 
@@ -764,29 +726,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_success_blocked_and_error_lines() {
+    fn parses_success_and_error_lines() {
+        // Unknown fields (meta, system, fatal, …) are simply ignored; an errored
+        // attr has no drvPath.
         let stdout = concat!(
-            r#"{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/a-hello.drv","meta":{"broken":false,"unsupported":false},"system":"aarch64-linux"}"#,
-            "\n",
-            r#"{"attr":"br","drvPath":"/nix/store/b-br.drv","meta":{"broken":true}}"#,
+            r#"{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/a-hello.drv","meta":{"broken":false},"system":"aarch64-linux"}"#,
             "\n",
             r#"{"attr":"bad","attrPath":["bad"],"error":"boom","fatal":false}"#,
             "\n",
         );
         let attrs = parse_jobs(stdout.as_bytes()).unwrap();
-        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs.len(), 2);
 
         assert_eq!(attrs[0].attr, "hello");
-        assert_eq!(attrs[0].existence, Existence::Buildable);
         assert_eq!(attrs[0].drv_path.as_deref(), Some("/nix/store/a-hello.drv"));
 
-        assert_eq!(attrs[1].existence, Existence::Blocked);
-        assert_eq!(attrs[1].broken, Some(true));
-        assert!(attrs[1].drv_path.is_some());
-
-        assert_eq!(attrs[2].existence, Existence::Error);
-        assert_eq!(attrs[2].drv_path, None);
-        assert_eq!(attrs[2].error.as_deref(), Some("boom"));
+        assert_eq!(attrs[1].attr, "bad");
+        assert_eq!(attrs[1].drv_path, None);
     }
 
     #[test]
@@ -809,13 +765,7 @@ mod tests {
     fn write_eval_strips_and_parse_restores() {
         let ae = |attr: &str, drv: Option<&str>| AttrEval {
             attr: attr.into(),
-            existence: Existence::Buildable,
             drv_path: drv.map(str::to_string),
-            broken: None,
-            unsupported: None,
-            insecure: None,
-            hydra_platforms_ok: None,
-            error: None,
         };
         let attrs = [
             ae("hello", Some("/nix/store/a-hello.drv")),
