@@ -232,8 +232,15 @@ const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 /// width here even when the RAM budget could afford more.
 const MAX_WORKERS_PER_EVAL: u64 = 8;
 
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|v| v.parse().ok())
+/// Optional overrides for the parallel-eval sizing (see [`eval_plan`]). Every
+/// field `None` means "auto-size from system RAM"; the CLI surfaces each as a
+/// global flag so the scheme can be tuned point-by-point without env vars.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvalOpts {
+    pub mem_budget_mb: Option<u64>,
+    pub worker_mem_mb: Option<u64>,
+    pub concurrency: Option<u64>,
+    pub workers: Option<u64>,
 }
 
 /// Total system RAM in MiB (Linux `/proc/meminfo`); a conservative fallback
@@ -253,8 +260,8 @@ fn total_mem_mb() -> u64 {
 
 /// How to run a batch of `n_jobs` evals: how many at once, how wide each, and
 /// the per-worker heap cap. Derived from a RAM budget (default 80% of system
-/// RAM) divided into `per_worker_mb` slots; each knob is env-overridable so the
-/// scheme can be benchmarked point-by-point.
+/// RAM) divided into `per_worker_mb` slots; each knob is overridable via
+/// [`EvalOpts`] so the scheme can be benchmarked point-by-point.
 struct EvalPlan {
     concurrency: usize,
     workers: usize,
@@ -263,17 +270,19 @@ struct EvalPlan {
     slots: u64,
 }
 
-fn eval_plan(n_jobs: usize) -> EvalPlan {
-    let per_worker_mb = env_u64("NPD_WORKER_MEM_MB").unwrap_or(DEFAULT_WORKER_MEM_MB);
-    let budget_mb = env_u64("NPD_MEM_BUDGET_MB").unwrap_or_else(|| total_mem_mb() * 8 / 10);
+fn eval_plan(n_jobs: usize, opts: EvalOpts) -> EvalPlan {
+    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
+    let budget_mb = opts.mem_budget_mb.unwrap_or_else(|| total_mem_mb() * 8 / 10);
     let slots = (budget_mb / per_worker_mb).max(1);
     // Run as many evals at once as fit in the budget (but no more than we have),
     // splitting the slots evenly across them; each override wins if set.
-    let concurrency = env_u64("NPD_EVAL_CONCURRENCY")
+    let concurrency = opts
+        .concurrency
         .unwrap_or(slots)
         .min(n_jobs.max(1) as u64)
         .max(1);
-    let workers = env_u64("NPD_EVAL_WORKERS")
+    let workers = opts
+        .workers
         .unwrap_or_else(|| (slots / concurrency).clamp(1, MAX_WORKERS_PER_EVAL))
         .max(1);
     EvalPlan {
@@ -355,6 +364,7 @@ pub fn eval_pairs(
     pairs: &[(String, String)],
     profile: &str,
     scope: &[String],
+    opts: EvalOpts,
 ) -> Result<Vec<Eval>> {
     let mut store = Store::open(&db_path()?)?;
     let now = chrono::Utc::now().timestamp();
@@ -377,7 +387,7 @@ pub fn eval_pairs(
     // Run the uncached jobs concurrently, sharing one MultiProgress.
     let mut computed: Vec<(usize, Vec<AttrEval>)> = Vec::new();
     if !todo.is_empty() {
-        let plan = eval_plan(todo.len());
+        let plan = eval_plan(todo.len(), opts);
         eprintln!(
             "  eval plan: {} job(s), budget {}MB / {}MB per worker = {} slot(s) \
              -> {} concurrent x {} worker(s)",
@@ -445,10 +455,11 @@ pub fn eval_commit(
     systems: &[String],
     profile: &str,
     scope: &[String],
+    opts: EvalOpts,
 ) -> Result<Vec<Eval>> {
     let pairs: Vec<(String, String)> =
         systems.iter().map(|s| (commit.to_string(), s.clone())).collect();
-    eval_pairs(repo, &pairs, profile, scope)
+    eval_pairs(repo, &pairs, profile, scope, opts)
 }
 
 /// Evaluate two commits across the same systems in one batch, so `base` and
@@ -461,6 +472,7 @@ pub fn eval_two(
     systems: &[String],
     profile: &str,
     scope: &[String],
+    opts: EvalOpts,
 ) -> Result<(Vec<Eval>, Vec<Eval>)> {
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
     for s in systems {
@@ -469,7 +481,7 @@ pub fn eval_two(
     for s in systems {
         pairs.push((head.to_string(), s.clone()));
     }
-    let all = eval_pairs(repo, &pairs, profile, scope)?;
+    let all = eval_pairs(repo, &pairs, profile, scope, opts)?;
     let base_evals = all.iter().filter(|e| e.commit == base).cloned().collect();
     let head_evals = all.iter().filter(|e| e.commit == head).cloned().collect();
     Ok((base_evals, head_evals))

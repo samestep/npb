@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::Command as Proc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::diff::{Attribution, DiffKind};
 use crate::model::{BuildPolicy, Decision, Existence, Outcome};
@@ -30,6 +30,38 @@ use crate::model::{BuildPolicy, Decision, Existence, Outcome};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    #[command(flatten)]
+    eval: EvalArgs,
+}
+
+/// Parallel-evaluation sizing knobs, shared by every command that evaluates.
+/// `global = true` lets them appear before or after the subcommand; each unset
+/// flag is auto-sized from system RAM (see `eval::eval_plan`).
+#[derive(Args, Clone, Copy, Default)]
+struct EvalArgs {
+    /// Total RAM budget for parallel evaluation, MiB (default: 80% of system RAM).
+    #[arg(long, global = true)]
+    mem_budget_mb: Option<u64>,
+    /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
+    #[arg(long, global = true)]
+    worker_mem_mb: Option<u64>,
+    /// Number of evaluations to run at once (default: auto from the RAM budget).
+    #[arg(long, global = true)]
+    eval_concurrency: Option<u64>,
+    /// `nix-eval-jobs` workers per evaluation (default: auto, clamped 1–8).
+    #[arg(long, global = true)]
+    eval_workers: Option<u64>,
+}
+
+impl EvalArgs {
+    fn opts(self) -> eval::EvalOpts {
+        eval::EvalOpts {
+            mem_budget_mb: self.mem_budget_mb,
+            worker_mem_mb: self.worker_mem_mb,
+            concurrency: self.eval_concurrency,
+            workers: self.eval_workers,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -212,13 +244,14 @@ fn cmd_eval(
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
     profile: Option<String>,
+    opts: eval::EvalOpts,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
     let commit = resolve_commit(&repo, &commit)?;
     let systems = resolve_systems(system);
     let profile = profile.unwrap_or_else(|| eval::DEFAULT_PROFILE.to_string());
 
-    for e in eval::eval_commit(&repo, &commit, &systems, &profile, &attrs)? {
+    for e in eval::eval_commit(&repo, &commit, &systems, &profile, &attrs, opts)? {
         let (mut buildable, mut blocked, mut errored) = (0, 0, 0);
         for a in &e.attrs {
             match a.existence {
@@ -256,6 +289,7 @@ fn cmd_diff(
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
     profile: Option<String>,
+    opts: eval::EvalOpts,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
     let base = resolve_commit(&repo, &base)?;
@@ -269,9 +303,10 @@ fn cmd_diff(
         None
     };
 
-    let (base_evals, head_evals) = eval::eval_two(&repo, &base, &head, &systems, &profile, &attrs)?;
+    let (base_evals, head_evals) =
+        eval::eval_two(&repo, &base, &head, &systems, &profile, &attrs, opts)?;
     let mb_evals = match &merge_base {
-        Some(c) => Some(eval::eval_commit(&repo, c, &systems, &profile, &attrs)?),
+        Some(c) => Some(eval::eval_commit(&repo, c, &systems, &profile, &attrs, opts)?),
         None => None,
     };
     if let Some(c) = &merge_base {
@@ -336,8 +371,9 @@ fn targets_from_attrs(
     commit: &str,
     systems: &[String],
     attrs: &[String],
+    opts: eval::EvalOpts,
 ) -> Result<Vec<build::Target>> {
-    let evals = eval::eval_commit(repo, commit, systems, eval::DEFAULT_PROFILE, attrs)?;
+    let evals = eval::eval_commit(repo, commit, systems, eval::DEFAULT_PROFILE, attrs, opts)?;
     let mut targets = Vec::new();
     for e in &evals {
         for a in &e.attrs {
@@ -360,9 +396,10 @@ fn targets_from_diff(
     base: &str,
     commit: &str,
     systems: &[String],
+    opts: eval::EvalOpts,
 ) -> Result<Vec<build::Target>> {
     let (base_evals, head_evals) =
-        eval::eval_two(repo, base, commit, systems, eval::DEFAULT_PROFILE, &[])?;
+        eval::eval_two(repo, base, commit, systems, eval::DEFAULT_PROFILE, &[], opts)?;
     let mut targets = Vec::new();
     for sys in systems {
         let b = attrs_for(&base_evals, sys);
@@ -393,6 +430,7 @@ fn cmd_build(
     recheck: bool,
     retry: bool,
     prefer_local: bool,
+    opts: eval::EvalOpts,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
     let commit = resolve_commit(&repo, &commit)?;
@@ -407,9 +445,9 @@ fn cmd_build(
         (Some(_), false) => bail!("npd build: pass either attrs or --changed <base>, not both"),
         (Some(base), true) => {
             let base = resolve_commit(&repo, base)?;
-            targets_from_diff(&repo, &base, &commit, &systems)?
+            targets_from_diff(&repo, &base, &commit, &systems, opts)?
         }
-        (None, false) => targets_from_attrs(&repo, &commit, &systems, &attrs)?,
+        (None, false) => targets_from_attrs(&repo, &commit, &systems, &attrs, opts)?,
         (None, true) => bail!(
             "npd build: pass one or more attrs, or --changed <base> \
              (building the whole package set is almost never intended)"
@@ -472,13 +510,14 @@ fn cmd_report(
     nixpkgs: Option<PathBuf>,
     system: Vec<String>,
     no_build: bool,
+    opts: eval::EvalOpts,
 ) -> Result<()> {
     let repo = resolve_repo(nixpkgs)?;
     let (base, head) = resolve_base_head(&repo, base, head)?;
     let systems = resolve_systems(system);
 
     let (base_evals, head_evals) =
-        eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, &[])?;
+        eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, &[], opts)?;
 
     // The changed set per system, computed once and reused for both the build and
     // the render so they can never disagree.
@@ -539,14 +578,16 @@ fn cmd_report(
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let opts = cli.eval.opts();
+    match cli.command {
         Command::Eval {
             commit,
             attrs,
             nixpkgs,
             system,
             profile,
-        } => cmd_eval(commit, attrs, nixpkgs, system, profile),
+        } => cmd_eval(commit, attrs, nixpkgs, system, profile, opts),
         Command::Diff {
             base,
             head,
@@ -555,7 +596,7 @@ fn main() -> Result<()> {
             nixpkgs,
             system,
             profile,
-        } => cmd_diff(base, head, attrs, three_way, nixpkgs, system, profile),
+        } => cmd_diff(base, head, attrs, three_way, nixpkgs, system, profile, opts),
         Command::Build {
             commit,
             attrs,
@@ -576,6 +617,7 @@ fn main() -> Result<()> {
             recheck,
             retry,
             prefer_local,
+            opts,
         ),
         Command::Report {
             base,
@@ -583,6 +625,6 @@ fn main() -> Result<()> {
             nixpkgs,
             system,
             no_build,
-        } => cmd_report(base, head, nixpkgs, system, no_build),
+        } => cmd_report(base, head, nixpkgs, system, no_build, opts),
     }
 }
