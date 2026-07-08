@@ -41,7 +41,7 @@ enum Command {
         /// Attribute paths to scope to (dotted, e.g. `python3Packages.numpy`).
         /// Omit to evaluate the whole package set (that result is cached).
         attrs: Vec<String>,
-        /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
+        /// nixpkgs clone to resolve the commit in (default: current directory).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
         /// Systems to evaluate for (repeatable); defaults to the host system.
@@ -60,7 +60,7 @@ enum Command {
         /// Also evaluate the merge base to attribute each change (git-3-way style).
         #[arg(long)]
         three_way: bool,
-        /// nixpkgs repo to resolve the commits in (default: `$NPD_NIXPKGS`).
+        /// nixpkgs clone to resolve the commits in (default: current directory).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
         /// Systems to diff on (repeatable); defaults to the host system.
@@ -84,7 +84,7 @@ enum Command {
         /// Show what would be built (decisions per target) without building.
         #[arg(long)]
         dry_run: bool,
-        /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
+        /// nixpkgs clone to resolve the commit in (default: current directory).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
         /// Systems to build for (repeatable); defaults to the host system.
@@ -110,7 +110,7 @@ enum Command {
         base: Option<String>,
         /// Head revision (default: `HEAD`).
         head: Option<String>,
-        /// nixpkgs repo to resolve the commits in (default: `$NPD_NIXPKGS`).
+        /// nixpkgs clone to resolve the commits in (default: current directory).
         #[arg(long)]
         nixpkgs: Option<PathBuf>,
         /// Systems to report on (repeatable); defaults to the host system.
@@ -132,10 +132,15 @@ fn host_system() -> String {
     format!("{arch}-{os}")
 }
 
+/// The nixpkgs clone to operate on: `--nixpkgs` if given, else the current
+/// directory (assumed to be the root of a nixpkgs checkout). Resolved to an
+/// absolute path so `git -C` and `builtins.fetchGit` both accept it.
 fn resolve_repo(nixpkgs: Option<PathBuf>) -> Result<PathBuf> {
-    nixpkgs
-        .or_else(|| std::env::var_os("NPD_NIXPKGS").map(PathBuf::from))
-        .context("no nixpkgs repo: pass --nixpkgs <path> or set $NPD_NIXPKGS")
+    match nixpkgs {
+        Some(p) => Ok(p),
+        None => std::env::current_dir()
+            .context("could not determine the current directory; pass --nixpkgs <path>"),
+    }
 }
 
 fn resolve_systems(system: Vec<String>) -> Vec<String> {
