@@ -30,12 +30,17 @@ pub struct AttrEval {
 /// `pkg_attr` is the package the test hangs off (the attr-path's first element),
 /// `test_attr` is the full `<pkg>.tests.<name>` label, and `drv_path` is `None`
 /// when the test errored (no derivation) — the same shape the full-set walk gives
-/// an errored attr.
+/// an errored attr. `broken` is the test's own meta-blocked bit (broken /
+/// unsupported-on-this-system / insecure) — a test can be unavailable even when
+/// its package is fine (e.g. an x86-only NixOS test hung off a cross-platform
+/// package on `aarch64-linux`), so it must be tracked per test, not inferred from
+/// the package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestJob {
     pub pkg_attr: String,
     pub test_attr: String,
     pub drv_path: Option<String>,
+    pub broken: bool,
 }
 
 /// Where a build observation came from. Local builds and substituter presence

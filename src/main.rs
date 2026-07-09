@@ -174,8 +174,8 @@ fn resolve_base_head(
 
 /// Test drvs for `pkgs` at one revision, via the per-package SQLite cache: look
 /// up which packages are already evaluated, `eval_tests` only the misses, persist
-/// them, then return `test_attr → drv` for the whole set. A fully-cached call
-/// runs no `nix-eval-jobs` — just two queries — so a re-run stays instant; a
+/// them, then return `test_attr → (drv, broken)` for the whole set. A fully-cached
+/// call runs no `nix-eval-jobs` — just two queries — so a re-run stays instant; a
 /// package evaluated in any prior review at this commit is reused for free.
 fn cached_test_drvs(
     store: &mut store::Store,
@@ -184,7 +184,7 @@ fn cached_test_drvs(
     system: &str,
     profile: &str,
     pkgs: &[String],
-) -> Result<std::collections::HashMap<String, String>> {
+) -> Result<std::collections::HashMap<String, (String, bool)>> {
     let done = store.tests_cached_pkgs(commit, system, profile, pkgs)?;
     let misses: Vec<String> = pkgs
         .iter()
@@ -267,17 +267,20 @@ fn run(cli: Cli) -> Result<()> {
             keys.sort();
             keys.dedup();
             for k in keys {
-                let bd = bmap.get(&k).cloned();
-                let hd = hmap.get(&k).cloned();
+                let bd = bmap.get(&k);
+                let hd = hmap.get(&k);
                 // Maps hold only resolved drvs, so a differing pair always has a
-                // drv on at least one side (a test dropped/added/rebuilt).
+                // drv on at least one side (a test dropped/added/rebuilt). The
+                // `(drv, broken)` pair is compared whole, so a meta-only (un)marking
+                // (same drv, flipped broken bit) is still a review event — exactly
+                // like `changed_set` for full-set attrs.
                 if bd != hd {
                     changed.push(eval::ChangedAttr {
                         attr: k,
-                        base_drv: bd,
-                        head_drv: hd,
-                        base_broken: false,
-                        head_broken: false,
+                        base_drv: bd.map(|(d, _)| d.clone()),
+                        head_drv: hd.map(|(d, _)| d.clone()),
+                        base_broken: bd.is_some_and(|(_, b)| *b),
+                        head_broken: hd.is_some_and(|(_, b)| *b),
                     });
                 }
             }

@@ -235,10 +235,23 @@ into it — so `--tests` runs a **targeted second eval** over just the changed
 set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a thunk
 `nix-eval-jobs` forces in a worker (so a package that fails to evaluate errors
 only its own subtree, never the whole run — the same per-attr isolation the
-full-set walk relies on). npd evaluates the tests on **both** sides and keeps a
-test only where its drv actually differs base→head, so the resulting rows
-classify (regression / fixed / new / …) exactly like any other attr — a delta
-view, a superset of #397's one-shot head-only build.
+full-set walk relies on). Each test carries its own meta-blocked bit
+(broken/unsupported/insecure), and a test can be blocked while its package is not
+(an x86-only `nixosTest` hung off a cross-platform package is *unsupported* on
+`aarch64-linux`), so the bit is tracked per test, never inferred from the
+package. Unlike a normal package, a `passthru.tests` entry is a
+`nixosTest`/`vm-test-run` derivation that bypasses `check-meta`'s `commonMeta`,
+so its raw `meta` has *no* computed `unsupported`/`insecure` field for `--meta`
+to carry — so the tests expression **computes** the bit itself (platform support
+via `lib.meta.availableOn`, insecurity via `knownVulnerabilities`) and injects it
+into each test's meta (`build_tests_expr` in `src/eval.rs`). This lands the same
+verdict nixpkgs-review reaches by `tryEval`-ing the outPath under a strict
+config: a meta-blocked test is skipped and rendered 🚧, exactly as nixpkgs-review
+lists it under "marked broken and skipped". npd evaluates the tests on **both**
+sides and keeps a test only where its `(drv, broken)` pair actually differs
+base→head, so the resulting rows classify (regression / fixed / new /
+marked-broken / …) exactly like any other attr — a delta view, a superset of
+#397's one-shot head-only build.
 
 This eval **is cached**, but *per package* rather than as a whole-set file. A
 test's drv is a pure function of `(commit, system, profile, package-attr)` — it

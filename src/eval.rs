@@ -70,14 +70,19 @@ struct RawJob {
     meta: Option<RawMeta>,
 }
 
+/// Fold `--meta`'s availability bits into npd's single "meta-blocked" bit: marked
+/// broken *or* unsupported-on-this-system *or* insecure. A missing `meta` (an
+/// errored attr carries none) reads as not-blocked. Shared by the full-set walk
+/// and the targeted test eval so both classify meta the same way.
+fn meta_broken(meta: &RawMeta) -> bool {
+    meta.broken == Some(true) || meta.unsupported == Some(true) || meta.insecure == Some(true)
+}
+
 fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
-    let meta = raw.meta.unwrap_or_default();
     AttrEval {
         attr: raw.attr,
         drv_path: raw.drv_path,
-        broken: meta.broken == Some(true)
-            || meta.unsupported == Some(true)
-            || meta.insecure == Some(true),
+        broken: meta_broken(&raw.meta.unwrap_or_default()),
     }
 }
 
@@ -260,6 +265,21 @@ fn nix_escape(s: &str) -> String {
 /// package errors only its own subtree. `tests` resolves to the package's
 /// `passthru.tests` — a derivation (emitted as `<pkg>.tests`) or an attrset made
 /// recursable (emitted as `<pkg>.tests.<name>`); anything else yields no jobs.
+///
+/// **Computed meta-blocked bit.** A `passthru.tests` entry is usually a
+/// `nixosTest`/`vm-test-run` derivation, which does *not* pass through nixpkgs'
+/// `check-meta` `commonMeta`, so — unlike a normal package — its raw `meta`
+/// carries no computed `unsupported`/`insecure` field (only whatever the test
+/// framework set, e.g. `platforms`). So `--meta` alone can't tell us a test is
+/// meta-blocked. `mark` computes it here — platform support via
+/// `lib.meta.availableOn`, insecurity via `knownVulnerabilities` — and injects
+/// `unsupported`/`insecure` into each test derivation's `meta`, so the same fold
+/// the full-set walk uses (`meta_broken`) also classifies tests, matching
+/// nixpkgs-review's "marked broken and skipped" (which gets the same answer by
+/// `tryEval`-ing the outPath under a strict config). `mark` stops at
+/// derivations, so it never forces a derivation's internals, and each recursed
+/// leaf is wrapped in `tryEval` so one throwing test errors only itself — the
+/// per-leaf isolation nix-eval-jobs would otherwise give the untransformed tree.
 fn build_tests_expr(
     repo: &Path,
     commit: &str,
@@ -276,7 +296,24 @@ fn build_tests_expr(
 let
   pkgs = import (builtins.fetchGit { url = "@REPO@"; rev = "@COMMIT@"; }) { system = "@SYSTEM@"; config = @CFG@; };
   lib = pkgs.lib;
+  host = pkgs.stdenv.hostPlatform;
   attrs = [ @ATTRS@];
+  # Inject the *computed* meta-blocked bits (see build_tests_expr doc) into every
+  # test derivation, recursing through `tests` sub-attrsets. Stops at derivations
+  # (never forces their internals); each recursed leaf goes through `tryEval`, so
+  # a test that throws when forced is passed through untouched to error on its own.
+  mark = t:
+    if lib.isDerivation t then
+      t // {
+        meta = (t.meta or { }) // {
+          unsupported = !(lib.meta.availableOn host t);
+          insecure = (t.meta.knownVulnerabilities or [ ]) != [ ];
+        };
+      }
+    else if lib.isAttrs t then
+      lib.mapAttrs (_: v: let r = builtins.tryEval (mark v); in if r.success then r.value else v) t
+      // { recurseForDerivations = true; }
+    else t;
   node = name: {
     recurseForDerivations = true;
     # Forced per-attr in a nix-eval-jobs worker: a package that fails to evaluate
@@ -286,8 +323,7 @@ let
         pkg = lib.attrByPath (lib.splitString "." name) null pkgs;
         t = if pkg == null then null else (pkg.tests or null);
       in
-        if lib.isDerivation t then t
-        else if lib.isAttrs t then t // { recurseForDerivations = true; }
+        if lib.isDerivation t || lib.isAttrs t then mark t
         else { recurseForDerivations = true; };
   };
 in
@@ -331,10 +367,12 @@ pub fn eval_tests(
     let map = |raw: RawJob| {
         let pkg_attr = raw.attr_path.first().cloned().unwrap_or_default();
         let test_attr = raw.attr_path.join(".");
+        let broken = meta_broken(&raw.meta.unwrap_or_default());
         TestJob {
             pkg_attr,
             test_attr,
             drv_path: raw.drv_path,
+            broken,
         }
     };
     let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &pb, &label, map);

@@ -36,6 +36,9 @@ CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 -- evaluated (present even when it has zero tests, so a no-test package isn't
 -- re-evaluated every run); `test_drv` holds each resolved `<pkg>.tests.<name>`
 -- drv (a package may contribute zero rows). Full drv paths, like `observation`.
+-- `broken` is the test's own meta-blocked bit (a test can be unsupported on this
+-- system even when its package builds — an x86-only NixOS test on aarch64), so
+-- it's stored per test, not inferred from the package.
 CREATE TABLE IF NOT EXISTS test_pkg (
     commit_  TEXT NOT NULL,
     system   TEXT NOT NULL,
@@ -50,6 +53,7 @@ CREATE TABLE IF NOT EXISTS test_drv (
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
+    broken    INTEGER NOT NULL,
     PRIMARY KEY (commit_, system, profile, test_attr)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (commit_, system, profile, pkg_attr);
@@ -240,9 +244,9 @@ impl Store {
             if let Some(drv) = &j.drv_path {
                 tx.execute(
                     "INSERT OR REPLACE INTO test_drv \
-                     (commit_, system, profile, pkg_attr, test_attr, drv_path) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![commit, system, profile, j.pkg_attr, j.test_attr, drv],
+                     (commit_, system, profile, pkg_attr, test_attr, drv_path, broken) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![commit, system, profile, j.pkg_attr, j.test_attr, drv, j.broken],
                 )?;
             }
         }
@@ -250,15 +254,16 @@ impl Store {
         Ok(())
     }
 
-    /// All cached test drvs for `pkgs` at this key, as `test_attr → drv_path`
-    /// (only tests that resolved to a derivation). One query for the whole set.
+    /// All cached test drvs for `pkgs` at this key, as `test_attr → (drv_path,
+    /// broken)` (only tests that resolved to a derivation). One query for the
+    /// whole set.
     pub fn tests_drvs_for(
         &self,
         commit: &str,
         system: &str,
         profile: &str,
         pkgs: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, (String, bool)>> {
         let mut out = std::collections::HashMap::new();
         if pkgs.is_empty() {
             return Ok(out);
@@ -267,7 +272,7 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT test_attr, drv_path FROM test_drv \
+            "SELECT test_attr, drv_path, broken FROM test_drv \
              WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -277,11 +282,15 @@ impl Store {
                 .chain(pkgs.iter().map(String::as_str)),
         );
         let rows = stmt.query_map(params, |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
         })?;
         for row in rows {
-            let (test_attr, drv_path) = row?;
-            out.insert(test_attr, drv_path);
+            let (test_attr, drv_path, broken) = row?;
+            out.insert(test_attr, (drv_path, broken));
         }
         Ok(out)
     }
@@ -338,22 +347,26 @@ mod tests {
                 .is_empty()
         );
 
-        // hello has two tests; ripgrep has none; one test errored (no drv).
+        // hello has two tests (one marked broken); ripgrep has none; one test
+        // errored (no drv).
         let jobs = vec![
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.run".into(),
                 drv_path: Some("/nix/store/a.drv".into()),
+                broken: false,
             },
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.version".into(),
                 drv_path: Some("/nix/store/b.drv".into()),
+                broken: true,
             },
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.broken".into(),
                 drv_path: None,
+                broken: false,
             },
         ];
         s.cache_test_eval(c, sys, prof, &pkgs(&["hello", "ripgrep"]), &jobs)
@@ -366,16 +379,17 @@ mod tests {
             .unwrap();
         assert!(done.contains("hello") && done.contains("ripgrep") && !done.contains("curl"));
 
-        // hello resolves to its two drv'd tests (the errored one is not stored).
+        // hello resolves to its two drv'd tests (the errored one is not stored),
+        // each carrying its own meta-blocked bit.
         let hd = s.tests_drvs_for(c, sys, prof, &pkgs(&["hello"])).unwrap();
         assert_eq!(hd.len(), 2);
         assert_eq!(
-            hd.get("hello.tests.run").map(String::as_str),
-            Some("/nix/store/a.drv")
+            hd.get("hello.tests.run"),
+            Some(&("/nix/store/a.drv".to_string(), false))
         );
         assert_eq!(
-            hd.get("hello.tests.version").map(String::as_str),
-            Some("/nix/store/b.drv")
+            hd.get("hello.tests.version"),
+            Some(&("/nix/store/b.drv".to_string(), true))
         );
         // ripgrep is cached-done but has no test drvs.
         assert!(
