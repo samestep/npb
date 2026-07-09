@@ -20,8 +20,13 @@ return maxrss > args.maxMemorySize * KB_TO_BYTES;
 
 `--max-memory-size` is documented in MiB. On **Linux**, `ru_maxrss` is in
 **kilobytes** (getrusage(2)), so `MiB * 1024 = KiB` and the comparison is
-correct. On **macOS**, `ru_maxrss` is in **bytes** (getrusage(2) on Darwin:
-"the maximum resident set size utilized (in bytes)"), so the effective limit is
+correct. On **macOS**, `ru_maxrss` is in **bytes** — note Apple's man page
+still says "kilobytes", but that text is inherited from 4.4BSD and contradicts
+Apple's kernel: XNU fills the field from Mach task info, whose unit is bytes
+([`kern_resource.c`: `ru_maxrss = (long)tinfo.resident_size_max`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_resource.c),
+[`task_info.h`: `resident_size_max; /* maximum resident memory size (bytes) */`](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/task_info.h)).
+Empirically, a process that touches 256 MiB reports `ru_maxrss = 263104` on
+Linux and `269910016` on macOS. So on Darwin the effective limit is
 `--max-memory-size` **KiB**: the default 4096 becomes a 4 MiB cap. Every
 nixpkgs eval worker exceeds that the moment it imports nixpkgs, so
 `processJobRequest` returns false after the **first** job, the worker exits
