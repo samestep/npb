@@ -39,10 +39,12 @@
           # ring (via ureq's TLS) needs perl at build; rusqlite bundles sqlite (cc).
           nativeBuildInputs = [ pkgs.perl ];
         };
+        # Built once and shared by the package and every check.
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         npd = craneLib.buildPackage (
           commonArgs
           // {
-            cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+            inherit cargoArtifacts;
             nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
             postInstall = ''
               wrapProgram $out/bin/npd --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
@@ -52,6 +54,20 @@
       in
       {
         packages.default = npd;
+        # `nix flake check` runs these in the sandbox. Only the default (non-
+        # `#[ignore]`d) tests run here — the sole ignored test builds real
+        # derivations and needs the daemon, which the sandbox rightly denies.
+        checks = {
+          inherit npd;
+          npd-test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+          npd-clippy = craneLib.cargoClippy (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            }
+          );
+        };
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.rust-bin.stable.latest.default
