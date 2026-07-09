@@ -22,10 +22,9 @@ use crate::eval;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
-/// One derivation to consider building, with the attr/system it came from (for
-/// reporting). Produced from either an explicit eval or a diff's changed set.
+/// One derivation to consider building, with the system it came from. Produced
+/// from either an explicit eval or a diff's changed set.
 pub struct Target {
-    pub attr: String,
     pub system: String,
     pub drv_path: String,
     /// Marked broken/unsupported/insecure in meta — skipped by the default
@@ -205,19 +204,13 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 }
 
 /// For each target, consult `policy` against the observation log; then build the
-/// whole build set at once. With `dry_run`, decisions are computed and printed
-/// but nothing is built or recorded.
-pub fn build_targets(targets: &[Target], policy: BuildPolicy, dry_run: bool) -> Result<()> {
-    build_targets_at(&eval::db_path()?, targets, policy, dry_run)
+/// whole build set at once.
+pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
+    build_targets_at(&eval::db_path()?, targets, policy)
 }
 
 /// [`build_targets`] against an explicit observation DB (separable for tests).
-fn build_targets_at(
-    db: &std::path::Path,
-    targets: &[Target],
-    policy: BuildPolicy,
-    dry_run: bool,
-) -> Result<()> {
+fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
     let mut store = Store::open(db)?;
     let host = hostname();
     // --recheck / --prefer-local force a genuine local build; otherwise a cached
@@ -265,16 +258,13 @@ fn build_targets_at(
         |drv: &str| !force && (cache_built(drv) || probed.get(drv).copied().unwrap_or(false));
 
     // Pass 1: decide per target. Skips are silent — a fully-cached run must print
-    // nothing; dry-run still lists each would-build target, since that's its point.
+    // nothing.
     let now = chrono::Utc::now().timestamp();
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
         let sub = substitutable(&t.drv_path);
         match policy.decide(observations, sub, t.broken) {
-            Decision::Build if dry_run => {
-                println!("  would build           {} {}", t.system, t.attr)
-            }
             Decision::Build => to_build.push(i),
             // Substitutable but not built here: record a Cache fact (deduped) so
             // the report reflects it and a re-run needn't probe the cache again.
@@ -424,10 +414,9 @@ mod tests {
         let slow = instantiate(&expr, "slow");
         let blocked = instantiate(&expr, "blocked");
 
-        let targets: Vec<Target> = [("fail", &fail), ("slow", &slow), ("blocked", &blocked)]
+        let targets: Vec<Target> = [&fail, &slow, &blocked]
             .into_iter()
-            .map(|(attr, drv)| Target {
-                attr: attr.to_string(),
+            .map(|drv| Target {
                 system: "testsys".to_string(),
                 drv_path: drv.clone(),
                 broken: false,
@@ -435,7 +424,7 @@ mod tests {
             .collect();
         let db2 = db.clone();
         let builder = std::thread::spawn(move || {
-            build_targets_at(&db2, &targets, BuildPolicy::default(), false)
+            build_targets_at(&db2, &targets, BuildPolicy::default())
         });
 
         // The failure is near-instant, the success sleeps 8s; its Failed row

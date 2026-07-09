@@ -300,7 +300,6 @@ fn run(cli: Cli) -> Result<()> {
                     let Some(drv) = drv else { continue };
                     if seen.insert((drv.clone(), sys.clone())) {
                         targets.push(build::Target {
-                            attr: c.attr.clone(),
                             system: sys.clone(),
                             drv_path: drv.clone(),
                             broken,
@@ -310,7 +309,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         if !targets.is_empty() {
-            build::build_targets(&targets, policy, false)?;
+            build::build_targets(&targets, policy)?;
         }
     }
 
