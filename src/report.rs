@@ -54,9 +54,7 @@ pub fn side_state(drv: &Option<String>, broken: bool, obs: &[Observation]) -> St
     if drv.is_none() {
         return State::Absent;
     }
-    let has = |src: Source, out: Outcome| {
-        obs.iter().any(|o| o.source == src && o.outcome == out)
-    };
+    let has = |src: Source, out: Outcome| obs.iter().any(|o| o.source == src && o.outcome == out);
     if has(Source::Local, Outcome::Built) {
         State::Built
     } else if has(Source::Local, Outcome::Failed) {
@@ -91,30 +89,78 @@ fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
     // rows failing/building *from* Broken are only reachable via --build-broken.
     match (base, head) {
         (Built, Failed) => (0, "regression", "build on the base, fail here"),
-        (Built, Blocked) => (1, "blocked package", "build on the base, a dependency fails here"),
+        (Built, Blocked) => (
+            1,
+            "blocked package",
+            "build on the base, a dependency fails here",
+        ),
         (Absent, Failed) => (2, "new failure", "added here, fail to build"),
-        (Absent, Blocked) => (3, "new blocked package", "added here, blocked by a failed dependency"),
+        (Absent, Blocked) => (
+            3,
+            "new blocked package",
+            "added here, blocked by a failed dependency",
+        ),
         (Unknown, Failed) => (4, "failure", "fail here; base status unknown"),
         (Unknown, Blocked) => (5, "blocked package", "blocked here; base status unknown"),
         (Broken, Failed) => (6, "failure", "marked broken on the base, fail here"),
-        (Broken, Blocked) => (7, "blocked package", "marked broken on the base, a dependency fails here"),
+        (Broken, Blocked) => (
+            7,
+            "blocked package",
+            "marked broken on the base, a dependency fails here",
+        ),
         (Failed, Failed) => (8, "pre-existing failure", "fail on the base and here"),
         (Failed, Blocked) => (9, "pre-existing failure", "fail on the base, blocked here"),
         (Blocked, Failed) => (10, "pre-existing failure", "blocked on the base, fail here"),
-        (Blocked, Blocked) => (11, "pre-existing blocked package", "blocked on the base and here"),
-        (Built, Broken) => (12, "newly broken package", "build on the base, marked broken here (not attempted)"),
-        (Failed, Broken) => (13, "newly broken package", "fail on the base, marked broken here (not attempted)"),
-        (Blocked, Broken) => (14, "newly broken package", "blocked on the base, marked broken here (not attempted)"),
-        (Absent, Broken) => (15, "new broken package", "added here already marked broken (not attempted)"),
-        (Unknown, Broken) => (16, "broken package", "marked broken here (not attempted); base status unknown"),
-        (Broken, Broken) => (17, "pre-existing broken package", "marked broken on the base and here (not attempted)"),
+        (Blocked, Blocked) => (
+            11,
+            "pre-existing blocked package",
+            "blocked on the base and here",
+        ),
+        (Built, Broken) => (
+            12,
+            "newly broken package",
+            "build on the base, marked broken here (not attempted)",
+        ),
+        (Failed, Broken) => (
+            13,
+            "newly broken package",
+            "fail on the base, marked broken here (not attempted)",
+        ),
+        (Blocked, Broken) => (
+            14,
+            "newly broken package",
+            "blocked on the base, marked broken here (not attempted)",
+        ),
+        (Absent, Broken) => (
+            15,
+            "new broken package",
+            "added here already marked broken (not attempted)",
+        ),
+        (Unknown, Broken) => (
+            16,
+            "broken package",
+            "marked broken here (not attempted); base status unknown",
+        ),
+        (Broken, Broken) => (
+            17,
+            "pre-existing broken package",
+            "marked broken on the base and here (not attempted)",
+        ),
         (Built, Absent) => (18, "dropped package", "build on the base, gone here"),
         (Failed, Absent) => (19, "removed package", "failed on the base, gone here"),
         (Blocked, Absent) => (20, "removed package", "blocked on the base, gone here"),
-        (Broken, Absent) => (21, "removed broken package", "marked broken on the base, gone here"),
+        (Broken, Absent) => (
+            21,
+            "removed broken package",
+            "marked broken on the base, gone here",
+        ),
         (Failed, Built) => (22, "fixed package", "fail on the base, build here"),
         (Blocked, Built) => (23, "fixed package", "blocked on the base, build here"),
-        (Broken, Built) => (24, "unbroken package", "marked broken on the base, build here"),
+        (Broken, Built) => (
+            24,
+            "unbroken package",
+            "marked broken on the base, build here",
+        ),
         (Absent, Built) => (25, "new package", "new here, build"),
         (Unknown, Built) => (26, "built package", "build here; base status unknown"),
         (Built, Built) => (27, "unchanged package", "build on the base and here"),
@@ -157,7 +203,10 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
         .map(|attrs| {
             let mut a = attrs.clone();
             a.sort_by(|x, y| x.len().cmp(&y.len()).then_with(|| x.cmp(y)));
-            a.iter().map(|x| format!("`{x}`")).collect::<Vec<_>>().join(" = ")
+            a.iter()
+                .map(|x| format!("`{x}`"))
+                .collect::<Vec<_>>()
+                .join(" = ")
         })
         .collect();
     lines.sort();
@@ -217,21 +266,39 @@ mod tests {
         let d = Some("/nix/store/x.drv".to_string());
         assert_eq!(side_state(&d, false, &[]), State::Unknown);
         // Direct vs transitive failures are distinguished.
-        assert_eq!(side_state(&d, false, &[obs(Source::Local, Outcome::Failed)]), State::Failed);
-        assert_eq!(side_state(&d, false, &[obs(Source::Local, Outcome::DepFailed)]), State::Blocked);
+        assert_eq!(
+            side_state(&d, false, &[obs(Source::Local, Outcome::Failed)]),
+            State::Failed
+        );
+        assert_eq!(
+            side_state(&d, false, &[obs(Source::Local, Outcome::DepFailed)]),
+            State::Blocked
+        );
         // Cache success reads as Built; a local build wins over it.
-        assert_eq!(side_state(&d, false, &[obs(Source::Cache, Outcome::Built)]), State::Built);
+        assert_eq!(
+            side_state(&d, false, &[obs(Source::Cache, Outcome::Built)]),
+            State::Built
+        );
         let s = side_state(
             &d,
             false,
-            &[obs(Source::Cache, Outcome::Built), obs(Source::Local, Outcome::Failed)],
+            &[
+                obs(Source::Cache, Outcome::Built),
+                obs(Source::Local, Outcome::Failed),
+            ],
         );
         assert_eq!(s, State::Failed);
         // Marked broken with no facts is Broken; a real fact (a --build-broken
         // run's build or failure) outranks the marking. No drv is still Absent.
         assert_eq!(side_state(&d, true, &[]), State::Broken);
-        assert_eq!(side_state(&d, true, &[obs(Source::Local, Outcome::Built)]), State::Built);
-        assert_eq!(side_state(&d, true, &[obs(Source::Local, Outcome::Failed)]), State::Failed);
+        assert_eq!(
+            side_state(&d, true, &[obs(Source::Local, Outcome::Built)]),
+            State::Built
+        );
+        assert_eq!(
+            side_state(&d, true, &[obs(Source::Local, Outcome::Failed)]),
+            State::Failed
+        );
         assert_eq!(side_state(&None, true, &[]), State::Absent);
     }
 
@@ -249,25 +316,67 @@ mod tests {
     fn render_sections_tokens_grouping_and_folding() {
         let entries = vec![
             // regression (state changed → open)
-            entry("pkgA", State::Built, State::Failed, Some("/b/a.drv"), Some("/h/a.drv")),
+            entry(
+                "pkgA",
+                State::Built,
+                State::Failed,
+                Some("/b/a.drv"),
+                Some("/h/a.drv"),
+            ),
             // two distinct blocked drvs (state changed → open), transitive glyph 🚫
-            entry("dep1", State::Built, State::Blocked, Some("/b/d1"), Some("/h/d1")),
-            entry("dep2", State::Built, State::Blocked, Some("/b/d2"), Some("/h/d2")),
+            entry(
+                "dep1",
+                State::Built,
+                State::Blocked,
+                Some("/b/d1"),
+                Some("/h/d1"),
+            ),
+            entry(
+                "dep2",
+                State::Built,
+                State::Blocked,
+                Some("/b/d2"),
+                Some("/h/d2"),
+            ),
             // newly marked broken (meta), distinct from dep-blocked
-            entry("brk", State::Built, State::Broken, Some("/b/k"), Some("/h/k")),
+            entry(
+                "brk",
+                State::Built,
+                State::Broken,
+                Some("/b/k"),
+                Some("/h/k"),
+            ),
             // two attrs sharing one drv, unchanged (state same → collapsed, grouped)
-            entry("z.foo", State::Built, State::Built, Some("/b/f"), Some("/h/f")),
-            entry("foo", State::Built, State::Built, Some("/b/f"), Some("/h/f")),
+            entry(
+                "z.foo",
+                State::Built,
+                State::Built,
+                Some("/b/f"),
+                Some("/h/f"),
+            ),
+            entry(
+                "foo",
+                State::Built,
+                State::Built,
+                Some("/b/f"),
+                Some("/h/f"),
+            ),
         ];
         let out = render("base", "head", &[("aarch64-linux".into(), entries)]);
 
         // Composable tokens and the transitive distinction.
         assert!(out.contains("✅ → ❌ · <b>1 regression</b>"), "{out}");
         assert!(out.contains("✅ → 🚫 · <b>2 blocked packages</b>"), "{out}");
-        assert!(out.contains("✅ → 🚧 · <b>1 newly broken package</b>"), "{out}");
+        assert!(
+            out.contains("✅ → 🚧 · <b>1 newly broken package</b>"),
+            "{out}"
+        );
         // Grouping: shared drv collapses to one equals-joined line, shortest first.
         assert!(out.contains("- `foo` = `z.foo`"), "{out}");
-        assert!(out.contains("✅ → ✅ · <b>1 unchanged package</b> (2 attrs)"), "{out}");
+        assert!(
+            out.contains("✅ → ✅ · <b>1 unchanged package</b> (2 attrs)"),
+            "{out}"
+        );
         // All sections are folded closed.
         assert!(out.contains("<details><summary>✅ → ❌"), "{out}");
         assert!(out.contains("<details><summary>✅ → ✅"), "{out}");

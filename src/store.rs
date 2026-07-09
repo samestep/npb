@@ -96,8 +96,7 @@ impl Store {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).context("creating cache directory")?;
         }
-        let conn =
-            Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // WAL: readers don't block the writer; better for a durable local store.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(SCHEMA).context("initializing schema")?;
@@ -196,14 +195,18 @@ impl Store {
         if pkgs.is_empty() {
             return Ok(out);
         }
-        let placeholders = std::iter::repeat_n("?", pkgs.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", pkgs.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT pkg_attr FROM test_pkg \
              WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [commit, system, profile].into_iter().chain(pkgs.iter().map(String::as_str)),
+            [commit, system, profile]
+                .into_iter()
+                .chain(pkgs.iter().map(String::as_str)),
         );
         let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
         for row in rows {
@@ -260,16 +263,22 @@ impl Store {
         if pkgs.is_empty() {
             return Ok(out);
         }
-        let placeholders = std::iter::repeat_n("?", pkgs.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", pkgs.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT test_attr, drv_path FROM test_drv \
              WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [commit, system, profile].into_iter().chain(pkgs.iter().map(String::as_str)),
+            [commit, system, profile]
+                .into_iter()
+                .chain(pkgs.iter().map(String::as_str)),
         );
-        let rows = stmt.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map(params, |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         for row in rows {
             let (test_attr, drv_path) = row?;
             out.insert(test_attr, drv_path);
@@ -323,33 +332,63 @@ mod tests {
         let pkgs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
         // Nothing cached yet.
-        assert!(s.tests_cached_pkgs(c, sys, prof, &pkgs(&["hello", "ripgrep"])).unwrap().is_empty());
+        assert!(
+            s.tests_cached_pkgs(c, sys, prof, &pkgs(&["hello", "ripgrep"]))
+                .unwrap()
+                .is_empty()
+        );
 
         // hello has two tests; ripgrep has none; one test errored (no drv).
         let jobs = vec![
-            TestJob { pkg_attr: "hello".into(), test_attr: "hello.tests.run".into(),
-                      drv_path: Some("/nix/store/a.drv".into()) },
-            TestJob { pkg_attr: "hello".into(), test_attr: "hello.tests.version".into(),
-                      drv_path: Some("/nix/store/b.drv".into()) },
-            TestJob { pkg_attr: "hello".into(), test_attr: "hello.tests.broken".into(),
-                      drv_path: None },
+            TestJob {
+                pkg_attr: "hello".into(),
+                test_attr: "hello.tests.run".into(),
+                drv_path: Some("/nix/store/a.drv".into()),
+            },
+            TestJob {
+                pkg_attr: "hello".into(),
+                test_attr: "hello.tests.version".into(),
+                drv_path: Some("/nix/store/b.drv".into()),
+            },
+            TestJob {
+                pkg_attr: "hello".into(),
+                test_attr: "hello.tests.broken".into(),
+                drv_path: None,
+            },
         ];
-        s.cache_test_eval(c, sys, prof, &pkgs(&["hello", "ripgrep"]), &jobs).unwrap();
+        s.cache_test_eval(c, sys, prof, &pkgs(&["hello", "ripgrep"]), &jobs)
+            .unwrap();
 
         // Both packages are now marked evaluated — including the no-test one, so
         // it isn't re-evaluated (negative caching).
-        let done = s.tests_cached_pkgs(c, sys, prof, &pkgs(&["hello", "ripgrep", "curl"])).unwrap();
+        let done = s
+            .tests_cached_pkgs(c, sys, prof, &pkgs(&["hello", "ripgrep", "curl"]))
+            .unwrap();
         assert!(done.contains("hello") && done.contains("ripgrep") && !done.contains("curl"));
 
         // hello resolves to its two drv'd tests (the errored one is not stored).
         let hd = s.tests_drvs_for(c, sys, prof, &pkgs(&["hello"])).unwrap();
         assert_eq!(hd.len(), 2);
-        assert_eq!(hd.get("hello.tests.run").map(String::as_str), Some("/nix/store/a.drv"));
-        assert_eq!(hd.get("hello.tests.version").map(String::as_str), Some("/nix/store/b.drv"));
+        assert_eq!(
+            hd.get("hello.tests.run").map(String::as_str),
+            Some("/nix/store/a.drv")
+        );
+        assert_eq!(
+            hd.get("hello.tests.version").map(String::as_str),
+            Some("/nix/store/b.drv")
+        );
         // ripgrep is cached-done but has no test drvs.
-        assert!(s.tests_drvs_for(c, sys, prof, &pkgs(&["ripgrep"])).unwrap().is_empty());
+        assert!(
+            s.tests_drvs_for(c, sys, prof, &pkgs(&["ripgrep"]))
+                .unwrap()
+                .is_empty()
+        );
         // a different commit shares nothing.
-        assert!(s.tests_cached_pkgs("commitB", sys, prof, &pkgs(&["hello"])).unwrap().is_empty());
+        assert!(
+            s.tests_cached_pkgs("commitB", sys, prof, &pkgs(&["hello"]))
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

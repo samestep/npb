@@ -67,6 +67,7 @@
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             }
           );
+          npd-fmt = craneLib.cargoFmt { inherit (commonArgs) src; };
         };
         devShells.default = pkgs.mkShell {
           buildInputs = [

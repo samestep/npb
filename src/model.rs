@@ -114,7 +114,12 @@ impl BuildPolicy {
     /// (Nix could fetch it without building) — a *success* signal that says
     /// nothing about local reproducibility. `broken` is the attr's
     /// meta-broken/unsupported/insecure bit from the eval.
-    pub fn decide(&self, observations: &[Observation], substitutable: bool, broken: bool) -> Decision {
+    pub fn decide(
+        &self,
+        observations: &[Observation],
+        substitutable: bool,
+        broken: bool,
+    ) -> Decision {
         let local: Vec<&Observation> = observations
             .iter()
             .filter(|o| o.source == Source::Local)
@@ -129,7 +134,11 @@ impl BuildPolicy {
         // other knobs, so e.g. `--retry` alone still doesn't build it). A real
         // fact recorded earlier (a prior `--build-broken` run) still counts.
         if broken && !self.build_broken {
-            return if local_built { Decision::SkipOk } else { Decision::SkipBroken };
+            return if local_built {
+                Decision::SkipOk
+            } else {
+                Decision::SkipBroken
+            };
         }
         // A trusted success short-circuits unless we're deliberately re-checking.
         if local_built && !self.recheck {
@@ -164,12 +173,18 @@ mod tests {
 
     #[test]
     fn never_observed_builds() {
-        assert_eq!(BuildPolicy::default().decide(&[], false, false), Decision::Build);
+        assert_eq!(
+            BuildPolicy::default().decide(&[], false, false),
+            Decision::Build
+        );
     }
 
     #[test]
     fn substitutable_skips_unless_prefer_local() {
-        assert_eq!(BuildPolicy::default().decide(&[], true, false), Decision::SkipOk);
+        assert_eq!(
+            BuildPolicy::default().decide(&[], true, false),
+            Decision::SkipOk
+        );
         let p = BuildPolicy {
             prefer_local: true,
             ..Default::default()
@@ -180,7 +195,10 @@ mod tests {
     #[test]
     fn local_success_skips_unless_recheck() {
         let o = [obs(Source::Local, Outcome::Built)];
-        assert_eq!(BuildPolicy::default().decide(&o, false, false), Decision::SkipOk);
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false),
+            Decision::SkipOk
+        );
         let p = BuildPolicy {
             recheck: true,
             ..Default::default()
@@ -191,7 +209,10 @@ mod tests {
     #[test]
     fn only_failures_skip_unless_retry() {
         let o = [obs(Source::Local, Outcome::Failed)];
-        assert_eq!(BuildPolicy::default().decide(&o, false, false), Decision::SkipFail);
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false),
+            Decision::SkipFail
+        );
         let p = BuildPolicy {
             retry: true,
             ..Default::default()
@@ -205,7 +226,10 @@ mod tests {
             obs(Source::Local, Outcome::Failed),
             obs(Source::Local, Outcome::Built),
         ];
-        assert_eq!(BuildPolicy::default().decide(&o, false, false), Decision::SkipOk);
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false),
+            Decision::SkipOk
+        );
     }
 
     #[test]
@@ -213,7 +237,10 @@ mod tests {
         // A recorded Cache success is not a local build; without substitutable we
         // still build (the caller folds a prior Cache-built obs into substitutable).
         let o = [obs(Source::Cache, Outcome::Built)];
-        assert_eq!(BuildPolicy::default().decide(&o, false, false), Decision::Build);
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false),
+            Decision::Build
+        );
     }
 
     #[test]
@@ -223,9 +250,18 @@ mod tests {
         let p = BuildPolicy::default();
         assert_eq!(p.decide(&[], false, true), Decision::SkipBroken);
         assert_eq!(p.decide(&[], true, true), Decision::SkipBroken);
-        let retry = BuildPolicy { retry: true, ..Default::default() };
-        assert_eq!(retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true), Decision::SkipBroken);
-        let recheck = BuildPolicy { recheck: true, ..Default::default() };
+        let retry = BuildPolicy {
+            retry: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true),
+            Decision::SkipBroken
+        );
+        let recheck = BuildPolicy {
+            recheck: true,
+            ..Default::default()
+        };
         assert_eq!(recheck.decide(&[], false, true), Decision::SkipBroken);
 
         // A prior forced build's success is still a trusted fact.
@@ -233,7 +269,10 @@ mod tests {
         assert_eq!(p.decide(&o, false, true), Decision::SkipOk);
 
         // --build-broken restores the normal policy.
-        let bb = BuildPolicy { build_broken: true, ..Default::default() };
+        let bb = BuildPolicy {
+            build_broken: true,
+            ..Default::default()
+        };
         assert_eq!(bb.decide(&[], false, true), Decision::Build);
         assert_eq!(bb.decide(&o, false, true), Decision::SkipOk);
     }

@@ -43,7 +43,9 @@ fn output_in_cache(out_path: &str) -> bool {
         return false;
     };
     // ureq returns Err for 4xx/5xx and transport errors; only 2xx is Ok.
-    ureq::head(&format!("{CACHE}/{hash}.narinfo")).call().is_ok()
+    ureq::head(&format!("{CACHE}/{hash}.narinfo"))
+        .call()
+        .is_ok()
 }
 
 /// Is any of `drv`'s outputs in the binary cache — i.e. substitutable without a
@@ -76,7 +78,10 @@ pub fn in_cache_many(drvs: &[String]) -> HashMap<String, bool> {
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     });
     results.into_iter().collect()
 }

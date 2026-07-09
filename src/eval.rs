@@ -203,7 +203,8 @@ fn stream_jobs<T>(
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_message(format!("evaluating {label}"));
     let mut attrs = Vec::new();
-    for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
+    for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>()
+    {
         attrs.push(map_job(item.context("parsing nix-eval-jobs output")?));
         pb.set_message(format!("evaluating {label} — {} attrs", attrs.len()));
     }
@@ -258,7 +259,9 @@ fn stream_jobs<T>(
 /// double quotes, and the `${` interpolation opener. (Package attr names
 /// virtually never contain these, but a changed set is untrusted input.)
 fn nix_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace("${", "\\${")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("${", "\\${")
 }
 
 /// Nix expression exposing the `passthru.tests` of `attrs` at one revision as a
@@ -390,16 +393,17 @@ fn available_mem_mb() -> u64 {
         }
     }
     // macOS: reclaimable pages from `vm_stat`, else total from `sysctl`.
-    macos_available_mb()
-        .or_else(macos_total_mb)
-        .unwrap_or(8192)
+    macos_available_mb().or_else(macos_total_mb).unwrap_or(8192)
 }
 
 /// macOS available RAM (MiB): free + inactive + speculative + purgeable pages,
 /// per `vm_stat`. A heuristic (like Activity Monitor's "available"), but far
 /// better than assuming all of `hw.memsize` is free.
 fn macos_available_mb() -> Option<u64> {
-    let out = Command::new("vm_stat").output().ok().filter(|o| o.status.success())?;
+    let out = Command::new("vm_stat")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
     let text = String::from_utf8(out.stdout).ok()?;
     // Header: "Mach Virtual Memory Statistics: (page size of 16384 bytes)".
     let page = text
@@ -415,8 +419,10 @@ fn macos_available_mb() -> Option<u64> {
             .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
             .unwrap_or(0)
     };
-    let avail = pages("Pages free") + pages("Pages inactive")
-        + pages("Pages speculative") + pages("Pages purgeable");
+    let avail = pages("Pages free")
+        + pages("Pages inactive")
+        + pages("Pages speculative")
+        + pages("Pages purgeable");
     (avail > 0).then_some(avail * page / 1024 / 1024)
 }
 
@@ -446,7 +452,9 @@ struct EvalPlan {
 
 fn eval_plan(n_jobs: usize, opts: EvalOpts) -> EvalPlan {
     let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
-    let budget_mb = opts.mem_budget_mb.unwrap_or_else(|| available_mem_mb() * 8 / 10);
+    let budget_mb = opts
+        .mem_budget_mb
+        .unwrap_or_else(|| available_mem_mb() * 8 / 10);
     let slots = (budget_mb / per_worker_mb).max(1);
     // Run as many evals at once as fit in the budget (but no more than we have),
     // splitting the slots evenly across them; each override wins if set.
@@ -532,9 +540,9 @@ pub fn db_path() -> Result<PathBuf> {
 // it, so a single stream is the right shape; the merge is unchanged.
 
 fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
-    Ok(cache_root()?
-        .join("evals")
-        .join(format!("{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv.zst")))
+    Ok(cache_root()?.join("evals").join(format!(
+        "{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv.zst"
+    )))
 }
 
 /// Write an eval to its file, sorted by attr, zstd-compressed, atomically: a
@@ -545,7 +553,13 @@ fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
 fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     let mut rows: Vec<(&str, &str, bool)> = attrs
         .iter()
-        .map(|a| (a.attr.as_str(), a.drv_path.as_deref().map(strip_drv).unwrap_or(""), a.broken))
+        .map(|a| {
+            (
+                a.attr.as_str(),
+                a.drv_path.as_deref().map(strip_drv).unwrap_or(""),
+                a.broken,
+            )
+        })
         .collect();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut buf = String::with_capacity(rows.len() * 96);
@@ -565,7 +579,8 @@ fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     let dir = path.parent().expect("eval path has a parent");
     fs::create_dir_all(dir).context("creating evals dir")?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir).context("creating temp eval file")?;
-    tmp.write_all(&compressed).context("writing temp eval file")?;
+    tmp.write_all(&compressed)
+        .context("writing temp eval file")?;
     tmp.persist(path).context("renaming eval into place")?;
     Ok(())
 }
@@ -586,7 +601,10 @@ fn strip_drv(drv: &str) -> &str {
     let stripped = drv
         .strip_prefix("/nix/store/")
         .and_then(|s| s.strip_suffix(".drv"));
-    debug_assert!(stripped.is_some(), "drv not /nix/store/<hash>-<name>.drv: {drv}");
+    debug_assert!(
+        stripped.is_some(),
+        "drv not /nix/store/<hash>-<name>.drv: {drv}"
+    );
     stripped.unwrap_or(drv)
 }
 
@@ -632,7 +650,12 @@ pub struct ChangedAttr {
 /// (un)marking a package broken can change nothing but the bit — still a review
 /// event worth a row) — via a linear two-pointer merge over the two sorted
 /// files. Only the (few) changed rows are allocated.
-pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Result<Vec<ChangedAttr>> {
+pub fn changed_set(
+    base: &str,
+    head: &str,
+    system: &str,
+    profile: &str,
+) -> Result<Vec<ChangedAttr>> {
     let bp = eval_path(base, system, profile)?;
     let hp = eval_path(head, system, profile)?;
     let bbuf = read_eval(&bp)?;
@@ -742,8 +765,15 @@ pub fn eval_pairs(
                 let sem = &sem;
                 handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
                     sem.acquire();
-                    let r =
-                        run_eval_pb(repo, commit, system, profile, plan.workers, plan.per_worker_mb, &pb);
+                    let r = run_eval_pb(
+                        repo,
+                        commit,
+                        system,
+                        profile,
+                        plan.workers,
+                        plan.per_worker_mb,
+                        &pb,
+                    );
                     sem.release();
                     Ok((i, r?))
                 }));
@@ -857,11 +887,19 @@ mod tests {
 
         // Parsing + restoring recovers the original rows exactly.
         let parsed = parse_eval(&raw);
-        let restored: Vec<_> =
-            parsed.iter().map(|(a, d, br)| (*a, restore_drv(*d), *br)).collect();
+        let restored: Vec<_> = parsed
+            .iter()
+            .map(|(a, d, br)| (*a, restore_drv(*d), *br))
+            .collect();
         assert_eq!(restored[0], ("bad", None, false));
-        assert_eq!(restored[1], ("br", Some("/nix/store/b-br.drv".into()), true));
-        assert_eq!(restored[2], ("hello", Some("/nix/store/a-hello.drv".into()), false));
+        assert_eq!(
+            restored[1],
+            ("br", Some("/nix/store/b-br.drv".into()), true)
+        );
+        assert_eq!(
+            restored[2],
+            ("hello", Some("/nix/store/a-hello.drv".into()), false)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -25,7 +25,11 @@ use clap::{Args, Parser};
 use crate::model::BuildPolicy;
 
 #[derive(Parser)]
-#[command(name = "npd", version, about = "A persistent fact store for iterating on nixpkgs changes")]
+#[command(
+    name = "npd",
+    version,
+    about = "A persistent fact store for iterating on nixpkgs changes"
+)]
 struct Cli {
     /// Base revision (default: merge-base of head and `master`).
     base: Option<String>,
@@ -186,7 +190,11 @@ fn cached_test_drvs(
     pkgs: &[String],
 ) -> Result<std::collections::HashMap<String, String>> {
     let done = store.tests_cached_pkgs(commit, system, profile, pkgs)?;
-    let misses: Vec<String> = pkgs.iter().filter(|p| !done.contains(*p)).cloned().collect();
+    let misses: Vec<String> = pkgs
+        .iter()
+        .filter(|p| !done.contains(*p))
+        .cloned()
+        .collect();
     if !misses.is_empty() {
         let jobs = eval::eval_tests(repo, commit, system, profile, &misses)?;
         store.cache_test_eval(commit, system, profile, &misses, &jobs)?;
@@ -243,10 +251,22 @@ fn run(cli: Cli) -> Result<()> {
             };
             let base_names = names_on(|c| !c.base_broken);
             let head_names = names_on(|c| !c.head_broken);
-            let bmap =
-                cached_test_drvs(&mut store, &repo, &base, sys, eval::DEFAULT_PROFILE, &base_names)?;
-            let hmap =
-                cached_test_drvs(&mut store, &repo, &head, sys, eval::DEFAULT_PROFILE, &head_names)?;
+            let bmap = cached_test_drvs(
+                &mut store,
+                &repo,
+                &base,
+                sys,
+                eval::DEFAULT_PROFILE,
+                &base_names,
+            )?;
+            let hmap = cached_test_drvs(
+                &mut store,
+                &repo,
+                &head,
+                sys,
+                eval::DEFAULT_PROFILE,
+                &head_names,
+            )?;
             let mut keys: Vec<String> = bmap.keys().chain(hmap.keys()).cloned().collect();
             keys.sort();
             keys.dedup();

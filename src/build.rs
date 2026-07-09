@@ -92,16 +92,14 @@ fn batch_build(
     let requested: HashSet<&str> = drvs.iter().copied().collect();
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
-    nix.arg("build")
-        .args(&installables)
-        .args([
-            "--keep-going",
-            "--log-format",
-            "internal-json",
-            "-v",
-            "--extra-experimental-features",
-            "nix-command",
-        ]);
+    nix.arg("build").args(&installables).args([
+        "--keep-going",
+        "--log-format",
+        "internal-json",
+        "-v",
+        "--extra-experimental-features",
+        "nix-command",
+    ]);
     if force {
         nix.arg("--rebuild");
     }
@@ -219,11 +217,7 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 /// For each target, consult `policy` against the observation log; then build the
 /// whole build set at once. With `dry_run`, decisions are computed and printed
 /// but nothing is built or recorded.
-pub fn build_targets(
-    targets: &[Target],
-    policy: BuildPolicy,
-    dry_run: bool,
-) -> Result<Vec<Built>> {
+pub fn build_targets(targets: &[Target], policy: BuildPolicy, dry_run: bool) -> Result<Vec<Built>> {
     build_targets_at(&eval::db_path()?, targets, policy, dry_run)
 }
 
@@ -263,9 +257,8 @@ fn build_targets_at(
     // This is what keeps a re-run of an unchanged report near-instant: we don't
     // re-probe (HTTP + `nix-store`) the failures every time. Probes that do run
     // run concurrently (see `cache::in_cache_many`).
-    let has_fact = |drv: &str| {
-        obs_of(drv).iter().any(|o| o.source == Source::Local) || cache_built(drv)
-    };
+    let has_fact =
+        |drv: &str| obs_of(drv).iter().any(|o| o.source == Source::Local) || cache_built(drv);
     // A broken target the policy will skip anyway isn't worth an HTTP probe.
     let skipped_broken = |t: &Target| t.broken && !policy.build_broken;
     let mut to_probe: Vec<String> = Vec::new();
@@ -278,9 +271,8 @@ fn build_targets_at(
         }
     }
     let probed = cache::in_cache_many(&to_probe);
-    let substitutable = |drv: &str| {
-        !force && (cache_built(drv) || probed.get(drv).copied().unwrap_or(false))
-    };
+    let substitutable =
+        |drv: &str| !force && (cache_built(drv) || probed.get(drv).copied().unwrap_or(false));
 
     // Pass 1: decide per target. Skips are silent — a fully-cached run must print
     // nothing; dry-run still lists each would-build target, since that's its point.
@@ -292,7 +284,9 @@ fn build_targets_at(
         let sub = substitutable(&t.drv_path);
         let decision = policy.decide(observations, sub, t.broken);
         match decision {
-            Decision::Build if dry_run => println!("  would build           {} {}", t.system, t.attr),
+            Decision::Build if dry_run => {
+                println!("  would build           {} {}", t.system, t.attr)
+            }
             Decision::Build => to_build.push(i),
             // Substitutable but not built here: record a Cache fact (deduped) so
             // the report reflects it and a re-run needn't probe the cache again.
@@ -327,7 +321,10 @@ fn build_targets_at(
     // committed, so only in-flight and never-started builds cost anything on
     // the next run. (Nix keeps the build log itself; `nix log <drv>` gets it.)
     if !to_build.is_empty() {
-        let drvs: Vec<&str> = to_build.iter().map(|&i| targets[i].drv_path.as_str()).collect();
+        let drvs: Vec<&str> = to_build
+            .iter()
+            .map(|&i| targets[i].drv_path.as_str())
+            .collect();
         // Several targets can share a drv (aliased attrs); record it once.
         let system_of: HashMap<&str, &str> = to_build
             .iter()
@@ -335,7 +332,11 @@ fn build_targets_at(
             .collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
         let attempted = batch_build(&drvs, force, |drv, secs| {
-            let outcome = if drv_built(drv)? { Outcome::Built } else { Outcome::Failed };
+            let outcome = if drv_built(drv)? {
+                Outcome::Built
+            } else {
+                Outcome::Failed
+            };
             store.add_observation(&Observation {
                 drv_path: drv.to_string(),
                 source: Source::Local,
@@ -354,8 +355,11 @@ fn build_targets_at(
         // outputs already (substituted, or a prior interrupted run built it) or
         // was blocked by a failed dependency. No per-target result lines: nom's
         // tree already showed each build's fate, and the report has the rest.
-        let leftover: Vec<&str> =
-            drvs.iter().copied().filter(|d| !recorded.contains_key(*d)).collect();
+        let leftover: Vec<&str> = drvs
+            .iter()
+            .copied()
+            .filter(|d| !recorded.contains_key(*d))
+            .collect();
         let built_map = build_outcomes(&leftover)?;
         let now = chrono::Utc::now().timestamp();
         for &i in &to_build {
@@ -418,7 +422,10 @@ mod tests {
     #[test]
     #[ignore = "builds real derivations via nix; needs nix, nom, and ~10s"]
     fn records_outcomes_while_batch_still_building() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("npd-build-test-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("npd.sqlite");
@@ -472,11 +479,19 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        assert!(seen_mid_batch, "failure was not recorded while the batch was still building");
+        assert!(
+            seen_mid_batch,
+            "failure was not recorded while the batch was still building"
+        );
 
         let results = builder.join().unwrap().unwrap();
         let outcome_of = |attr: &str| {
-            results.iter().find(|b| b.attr == attr).unwrap().outcome.unwrap()
+            results
+                .iter()
+                .find(|b| b.attr == attr)
+                .unwrap()
+                .outcome
+                .unwrap()
         };
         assert_eq!(outcome_of("fail"), Outcome::Failed);
         assert_eq!(outcome_of("slow"), Outcome::Built);
