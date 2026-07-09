@@ -74,20 +74,25 @@ never grows past the initial size, because it never lives past one job).
 
 ## Fix
 
-Scale `ru_maxrss` per platform, e.g.:
+Normalize `ru_maxrss` to KiB on Darwin and leave the rest of the comparison
+untouched (minimal diff; keeps upstream's `NOLINT`s, which are still needed on
+glibc, where `struct rusage` fields live in unions and the struct is declared
+in an internal `bits/` header — on Darwin neither diagnostic fires):
 
 ```cpp
 auto shouldRestart(const MyArgs &args) -> bool {
-    struct rusage resourceUsage = {};
+    struct rusage resourceUsage = {}; // NOLINT(misc-include-cleaner)
     getrusage(RUSAGE_SELF, &resourceUsage);
-    // ru_maxrss is in kilobytes on Linux, bytes on macOS (getrusage(2)).
+    size_t maxrss =
+        resourceUsage
+            .ru_maxrss; // NOLINT(cppcoreguidelines-pro-type-union-access)
 #ifdef __APPLE__
-    const size_t maxrssBytes = resourceUsage.ru_maxrss;
-#else
-    const size_t maxrssBytes = resourceUsage.ru_maxrss * 1024UL;
+    // ru_maxrss is in bytes on Darwin, kilobytes everywhere else
+    // (getrusage(2)); normalize to KiB.
+    maxrss /= 1024;
 #endif
-    constexpr size_t MB_TO_BYTES = 1024UL * 1024UL;
-    return maxrssBytes > args.maxMemorySize * MB_TO_BYTES;
+    static constexpr size_t KB_TO_BYTES = 1024;
+    return maxrss > args.maxMemorySize * KB_TO_BYTES;
 }
 ```
 
