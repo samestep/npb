@@ -771,7 +771,12 @@ pub fn eval_pairs(
     }
 
     let plan = eval_plan(todo.len(), opts);
-    eprintln!(
+    let sem = Semaphore::new(plan.concurrency);
+    let mp = MultiProgress::new();
+    // Print through the MultiProgress so this shares indicatif's stderr surface
+    // and terminal handling (drawn above the bars on a TTY, hidden otherwise)
+    // rather than a bare eprintln! that would bypass and tear the progress bars.
+    let _ = mp.println(format!(
         "  eval plan: {} job(s), budget {}MB / {}MB per worker = {} slot(s) \
          -> {} concurrent x {} worker(s)",
         todo.len(),
@@ -780,9 +785,7 @@ pub fn eval_pairs(
         plan.slots,
         plan.concurrency,
         plan.workers,
-    );
-    let sem = Semaphore::new(plan.concurrency);
-    let mp = MultiProgress::new();
+    ));
     let computed: Vec<(usize, Vec<AttrEval>)> =
         thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
             let mut handles = Vec::new();
