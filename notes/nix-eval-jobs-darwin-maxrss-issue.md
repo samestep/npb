@@ -75,9 +75,14 @@ never grows past the initial size, because it never lives past one job).
 ## Fix
 
 Normalize `ru_maxrss` to KiB on Darwin and leave the rest of the comparison
-untouched (minimal diff; keeps upstream's `NOLINT`s, which are still needed on
+untouched (minimal diff; keeps upstream's `NOLINT`s — they only matter on
 glibc, where `struct rusage` fields live in unions and the struct is declared
-in an internal `bits/` header — on Darwin neither diagnostic fires):
+in an internal `bits/` header; on Darwin neither diagnostic can fire. Note the
+suppressed diagnostics are invisible to the `clang-tidy-fix` flake check
+either way: the project builds with meson `unity=on`, so the compile database
+contains only generated unity TUs, and clang-tidy without a `HeaderFilterRegex`
+reports main-file diagnostics only — nothing in `src/*.cc` is ever reported.
+The `NOLINT`s exist for per-file tidy runs, e.g. clangd in an editor):
 
 ```cpp
 auto shouldRestart(const MyArgs &args) -> bool {
