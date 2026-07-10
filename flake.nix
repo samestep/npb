@@ -45,7 +45,9 @@
           commonArgs
           // {
             inherit cargoArtifacts;
-            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+            # makeBinaryWrapper, not makeWrapper: the bash wrapper costs ~4 ms
+            # of PATH munging per invocation, the compiled one ~0.1 ms.
+            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeBinaryWrapper ];
             postInstall = ''
               wrapProgram $out/bin/npd --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
             '';
