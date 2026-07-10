@@ -703,25 +703,27 @@ pub struct ChangedAttr {
 }
 
 /// The changed set between two cached evals — one [`ChangedAttr`] for each attr
-/// whose drv *or* meta-blocked bit differs (meta isn't part of the drv hash, so
-/// (un)marking a package broken can change nothing but the bit — still a review
-/// event worth a row) — via a linear two-pointer merge over the two sorted
-/// files. Only the (few) changed rows are allocated.
+/// whose drv *or* meta-blocked bit differs — reading both eval files whole and
+/// handing the parsed rows to [`diff`].
 pub fn changed_set(
     base: &str,
     head: &str,
     system: &str,
     profile: &str,
 ) -> Result<Vec<ChangedAttr>> {
-    let bp = eval_path(base, system, profile)?;
-    let hp = eval_path(head, system, profile)?;
-    let bbuf = read_eval(&bp)?;
-    let hbuf = read_eval(&hp)?;
-    let b = parse_eval(&bbuf);
-    let h = parse_eval(&hbuf);
+    let bbuf = read_eval(&eval_path(base, system, profile)?)?;
+    let hbuf = read_eval(&eval_path(head, system, profile)?)?;
+    Ok(diff(&parse_eval(&bbuf), &parse_eval(&hbuf)))
+}
 
-    // One side only: absent on the other (an attr with no drv — an eval error —
-    // is treated as absent, exactly as before).
+/// The changed rows between two attr-sorted row lists: one [`ChangedAttr`] for
+/// each attr whose drv *or* meta-blocked bit differs (meta isn't part of the
+/// drv hash, so (un)marking a package broken can change nothing but the bit —
+/// still a review event worth a row), via a linear two-pointer merge. Only the
+/// (few) changed rows are allocated. An attr with no drv (an eval error) is
+/// treated as absent on that side. Pure — the file I/O lives in
+/// [`changed_set`] — so the merge's edge cases are unit-testable.
+fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
     let base_only = |r: &EvalRow| ChangedAttr {
         attr: r.0.to_string(),
         base_drv: restore_drv(r.1),
@@ -778,7 +780,25 @@ pub fn changed_set(
             out.push(head_only(k));
         }
     }
-    Ok(out)
+    out
+}
+
+/// Diff two `test_attr → (drv, broken)` maps (the `--tests` cache's shape, full
+/// drv paths) with exactly [`diff`]'s semantics, so test rows classify
+/// (regression / fixed / new / meta-only …) like any full-set attr.
+pub fn changed_tests(
+    base: &std::collections::HashMap<String, (String, bool)>,
+    head: &std::collections::HashMap<String, (String, bool)>,
+) -> Vec<ChangedAttr> {
+    fn rows(m: &std::collections::HashMap<String, (String, bool)>) -> Vec<EvalRow<'_>> {
+        let mut v: Vec<EvalRow<'_>> = m
+            .iter()
+            .map(|(attr, (drv, broken))| (attr.as_str(), Some(strip_drv(drv)), *broken))
+            .collect();
+        v.sort_unstable_by_key(|r| r.0);
+        v
+    }
+    diff(&rows(base), &rows(head))
 }
 
 /// Ensure every `(commit, system)` pair has a cached eval file, computing the
@@ -975,6 +995,95 @@ mod tests {
             ("hello", Some("/nix/store/a-hello.drv".into()), false)
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A [`ChangedAttr`] from stored-form drvs, for expected values.
+    fn ca(
+        attr: &str,
+        base: Option<&str>,
+        head: Option<&str>,
+        base_broken: bool,
+        head_broken: bool,
+    ) -> ChangedAttr {
+        ChangedAttr {
+            attr: attr.into(),
+            base_drv: restore_drv(base),
+            head_drv: restore_drv(head),
+            base_broken,
+            head_broken,
+        }
+    }
+
+    #[test]
+    fn diff_emits_only_changed_rows() {
+        // Both lists sorted by attr, as parse_eval guarantees.
+        let b = [
+            ("dropped", Some("d1"), false),
+            ("errored.base", None, false), // eval error on base only: no row
+            ("flip", Some("f1"), true),    // meta-only unmarking: row, same drv
+            ("gone.err", Some("g1"), false), // drv on base, eval error at head
+            ("rebuilt", Some("r1"), false),
+            ("same", Some("s1"), false),
+        ];
+        let h = [
+            ("added", Some("a1"), false),
+            ("errored.head", None, false), // eval error on head only: no row
+            ("flip", Some("f1"), false),
+            ("gone.err", None, false),
+            ("rebuilt", Some("r2"), false),
+            ("same", Some("s1"), false),
+        ];
+        let got = diff(&b, &h);
+        let want = vec![
+            ca("added", None, Some("a1"), false, false),
+            ca("dropped", Some("d1"), None, false, false),
+            ca("flip", Some("f1"), Some("f1"), true, false),
+            ca("gone.err", Some("g1"), None, false, false),
+            ca("rebuilt", Some("r1"), Some("r2"), false, false),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn diff_drains_tails() {
+        // One list ends first; the other's remainder must still be emitted
+        // (with its no-drv rows skipped).
+        let b = [("a", Some("a1"), false)];
+        let h = [
+            ("a", Some("a1"), false),
+            ("y", None, false),
+            ("z", Some("z1"), true),
+        ];
+        assert_eq!(diff(&b, &h), vec![ca("z", None, Some("z1"), false, true)]);
+        assert_eq!(diff(&h, &b), vec![ca("z", Some("z1"), None, true, false)]);
+        assert_eq!(diff(&[], &[]), vec![]);
+    }
+
+    #[test]
+    fn changed_tests_matches_diff_semantics() {
+        let m = |kv: &[(&str, &str, bool)]| {
+            kv.iter()
+                .map(|(a, d, b)| (a.to_string(), (format!("/nix/store/{d}.drv"), *b)))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let base = m(&[
+            ("pkg.tests.dropped", "d1", false),
+            ("pkg.tests.flip", "f1", true),
+            ("pkg.tests.same", "s1", false),
+        ]);
+        let head = m(&[
+            ("pkg.tests.added", "a1", false),
+            ("pkg.tests.flip", "f1", false),
+            ("pkg.tests.same", "s1", false),
+        ]);
+        // Sorted by attr, full drv paths restored, meta-only flip kept.
+        let got = changed_tests(&base, &head);
+        let want = vec![
+            ca("pkg.tests.added", None, Some("a1"), false, false),
+            ca("pkg.tests.dropped", Some("d1"), None, false, false),
+            ca("pkg.tests.flip", Some("f1"), Some("f1"), true, false),
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]

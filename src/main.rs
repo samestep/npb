@@ -240,27 +240,9 @@ fn run(cli: Cli) -> Result<()> {
                 eval::DEFAULT_PROFILE,
                 &head_names,
             )?;
-            let mut keys: Vec<String> = bmap.keys().chain(hmap.keys()).cloned().collect();
-            keys.sort();
-            keys.dedup();
-            for k in keys {
-                let bd = bmap.get(&k);
-                let hd = hmap.get(&k);
-                // Maps hold only resolved drvs, so a differing pair always has a
-                // drv on at least one side (a test dropped/added/rebuilt). The
-                // `(drv, broken)` pair is compared whole, so a meta-only (un)marking
-                // (same drv, flipped broken bit) is still a review event — exactly
-                // like `changed_set` for full-set attrs.
-                if bd != hd {
-                    changed.push(eval::ChangedAttr {
-                        attr: k,
-                        base_drv: bd.map(|(d, _)| d.clone()),
-                        head_drv: hd.map(|(d, _)| d.clone()),
-                        base_broken: bd.is_some_and(|(_, b)| *b),
-                        head_broken: hd.is_some_and(|(_, b)| *b),
-                    });
-                }
-            }
+            // The same diff the full set went through, so the test rows
+            // classify (regression / fixed / new / meta-only …) identically.
+            changed.extend(eval::changed_tests(&bmap, &hmap));
         }
     }
 
