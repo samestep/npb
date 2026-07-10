@@ -964,11 +964,8 @@ fn changed_set_files(bpath: &Path, hpath: &Path) -> Result<Vec<ChangedAttr>> {
 /// [`merge_rows`] over two in-memory row slices — the merge's pure spelling,
 /// used by [`changed_tests`] and the unit tests.
 fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
-    merge_rows(
-        SliceCursor { rows: b, i: 0 },
-        SliceCursor { rows: h, i: 0 },
-    )
-    .expect("slice cursors are infallible")
+    merge_rows(SliceCursor { rows: b, i: 0 }, SliceCursor { rows: h, i: 0 })
+        .expect("slice cursors are infallible")
 }
 
 /// Diff two `test_attr → (drv, broken)` maps (the `--tests` cache's shape, full
