@@ -88,14 +88,28 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
 
 // --- running the evaluator --------------------------------------------------
 
+/// Escape a string for embedding inside a Nix `"..."` literal: backslashes,
+/// double quotes, and the `${` interpolation opener. (Attr names and store
+/// paths virtually never contain these, but the repo path and revision are
+/// user input.)
+fn nix_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("${", "\\${")
+}
+
 /// Build the whole-package-set Nix expression `nix-eval-jobs` walks. The
-/// revision's source is fetched by `builtins.fetchGit`.
+/// revision's source is fetched by `builtins.fetchGit`. Interpolants are
+/// escaped exactly as in [`build_tests_expr`] — the repo path in particular is
+/// user input (`--nixpkgs`).
 fn build_expr(repo: &Path, commit: &str, system: &str, profile: &str) -> Result<String> {
     let cfg = profile_config(profile)?;
     Ok(format!(
-        "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{commit}\"; }}) \
-         {{ system = \"{system}\"; config = {cfg}; }}",
-        repo.display()
+        "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
+         {{ system = \"{}\"; config = {cfg}; }}",
+        nix_escape(&repo.display().to_string()),
+        nix_escape(commit),
+        nix_escape(system),
     ))
 }
 
@@ -248,15 +262,6 @@ fn stream_jobs<T>(
 // `nix-eval-jobs` in its per-attr worker — so a package that fails to evaluate
 // (even an uncatchable parse error `tryEval` can't trap) is isolated to its own
 // attr, exactly as in the full-set walk, rather than aborting the whole eval.
-
-/// Escape a string for embedding inside a Nix `"..."` literal: backslashes,
-/// double quotes, and the `${` interpolation opener. (Package attr names
-/// virtually never contain these, but a changed set is untrusted input.)
-fn nix_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace("${", "\\${")
-}
 
 /// Nix expression exposing the `passthru.tests` of `attrs` at one revision as a
 /// `nix-eval-jobs` job tree. Each requested `<pkg>` becomes a recursable node

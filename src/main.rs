@@ -78,14 +78,18 @@ fn host_system() -> String {
 }
 
 /// The nixpkgs clone to operate on: `--nixpkgs` if given, else the current
-/// directory (assumed to be the root of a nixpkgs checkout). Resolved to an
-/// absolute path so `git -C` and `builtins.fetchGit` both accept it.
+/// directory (assumed to be the root of a nixpkgs checkout). Canonicalized,
+/// because a relative `--nixpkgs` that `git -C` accepts would be embedded
+/// verbatim in the eval expression, where `builtins.fetchGit` needs an
+/// absolute path.
 fn resolve_repo(nixpkgs: Option<PathBuf>) -> Result<PathBuf> {
-    match nixpkgs {
-        Some(p) => Ok(p),
+    let p = match nixpkgs {
+        Some(p) => p,
         None => std::env::current_dir()
-            .context("could not determine the current directory; pass --nixpkgs <path>"),
-    }
+            .context("could not determine the current directory; pass --nixpkgs <path>")?,
+    };
+    p.canonicalize()
+        .with_context(|| format!("resolving nixpkgs path {}", p.display()))
 }
 
 fn resolve_systems(system: Vec<String>) -> Vec<String> {
