@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, HashMap};
 use crate::model::{Observation, Outcome, Source};
 
 /// One side's build state, reduced from a drv's observations (or its absence).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// `Ord` (declaration order) only tie-breaks section order among pairs sharing
+/// a [`cell`] priority, so the report is deterministic.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum State {
     /// Output valid — built locally, or substitutable from the cache.
     Built,
@@ -234,7 +236,9 @@ pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Entry>)]) -> St
             buckets.entry((e.base, e.head)).or_default().push(e);
         }
         let mut keys: Vec<(State, State)> = buckets.keys().copied().collect();
-        keys.sort_by_key(|(b, h)| cell(*b, *h).0);
+        // The state pair tie-breaks equal priorities (several pairs share the
+        // generic last cell), keeping the output deterministic.
+        keys.sort_by_key(|&(b, h)| (cell(b, h).0, b, h));
         for (b, h) in keys {
             out.push_str(&render_section(b, h, &buckets[&(b, h)]));
         }
