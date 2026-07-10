@@ -800,39 +800,41 @@ pub fn eval_pairs(
         plan.concurrency,
         plan.workers,
     ));
-    let computed: Vec<(usize, Vec<AttrEval>)> =
-        thread::scope(|s| -> Result<Vec<(usize, Vec<AttrEval>)>> {
-            let mut handles = Vec::new();
-            for &i in &todo {
-                let (commit, system) = (&pairs[i].0, &pairs[i].1);
-                let pb = mp.add(ProgressBar::new_spinner());
-                let sem = &sem;
-                handles.push(s.spawn(move || -> Result<(usize, Vec<AttrEval>)> {
-                    sem.acquire();
-                    let r = run_eval_pb(
-                        repo,
-                        commit,
-                        system,
-                        profile,
-                        plan.workers,
-                        plan.per_worker_mb,
-                        &pb,
-                    );
-                    sem.release();
-                    Ok((i, r?))
-                }));
+    thread::scope(|s| -> Result<()> {
+        let mut handles = Vec::new();
+        for &i in &todo {
+            let (commit, system) = (&pairs[i].0, &pairs[i].1);
+            let pb = mp.add(ProgressBar::new_spinner());
+            let sem = &sem;
+            handles.push(s.spawn(move || -> Result<()> {
+                sem.acquire();
+                let r = run_eval_pb(
+                    repo,
+                    commit,
+                    system,
+                    profile,
+                    plan.workers,
+                    plan.per_worker_mb,
+                    &pb,
+                );
+                sem.release();
+                // Persist as soon as this eval completes (the write is atomic):
+                // a full-set eval costs minutes, and a *sibling* eval failing —
+                // e.g. one OOM among four — must not discard finished work.
+                write_eval(&eval_path(commit, system, profile)?, &r?)
+            }));
+        }
+        // Join everything before propagating the first error, so no result is
+        // dropped mid-write and every progress bar reaches a final state.
+        let mut result = Ok(());
+        for h in handles {
+            let r = h.join().expect("eval thread panicked");
+            if result.is_ok() {
+                result = r;
             }
-            let mut out = Vec::new();
-            for h in handles {
-                out.push(h.join().expect("eval thread panicked")?);
-            }
-            Ok(out)
-        })?;
-    for (i, attrs) in &computed {
-        let (commit, system) = &pairs[*i];
-        write_eval(&eval_path(commit, system, profile)?, attrs)?;
-    }
-    Ok(())
+        }
+        result
+    })
 }
 
 /// Ensure both commits are evaluated across all systems (they run concurrently).
