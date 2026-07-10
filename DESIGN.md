@@ -344,8 +344,11 @@ and each job pays a fork + full nixpkgs re-import (~0.6 s each; also why "huge"
 MB values didn't help — 999999 MB still reads as ~1 GB). It was never a GC or
 eval-engine problem: with the cap compensated ×1024, the same darwin VM
 evaluates *faster* than the Linux VM (7671 vs 5134 attrs/30 s, one worker).
-npd works around it by passing `--max-memory-size` ×1024 on macOS (see
-`stream_jobs` in `src/eval.rs`); drop that when the upstream fix lands.
+Reported as [nix-eval-jobs#425](https://github.com/NixOS/nix-eval-jobs/issues/425)
+and fixed by [nix-eval-jobs#426](https://github.com/NixOS/nix-eval-jobs/pull/426)
+(merged 2026-07-10). npd works around it by passing `--max-memory-size` ×1024 on
+macOS (see `stream_jobs` in `src/eval.rs`); drop that once the fix reaches the
+`nix-eval-jobs` npd runs.
 
 ## 10. Open questions
 
