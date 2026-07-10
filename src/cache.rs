@@ -56,14 +56,15 @@ fn output_in_cache(out_path: &str) -> bool {
         .is_ok()
 }
 
-/// Is any of `drv`'s outputs in the binary cache — i.e. substitutable without a
-/// local build? Used by the build driver to avoid "building" (really fetching)
-/// a cached path and mislabelling it as a local build. A drv whose outputs
-/// can't even be queried probes as not-substitutable — the safe direction: the
-/// driver just builds it.
+/// Are ALL of `drv`'s outputs in the binary cache — i.e. is `nix build drv^*`
+/// fully substitutable without a local build? All, not any: the recorded
+/// `Cache`/`Built` fact stands for the whole drv, and one missing output of a
+/// multi-output drv (a partial upload, an evicting substituter) would still
+/// force a local build. A drv whose outputs can't even be queried probes as
+/// not-substitutable — the safe direction: the driver just builds it.
 fn in_cache(drv: &str) -> bool {
     drv_outputs(drv)
-        .map(|outs| outs.iter().any(|o| output_in_cache(o)))
+        .map(|outs| !outs.is_empty() && outs.iter().all(|o| output_in_cache(o)))
         .unwrap_or(false)
 }
 

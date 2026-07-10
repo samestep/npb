@@ -102,6 +102,12 @@ impl Store {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // WAL: readers don't block the writer; better for a durable local store.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
+        // Two *writers* still conflict (even in WAL), and SQLite's default busy
+        // handler fails immediately — a second npd (or the report path's Cache
+        // writes) would abort a batch mid-run with SQLITE_BUSY. Waiting out the
+        // other writer's millisecond-scale autocommit is always right here.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
         conn.execute_batch(SCHEMA).context("initializing schema")?;
         Ok(Self { conn })
     }

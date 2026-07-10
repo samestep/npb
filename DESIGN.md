@@ -277,8 +277,10 @@ keyed/incremental (§4).
 ## 7. Cache facts — the one remote signal
 
 The only remote fact `npd` gathers is **narinfo presence** on `cache.nixos.org`:
-`HEAD /<out-hash>.narinfo` → does an already-built output for *this exact drv*
-exist to substitute? It is drv-precise and drift-free, but **success-only** (a
+`HEAD /<out-hash>.narinfo` for **every output** of the drv → is this exact drv
+fully substitutable? (All outputs, because the recorded fact stands for the
+whole drv; substitution is per-output, so one missing output would still force
+a local build.) It is drv-precise and drift-free, but **success-only** (a
 404 conflates never-built / failed / GC-evicted — it can never assert a
 failure). A hit is recorded as a `Cache`/`Built` observation so a later run
 skips the probe; a miss records nothing (re-probing is cheap, and cache state
