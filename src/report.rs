@@ -82,7 +82,9 @@ pub struct Entry {
 }
 
 /// The section a `(base, head)` pair belongs to: an emission-priority index
-/// (lower = worse / more actionable, emitted first), a count noun, and a phrase.
+/// (lower = worse / more actionable, emitted first), a count noun, and a
+/// phrase. Exhaustive over all 36 pairs — no catch-all — so adding a [`State`]
+/// forces every new pair to be placed deliberately.
 fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
     use State::{Absent, Blocked, Broken, Built, Failed, Unknown};
     // Nouns are singular count-nouns (pluralized with a trailing "s" by the
@@ -166,8 +168,26 @@ fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
         (Absent, Built) => (25, "new package", "new here, build"),
         (Unknown, Built) => (26, "built package", "build here; base status unknown"),
         (Built, Built) => (27, "unchanged package", "build on the base and here"),
-        // Any leftover (e.g. Unknown↔Unknown under --no-build) — last, generic.
-        _ => (28, "package", "see the before → after glyphs"),
+        // A head-side Unknown is only reachable with --no-build (§8): the drv
+        // exists but nothing has been built or probed yet.
+        (Built, Unknown) => (28, "unbuilt package", "build on the base; no fact here yet"),
+        (Failed, Unknown) => (29, "unbuilt package", "fail on the base; no fact here yet"),
+        (Blocked, Unknown) => (
+            30,
+            "unbuilt package",
+            "blocked on the base; no fact here yet",
+        ),
+        (Broken, Unknown) => (
+            31,
+            "unbuilt package",
+            "marked broken on the base; no fact here yet",
+        ),
+        (Absent, Unknown) => (32, "new unbuilt package", "added here; no fact yet"),
+        (Unknown, Unknown) => (33, "unbuilt package", "no facts on either side yet"),
+        (Unknown, Absent) => (34, "removed package", "gone here; base status unknown"),
+        // Not producible by the diff (a changed row has a drv on at least one
+        // side), but the renderer shouldn't panic if it ever appears.
+        (Absent, Absent) => (35, "package", "absent on both sides"),
     }
 }
 
@@ -306,6 +326,23 @@ mod tests {
             State::Failed
         );
         assert_eq!(side_state(&None, true, &[]), State::Absent);
+    }
+
+    #[test]
+    fn cell_priorities_are_distinct() {
+        // Every (base, head) pair has its own section slot; a duplicate
+        // priority would silently merge two sections' ordering.
+        use State::{Absent, Blocked, Broken, Built, Failed, Unknown};
+        const ALL: [State; 6] = [Built, Failed, Blocked, Broken, Absent, Unknown];
+        let mut seen = std::collections::HashSet::new();
+        for b in ALL {
+            for h in ALL {
+                let (priority, noun, phrase) = cell(b, h);
+                assert!(seen.insert(priority), "duplicate priority {priority}");
+                assert!(!noun.is_empty() && !phrase.is_empty());
+            }
+        }
+        assert_eq!(seen.len(), 36);
     }
 
     fn entry(attr: &str, base: State, head: State, bd: Option<&str>, hd: Option<&str>) -> Entry {
