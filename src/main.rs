@@ -11,7 +11,8 @@ mod model;
 mod report;
 mod store;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::process::Command as Proc;
 
@@ -175,6 +176,44 @@ fn cached_test_drvs(
     store.tests_drvs_for(commit, system, profile, pkgs)
 }
 
+/// Flatten the per-system changed sets into build targets: every side's drv,
+/// deduped per `(system, drv)`.
+///
+/// Several `(attr, side)` rows can share one drv with *different* meta-blocked
+/// bits — aliases where only some variants are marked (on darwin `ollama-cuda`
+/// shares `ollama`'s drv but is marked unsupported), or a meta-only unmarking
+/// (a PR deleting `meta.broken` leaves the drv identical on both sides with
+/// the bit flipped). The marking is a property of the *attr*, not the recipe,
+/// so the deduped target is broken only if EVERY row wanting this drv is
+/// marked: any unmarked row is a legitimate request to build it.
+fn assemble_targets(per_system_changed: &[(String, Vec<eval::ChangedAttr>)]) -> Vec<build::Target> {
+    let mut targets: Vec<build::Target> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for (sys, changed) in per_system_changed {
+        for c in changed {
+            let sides = [(&c.base_drv, c.base_broken), (&c.head_drv, c.head_broken)];
+            for (drv, broken) in sides {
+                let Some(drv) = drv else { continue };
+                match index.entry((sys.clone(), drv.clone())) {
+                    Entry::Occupied(e) => {
+                        let t = &mut targets[*e.get()];
+                        t.broken = t.broken && broken;
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(targets.len());
+                        targets.push(build::Target {
+                            system: sys.clone(),
+                            drv_path: drv.clone(),
+                            broken,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    targets
+}
+
 fn run(cli: Cli) -> Result<()> {
     // --max is simply "everything on".
     let tests = cli.tests || cli.max;
@@ -250,23 +289,7 @@ fn run(cli: Cli) -> Result<()> {
     // substitutable, or marked broken) so the report has a real state for every
     // row, not a `❓`.
     if !cli.no_build {
-        let mut targets = Vec::new();
-        let mut seen = HashSet::new();
-        for (sys, changed) in &per_system_changed {
-            for c in changed {
-                let sides = [(&c.base_drv, c.base_broken), (&c.head_drv, c.head_broken)];
-                for (drv, broken) in sides {
-                    let Some(drv) = drv else { continue };
-                    if seen.insert((drv.clone(), sys.clone())) {
-                        targets.push(build::Target {
-                            system: sys.clone(),
-                            drv_path: drv.clone(),
-                            broken,
-                        });
-                    }
-                }
-            }
-        }
+        let targets = assemble_targets(&per_system_changed);
         if !targets.is_empty() {
             build::build_targets(&targets, policy)?;
         }
@@ -302,4 +325,69 @@ fn run(cli: Cli) -> Result<()> {
 
 fn main() -> Result<()> {
     run(Cli::parse())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ca(
+        attr: &str,
+        base_drv: Option<&str>,
+        head_drv: Option<&str>,
+        base_broken: bool,
+        head_broken: bool,
+    ) -> eval::ChangedAttr {
+        eval::ChangedAttr {
+            attr: attr.into(),
+            base_drv: base_drv.map(str::to_string),
+            head_drv: head_drv.map(str::to_string),
+            base_broken,
+            head_broken,
+        }
+    }
+
+    #[test]
+    fn assemble_targets_dedups_and_ands_broken() {
+        let changed = vec![
+            // A meta-only unmarking: same drv both sides, bit flips — the
+            // unmarked head side must win (build it).
+            ca("unmarked", Some("/d/flip"), Some("/d/flip"), true, false),
+            // Aliases sharing one head drv where only some variants are marked
+            // (the darwin ollama shape): one unmarked alias ⇒ build.
+            ca("tool", Some("/d/t0"), Some("/d/shared"), false, false),
+            ca("tool-cuda", Some("/d/t1"), Some("/d/shared"), false, true),
+            // Every alias marked ⇒ stays skipped.
+            ca("allbroken-a", None, Some("/d/ab"), false, true),
+            ca("allbroken-b", None, Some("/d/ab"), false, true),
+        ];
+        let targets = assemble_targets(&[("sys".into(), changed)]);
+
+        let broken_of = |drv: &str| {
+            targets
+                .iter()
+                .find(|t| t.drv_path == drv)
+                .unwrap_or_else(|| panic!("no target for {drv}"))
+                .broken
+        };
+        // Deduped: flip once, shared once, ab once, plus the two base drvs.
+        assert_eq!(targets.len(), 5);
+        assert!(!broken_of("/d/flip"));
+        assert!(!broken_of("/d/shared"));
+        assert!(broken_of("/d/ab"));
+        assert!(!broken_of("/d/t0"));
+        assert!(!broken_of("/d/t1"));
+    }
+
+    #[test]
+    fn assemble_targets_keeps_systems_apart() {
+        // The same drv on two systems is two targets, each with its own bit.
+        let a = vec![ca("x", None, Some("/d/x"), false, true)];
+        let b = vec![ca("x", None, Some("/d/x"), false, false)];
+        let targets = assemble_targets(&[("sysA".into(), a), ("sysB".into(), b)]);
+        assert_eq!(targets.len(), 2);
+        let of = |sys: &str| targets.iter().find(|t| t.system == sys).unwrap();
+        assert!(of("sysA").broken);
+        assert!(!of("sysB").broken);
+    }
 }
