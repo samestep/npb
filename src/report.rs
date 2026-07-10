@@ -194,8 +194,10 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
         String::new()
     };
 
+    // Sections carry their own separator *before* them (a leading blank line),
+    // so the gaps fall between sections and none trails the last one.
     let mut s = format!(
-        "<details><summary>{} → {} · <b>{groups} {noun}{plural}</b>{note} — {phrase}</summary>\n\n",
+        "\n<details><summary>{} → {} · <b>{groups} {noun}{plural}</b>{note} — {phrase}</summary>\n\n",
         base.glyph(),
         head.glyph(),
     );
@@ -215,7 +217,7 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     for line in lines {
         s.push_str(&format!("- {line}\n"));
     }
-    s.push_str("</details>\n\n");
+    s.push_str("</details>\n");
     s
 }
 
@@ -225,9 +227,9 @@ pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Entry>)]) -> St
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
     let mut out = format!("## `npd` report: {base} → {head}\n");
     for (system, entries) in per_system {
-        out.push_str(&format!("\n### `{system}`\n\n"));
+        out.push_str(&format!("\n### `{system}`\n"));
         if entries.is_empty() {
-            out.push_str("_No changed attrs._\n");
+            out.push_str("\n_No changed attrs._\n");
             continue;
         }
         // Bucket by (base, head) state, then emit buckets in priority order.
