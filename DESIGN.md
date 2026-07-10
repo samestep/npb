@@ -189,6 +189,19 @@ including the failures nix itself forgets — and a re-run only re-pays for the
 in-flight and never-started builds. Drvs with no build activity (blocked by a
 failed dep, or valid without a build) are attributed in a post-batch sweep.
 
+**Soundness caveats (known, accepted).** `Built` facts come from output
+validity — ground truth. `Failed`/`DepFailed` facts from the post-batch sweep
+are *inferences* premised on nix having finished the batch under
+`--keep-going`, so the sweep skips them when nix died by a signal (exit code
+absent — OOM kill, daemon restart). Residual gap: a batch that *aborts* with a
+normal error exit (e.g. the daemon connection drops mid-run) is
+indistinguishable by exit status from one that completed with failures, and
+can then mis-attribute never-started drvs as `DepFailed`; `--retry` re-attempts
+any recorded failure, so the damage is bounded and user-repairable. Also in
+this class: a `Cache` fact records substitutability *at probe time* — the
+remote cache deleting a path later doesn't invalidate the fact (by design,
+§3), it just means nix substitutes from source instead.
+
 ## 6. Evaluation, its cache key, and the diff
 
 **The cache key is `(commit, system, config)`, and it is not a can of worms —

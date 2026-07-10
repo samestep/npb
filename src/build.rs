@@ -78,14 +78,16 @@ const ACT_BUILD: i64 = 105;
 /// the `actBuild` Activity — nix 2.34 `derivation-building-goal.cc`), so the
 /// callback can attribute the outcome from output validity right away.
 ///
-/// Returns every drv nix attempted (build started), dependencies included.
-/// (Nix keeps the build log itself under `/nix/var/log/nix/drvs`; `nix log
-/// <drv>` retrieves it, so npd doesn't duplicate it.)
+/// Returns every drv nix attempted (build started), dependencies included,
+/// plus nix's own exit status — the caller gates its no-activity *inferences*
+/// on it (see the pass-3 comment in [`build_targets_at`]). (Nix keeps the
+/// build log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves
+/// it, so npd doesn't duplicate it.)
 fn batch_build(
     drvs: &[&str],
     force: bool,
     mut on_finish: impl FnMut(&str, f64) -> Result<()>,
-) -> Result<HashSet<String>> {
+) -> Result<(HashSet<String>, std::process::ExitStatus)> {
     let requested: HashSet<&str> = drvs.iter().copied().collect();
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
@@ -116,38 +118,50 @@ fn batch_build(
     let mut attempted = HashSet::new();
     let mut starts: HashMap<u64, (String, Instant)> = HashMap::new();
 
-    for line in log.lines() {
-        let line = line.context("reading nix build log")?;
-        // Forward the raw internal-json line to nom, which renders the tree.
-        let _ = writeln!(nom_in, "{line}");
-        let Some(rest) = line.strip_prefix("@nix ") else {
-            continue;
-        };
-        let Ok(ev) = serde_json::from_str::<NixEvent>(rest) else {
-            continue;
-        };
-        match ev.action.as_str() {
-            "start" if ev.typ == Some(ACT_BUILD) => {
-                if let (Some(id), Some(drv)) = (ev.id, ev.fields.first().and_then(|v| v.as_str())) {
-                    attempted.insert(drv.to_string());
-                    starts.insert(id, (drv.to_string(), Instant::now()));
+    let streamed = (|| -> Result<()> {
+        for line in log.lines() {
+            let line = line.context("reading nix build log")?;
+            // Forward the raw internal-json line to nom, which renders the tree.
+            let _ = writeln!(nom_in, "{line}");
+            let Some(rest) = line.strip_prefix("@nix ") else {
+                continue;
+            };
+            let Ok(ev) = serde_json::from_str::<NixEvent>(rest) else {
+                continue;
+            };
+            match ev.action.as_str() {
+                "start" if ev.typ == Some(ACT_BUILD) => {
+                    if let (Some(id), Some(drv)) =
+                        (ev.id, ev.fields.first().and_then(|v| v.as_str()))
+                    {
+                        attempted.insert(drv.to_string());
+                        starts.insert(id, (drv.to_string(), Instant::now()));
+                    }
                 }
-            }
-            "stop" => {
-                if let Some(id) = ev.id
-                    && let Some((drv, t0)) = starts.remove(&id)
-                    && requested.contains(drv.as_str())
-                {
-                    on_finish(&drv, t0.elapsed().as_secs_f64())?;
+                "stop" => {
+                    if let Some(id) = ev.id
+                        && let Some((drv, t0)) = starts.remove(&id)
+                        && requested.contains(drv.as_str())
+                    {
+                        on_finish(&drv, t0.elapsed().as_secs_f64())?;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
+        Ok(())
+    })();
     drop(nom_in); // EOF -> nom finishes rendering and exits
-    let _ = nix.wait();
+    if streamed.is_err() {
+        // An on_finish (store) error abandons the stream mid-batch; a Child is
+        // not killed on drop, so without this nix keeps building into a closed
+        // pipe until its next stderr write EPIPEs it — potentially minutes.
+        let _ = nix.kill();
+    }
+    let status = nix.wait().context("waiting for nix build")?;
     let _ = nom.wait();
-    Ok(attempted)
+    streamed?;
+    Ok((attempted, status))
 }
 
 /// Which of `paths` are NOT valid in the local store (i.e. weren't built).
@@ -290,7 +304,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .map(|&i| (targets[i].drv_path.as_str(), targets[i].system.as_str()))
             .collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
-        let attempted = batch_build(&drvs, force, |drv, secs| {
+        let (attempted, status) = batch_build(&drvs, force, |drv, secs| {
             let outcome = if drv_built(drv)? {
                 Outcome::Built
             } else {
@@ -314,6 +328,17 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         // outputs already (substituted, or a prior interrupted run built it) or
         // was blocked by a failed dependency. No per-target result lines: nom's
         // tree already showed each build's fate, and the report has the rest.
+        //
+        // Output validity is ground truth, so `Built` is always safe to record.
+        // The Failed/DepFailed branches are *inferences* whose premise is that
+        // nix finished the batch under --keep-going; if nix was killed by a
+        // signal (`code()` is None: OOM kill, daemon-restart kill) the batch
+        // never finished scheduling and "no build activity" implies nothing —
+        // recording it would plant false failure facts the policy then trusts
+        // forever. (A batch that *aborts* with a normal error exit — e.g. the
+        // daemon connection dropping — is indistinguishable by status from one
+        // that completed with failures and can still mis-attribute; DESIGN §5.)
+        let finished = status.code().is_some();
         let leftover: Vec<&str> = drvs
             .iter()
             .copied()
@@ -324,7 +349,11 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         let built_map = build_outcomes(&leftover)?;
         let now = unix_now();
         for &drv in &leftover {
-            let outcome = if built_map.get(drv).copied().unwrap_or(false) {
+            let built = built_map.get(drv).copied().unwrap_or(false);
+            if !built && !finished {
+                continue;
+            }
+            let outcome = if built {
                 Outcome::Built
             } else if attempted.contains(drv) {
                 Outcome::Failed
