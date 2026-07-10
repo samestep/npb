@@ -32,6 +32,14 @@ pub struct Target {
     pub broken: bool,
 }
 
+/// Seconds since the Unix epoch, for an observation's `when` stamp.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before the Unix epoch")
+        .as_secs() as i64
+}
+
 fn hostname() -> String {
     Command::new("hostname")
         .output()
@@ -259,7 +267,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
 
     // Pass 1: decide per target. Skips are silent — a fully-cached run must print
     // nothing.
-    let now = chrono::Utc::now().timestamp();
+    let now = unix_now();
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
@@ -312,7 +320,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 drv_path: drv.to_string(),
                 source: Source::Local,
                 outcome,
-                when: chrono::Utc::now().timestamp(),
+                when: unix_now(),
                 system: system_of.get(drv).copied().map(str::to_string),
                 duration_s: Some(secs),
                 machine: Some(host.clone()),
@@ -334,7 +342,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .into_iter()
             .collect();
         let built_map = build_outcomes(&leftover)?;
-        let now = chrono::Utc::now().timestamp();
+        let now = unix_now();
         for &drv in &leftover {
             let outcome = if built_map.get(drv).copied().unwrap_or(false) {
                 Outcome::Built
