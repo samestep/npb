@@ -93,6 +93,10 @@ fn batch_build(
     let mut nix = Command::new("nix");
     nix.arg("build").args(&installables).args([
         "--keep-going",
+        // No ./result* out-links: they'd litter the cwd (the user's nixpkgs
+        // checkout) and pin every built output as a GC root — npd keeps no
+        // gcroots by design (DESIGN §4); the *observation* is the durable fact.
+        "--no-link",
         "--log-format",
         "internal-json",
         "-v",
