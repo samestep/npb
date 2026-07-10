@@ -592,9 +592,10 @@ pub fn db_path() -> Result<PathBuf> {
 // ignored and regenerated, never mis-parsed as if they were stripped.
 //
 // The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller at the
-// default level; higher levels and a two-file split bought little). We diff by
-// reading a file whole and decompressing it, so a single stream is the right
-// shape.
+// default level; higher levels and a two-file split bought little). The diff
+// consumes each file as a single stream: decompressed on its own thread, merged
+// line-by-line, so no whole-file buffer is ever materialized (see
+// `changed_set`).
 
 fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
     Ok(cache_root()?.join("evals").join(format!(
@@ -642,7 +643,10 @@ fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     Ok(())
 }
 
-/// Read and decompress an eval file into its TSV text.
+/// Read and decompress an eval file into its TSV text — [`write_eval`]'s
+/// mirror for the format-round-trip tests; the production diff streams the
+/// file instead (see [`changed_set`]).
+#[cfg(test)]
 fn read_eval(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let tsv = zstd::decode_all(&bytes[..])
@@ -670,25 +674,29 @@ fn restore_drv(field: Option<&str>) -> Option<String> {
     field.map(|s| format!("/nix/store/{s}.drv"))
 }
 
-/// One parsed eval row, borrowing from the file buffer: attr, stored-form drv,
-/// and the meta-blocked bit.
+/// One parsed eval row, borrowing from its line: attr, stored-form drv, and the
+/// meta-blocked bit.
 type EvalRow<'a> = (&'a str, Option<&'a str>, bool);
 
-/// Parse an eval file's bytes into [`EvalRow`]s, borrowing from `buf` (no
-/// per-attr allocation). The drv is left in its stored form (see [`strip_drv`]);
-/// since that encoding is injective, the merge can compare stored fields
-/// directly and only [`restore_drv`] the few rows it emits. Assumes the file is
-/// already sorted by attr.
+/// Parse one eval-file line into an [`EvalRow`] (no allocation). The drv is
+/// left in its stored form (see [`strip_drv`]); since that encoding is
+/// injective, the merge can compare stored fields directly and only
+/// [`restore_drv`] the few rows it emits.
+fn parse_line(l: &str) -> EvalRow<'_> {
+    let mut fields = l.splitn(3, '\t');
+    let attr = fields.next().unwrap_or(l);
+    let drv = fields.next().unwrap_or("");
+    let broken = fields.next() == Some("b");
+    (attr, if drv.is_empty() { None } else { Some(drv) }, broken)
+}
+
+/// Parse a whole eval file's text into [`EvalRow`]s, borrowing from `buf`.
+/// The production diff never materializes this (it streams lines — see
+/// [`changed_set`]); this is [`read_eval`]'s counterpart for the tests that
+/// check the on-disk format round-trips.
+#[cfg(test)]
 fn parse_eval(buf: &str) -> Vec<EvalRow<'_>> {
-    buf.lines()
-        .map(|l| {
-            let mut fields = l.splitn(3, '\t');
-            let attr = fields.next().unwrap_or(l);
-            let drv = fields.next().unwrap_or("");
-            let broken = fields.next() == Some("b");
-            (attr, if drv.is_empty() { None } else { Some(drv) }, broken)
-        })
-        .collect()
+    buf.lines().map(parse_line).collect()
 }
 
 /// One changed attr between two evals: its drv and meta-blocked bit on each side
@@ -702,102 +710,265 @@ pub struct ChangedAttr {
     pub head_broken: bool,
 }
 
-/// The changed set between two cached evals — one [`ChangedAttr`] for each attr
-/// whose drv *or* meta-blocked bit differs — reading both eval files whole and
-/// handing the parsed rows to [`diff`]. The two sides are independent until the
-/// diff, so each stage (read+decompress, then parse) runs them on parallel
-/// threads — that's most of a warm run's in-process time, and this halves it.
-/// Two stages rather than one because [`parse_eval`] borrows from the
-/// decompressed buffer, which must outlive its thread.
+// The diff pipeline: each file is decompressed on its own thread (the two
+// sides overlap) and handed to the consuming merge in bounded chunks, which
+// walks both line streams in lockstep. Compared to materializing each ~11 MB
+// TSV and a ~114k-row Vec per side, streaming both halves the warm-run wall
+// time (decompression pipelines with parsing+merging instead of preceding it,
+// and none of the big buffers are ever allocated or page-faulted in) and cuts
+// peak memory ~3× — measured over two ~113k-attr evals.
+
+/// Decompressed bytes of one eval file, produced on a decoder thread and
+/// consumed as a `Read`. A producer-side error (open/read/decompress) arrives
+/// in-band as the next `read` result; producer EOF is a closed channel.
+struct ChunkReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    cur: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.cur.len() {
+            match self.rx.recv() {
+                Ok(Ok(c)) => {
+                    self.cur = c;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(0), // producer finished: EOF
+            }
+        }
+        let n = (self.cur.len() - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Chunk granularity of a decoder thread, and its consumer's buffer size.
+const DECODE_CHUNK: usize = 256 * 1024;
+
+/// Spawn a thread in `scope` that streams `path` through a zstd decoder,
+/// sending [`DECODE_CHUNK`]-sized chunks down a bounded channel (so a fast
+/// producer stays ~1 MB ahead, never the whole file). Returns the consuming
+/// end. The thread exits when the file is drained, on error, or when the
+/// consumer hangs up mid-file (e.g. the merge failed on the other side).
+fn spawn_eval_decoder<'scope>(
+    path: PathBuf,
+    scope: &'scope thread::Scope<'scope, '_>,
+) -> BufReader<ChunkReader> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(4);
+    scope.spawn(move || {
+        let mut dec = match fs::File::open(&path).and_then(zstd::stream::read::Decoder::new) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        loop {
+            // Fill each chunk completely (a zstd decoder returns short reads)
+            // so the channel traffics in as few sends as possible.
+            let mut chunk = vec![0u8; DECODE_CHUNK];
+            let mut filled = 0;
+            while filled < chunk.len() {
+                match dec.read(&mut chunk[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+            chunk.truncate(filled);
+            if chunk.is_empty() || tx.send(Ok(chunk)).is_err() {
+                return;
+            }
+        }
+    });
+    BufReader::with_capacity(
+        DECODE_CHUNK,
+        ChunkReader {
+            rx,
+            cur: Vec::new(),
+            pos: 0,
+        },
+    )
+}
+
+/// One side of the changed-set merge: the current attr-sorted [`EvalRow`]
+/// (borrowing from the cursor's own buffer) plus fallible advancement. The
+/// merge is written once over this; implementations are the streaming line
+/// reader ([`LineCursor`]) and in-memory parsed rows ([`SliceCursor`]).
+trait RowCursor {
+    /// The current row, or `None` once exhausted.
+    fn row(&self) -> Option<EvalRow<'_>>;
+    fn advance(&mut self) -> Result<()>;
+}
+
+/// [`RowCursor`] over a streamed eval file, one reused line buffer per side.
+struct LineCursor<R: BufRead> {
+    src: R,
+    /// Names the file in read errors (which surface here, not at open — the
+    /// decoder thread reports in-band through the stream).
+    path: PathBuf,
+    cur: String,
+    done: bool,
+}
+
+impl<R: BufRead> LineCursor<R> {
+    fn new(src: R, path: PathBuf) -> Result<Self> {
+        let mut c = LineCursor {
+            src,
+            path,
+            cur: String::new(),
+            done: false,
+        };
+        c.advance()?;
+        Ok(c)
+    }
+}
+
+impl<R: BufRead> RowCursor for LineCursor<R> {
+    fn row(&self) -> Option<EvalRow<'_>> {
+        (!self.done).then(|| parse_line(&self.cur))
+    }
+    fn advance(&mut self) -> Result<()> {
+        self.cur.clear();
+        let n = self
+            .src
+            .read_line(&mut self.cur)
+            .with_context(|| format!("streaming {}", self.path.display()))?;
+        if n == 0 {
+            self.done = true;
+        } else if self.cur.ends_with('\n') {
+            self.cur.pop();
+        }
+        Ok(())
+    }
+}
+
+/// [`RowCursor`] over already-parsed rows ([`changed_tests`] and the unit
+/// tests); infallible.
+struct SliceCursor<'a> {
+    rows: &'a [EvalRow<'a>],
+    i: usize,
+}
+
+impl RowCursor for SliceCursor<'_> {
+    fn row(&self) -> Option<EvalRow<'_>> {
+        self.rows.get(self.i).copied()
+    }
+    fn advance(&mut self) -> Result<()> {
+        self.i += 1;
+        Ok(())
+    }
+}
+
+/// A [`ChangedAttr`] for a row present only on the base side (skipped if it
+/// has no drv — an eval error is treated as absent).
+fn base_only(r: &EvalRow) -> Option<ChangedAttr> {
+    r.1.is_some().then(|| ChangedAttr {
+        attr: r.0.to_string(),
+        base_drv: restore_drv(r.1),
+        head_drv: None,
+        base_broken: r.2,
+        head_broken: false,
+    })
+}
+
+/// [`base_only`]'s mirror for a row present only on the head side.
+fn head_only(r: &EvalRow) -> Option<ChangedAttr> {
+    r.1.is_some().then(|| ChangedAttr {
+        attr: r.0.to_string(),
+        base_drv: None,
+        head_drv: restore_drv(r.1),
+        base_broken: false,
+        head_broken: r.2,
+    })
+}
+
+/// The changed rows between two attr-sorted sides: one [`ChangedAttr`] for
+/// each attr whose drv *or* meta-blocked bit differs (meta isn't part of the
+/// drv hash, so (un)marking a package broken can change nothing but the bit —
+/// still a review event worth a row), via a linear two-pointer merge. Only the
+/// (few) changed rows are allocated.
+fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<ChangedAttr>> {
+    let mut out = Vec::new();
+    loop {
+        // Decide what to emit and which side(s) to advance while the rows
+        // borrow the cursors, then act once the borrows are released.
+        let (emit, adv_b, adv_h) = match (b.row(), h.row()) {
+            (None, None) => break,
+            (Some(br), None) => (base_only(&br), true, false),
+            (None, Some(hr)) => (head_only(&hr), false, true),
+            (Some(br), Some(hr)) => match br.0.cmp(hr.0) {
+                std::cmp::Ordering::Less => (base_only(&br), true, false),
+                std::cmp::Ordering::Greater => (head_only(&hr), false, true),
+                std::cmp::Ordering::Equal => {
+                    let changed = br.1 != hr.1 || br.2 != hr.2;
+                    let emit = changed.then(|| ChangedAttr {
+                        attr: br.0.to_string(),
+                        base_drv: restore_drv(br.1),
+                        head_drv: restore_drv(hr.1),
+                        base_broken: br.2,
+                        head_broken: hr.2,
+                    });
+                    (emit, true, true)
+                }
+            },
+        };
+        out.extend(emit);
+        if adv_b {
+            b.advance()?;
+        }
+        if adv_h {
+            h.advance()?;
+        }
+    }
+    Ok(out)
+}
+
+/// The changed set between two cached evals, streaming both eval files through
+/// [`merge_rows`]: each side is decompressed on its own thread
+/// ([`spawn_eval_decoder`]) and consumed line-by-line ([`LineCursor`]), so the
+/// two decompressions overlap each other *and* the merge.
 pub fn changed_set(
     base: &str,
     head: &str,
     system: &str,
     profile: &str,
 ) -> Result<Vec<ChangedAttr>> {
-    let bpath = eval_path(base, system, profile)?;
-    let hpath = eval_path(head, system, profile)?;
-    // In both stages the main thread does the head side BEFORE joining the
-    // spawned base thread — joining first would serialize the two sides.
-    let (bbuf, hbuf) = thread::scope(|s| {
-        let b = s.spawn(|| read_eval(&bpath));
-        let h = read_eval(&hpath);
-        (b.join().expect("read_eval panicked"), h)
-    });
-    let (bbuf, hbuf) = (bbuf?, hbuf?);
-    let (brows, hrows) = thread::scope(|s| {
-        let b = s.spawn(|| parse_eval(&bbuf));
-        let h = parse_eval(&hbuf);
-        (b.join().expect("parse_eval panicked"), h)
-    });
-    Ok(diff(&brows, &hrows))
+    changed_set_files(
+        &eval_path(base, system, profile)?,
+        &eval_path(head, system, profile)?,
+    )
 }
 
-/// The changed rows between two attr-sorted row lists: one [`ChangedAttr`] for
-/// each attr whose drv *or* meta-blocked bit differs (meta isn't part of the
-/// drv hash, so (un)marking a package broken can change nothing but the bit —
-/// still a review event worth a row), via a linear two-pointer merge. Only the
-/// (few) changed rows are allocated. An attr with no drv (an eval error) is
-/// treated as absent on that side. Pure — the file I/O lives in
-/// [`changed_set`] — so the merge's edge cases are unit-testable.
-fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
-    let base_only = |r: &EvalRow| ChangedAttr {
-        attr: r.0.to_string(),
-        base_drv: restore_drv(r.1),
-        head_drv: None,
-        base_broken: r.2,
-        head_broken: false,
-    };
-    let head_only = |r: &EvalRow| ChangedAttr {
-        attr: r.0.to_string(),
-        base_drv: None,
-        head_drv: restore_drv(r.1),
-        base_broken: false,
-        head_broken: r.2,
-    };
+/// [`changed_set`] on explicit file paths (separable for tests).
+fn changed_set_files(bpath: &Path, hpath: &Path) -> Result<Vec<ChangedAttr>> {
+    thread::scope(|s| {
+        // Both decoders are spawned before either cursor blocks on its first
+        // chunk, so the two sides start decompressing together.
+        let brd = spawn_eval_decoder(bpath.to_path_buf(), s);
+        let hrd = spawn_eval_decoder(hpath.to_path_buf(), s);
+        let b = LineCursor::new(brd, bpath.to_path_buf())?;
+        let h = LineCursor::new(hrd, hpath.to_path_buf())?;
+        merge_rows(b, h)
+    })
+}
 
-    let mut out = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < b.len() && j < h.len() {
-        match b[i].0.cmp(h[j].0) {
-            std::cmp::Ordering::Less => {
-                if b[i].1.is_some() {
-                    out.push(base_only(&b[i]));
-                }
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                if h[j].1.is_some() {
-                    out.push(head_only(&h[j]));
-                }
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                if b[i].1 != h[j].1 || b[i].2 != h[j].2 {
-                    out.push(ChangedAttr {
-                        attr: b[i].0.to_string(),
-                        base_drv: restore_drv(b[i].1),
-                        head_drv: restore_drv(h[j].1),
-                        base_broken: b[i].2,
-                        head_broken: h[j].2,
-                    });
-                }
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    for k in &b[i..] {
-        if k.1.is_some() {
-            out.push(base_only(k));
-        }
-    }
-    for k in &h[j..] {
-        if k.1.is_some() {
-            out.push(head_only(k));
-        }
-    }
-    out
+/// [`merge_rows`] over two in-memory row slices — the merge's pure spelling,
+/// used by [`changed_tests`] and the unit tests.
+fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
+    merge_rows(
+        SliceCursor { rows: b, i: 0 },
+        SliceCursor { rows: h, i: 0 },
+    )
+    .expect("slice cursors are infallible")
 }
 
 /// Diff two `test_attr → (drv, broken)` maps (the `--tests` cache's shape, full
@@ -1074,6 +1245,52 @@ mod tests {
         assert_eq!(diff(&b, &h), vec![ca("z", None, Some("z1"), false, true)]);
         assert_eq!(diff(&h, &b), vec![ca("z", Some("z1"), None, true, false)]);
         assert_eq!(diff(&[], &[]), vec![]);
+    }
+
+    #[test]
+    fn changed_set_streams_real_files() {
+        // End-to-end over the real on-disk shape: write two evals with
+        // write_eval, diff them through the streaming path (decoder threads +
+        // line cursors), and expect exactly diff's semantics.
+        let ae = |attr: &str, drv: Option<&str>, broken: bool| AttrEval {
+            attr: attr.into(),
+            drv_path: drv.map(str::to_string),
+            broken,
+        };
+        let dir = std::env::temp_dir().join(format!("npd-stream-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bpath = dir.join("b.tsv.zst");
+        let hpath = dir.join("h.tsv.zst");
+        write_eval(
+            &bpath,
+            &[
+                ae("dropped", Some("/nix/store/d1.drv"), false),
+                ae("errored", None, false),
+                ae("rebuilt", Some("/nix/store/r1.drv"), false),
+                ae("same", Some("/nix/store/s1.drv"), false),
+            ],
+        )
+        .unwrap();
+        write_eval(
+            &hpath,
+            &[
+                ae("added", Some("/nix/store/a1.drv"), true),
+                ae("errored", None, false),
+                ae("rebuilt", Some("/nix/store/r2.drv"), false),
+                ae("same", Some("/nix/store/s1.drv"), false),
+            ],
+        )
+        .unwrap();
+        let got = changed_set_files(&bpath, &hpath).unwrap();
+        let want = vec![
+            ca("added", None, Some("a1"), false, true),
+            ca("dropped", Some("d1"), None, false, false),
+            ca("rebuilt", Some("r1"), Some("r2"), false, false),
+        ];
+        assert_eq!(got, want);
+        // A missing file must error (through the in-band producer error).
+        assert!(changed_set_files(&dir.join("nope.tsv.zst"), &hpath).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

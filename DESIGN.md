@@ -113,7 +113,8 @@ eval, so a file beats SQLite on every axis that matters here:
 - **smaller** — ~3.4 MB compressed (vs ~11 MB raw, ~22 MB in SQLite: no per-row
   overhead, no `(run_id, attr)` index duplicating the data);
 - **faster to diff** — both files are sorted by attr, so the changed set is a
-  linear two-pointer merge over borrowed slices (~16 ms) rather than ~114k
+  linear two-pointer merge over two line streams, each decompressed on its own
+  thread (~12 ms, never materializing a whole file) rather than ~114k
   primary-key point-lookups (~94 ms). The cross-cutting SQL queries that would
   have justified a table never materialised (we only ever diff);
 - **evictable** — when the cache grows too big, delete whole eval files for old
