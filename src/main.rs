@@ -160,20 +160,19 @@ fn cached_test_drvs(
     repo: &std::path::Path,
     commit: &str,
     system: &str,
-    profile: &str,
     pkgs: &[String],
 ) -> Result<std::collections::HashMap<String, (String, bool)>> {
-    let done = store.tests_cached_pkgs(commit, system, profile, pkgs)?;
+    let done = store.tests_cached_pkgs(commit, system, pkgs)?;
     let misses: Vec<String> = pkgs
         .iter()
         .filter(|p| !done.contains(*p))
         .cloned()
         .collect();
     if !misses.is_empty() {
-        let jobs = eval::eval_tests(repo, commit, system, profile, &misses)?;
-        store.cache_test_eval(commit, system, profile, &misses, &jobs)?;
+        let jobs = eval::eval_tests(repo, commit, system, &misses)?;
+        store.cache_test_eval(commit, system, &misses, &jobs)?;
     }
-    store.tests_drvs_for(commit, system, profile, pkgs)
+    store.tests_drvs_for(commit, system, pkgs)
 }
 
 /// Flatten the per-system changed sets into build targets: every side's drv,
@@ -229,14 +228,14 @@ fn run(cli: Cli) -> Result<()> {
     let (base, head) = resolve_base_head(&repo, cli.base, cli.head)?;
     let systems = resolve_systems(cli.system);
 
-    eval::eval_two(&repo, &base, &head, &systems, eval::DEFAULT_PROFILE, opts)?;
+    eval::eval_two(&repo, &base, &head, &systems, opts)?;
 
     // The changed set per system — each attr's drv + meta-blocked bit per side —
     // from a linear merge of the two sorted eval files. Computed once, reused
     // for build+render.
     let mut per_system_changed: Vec<(String, Vec<eval::ChangedAttr>)> = Vec::new();
     for sys in &systems {
-        let changed = eval::changed_set(&base, &head, sys, eval::DEFAULT_PROFILE)?;
+        let changed = eval::changed_set(&base, &head, sys)?;
         per_system_changed.push((sys.clone(), changed));
     }
 
@@ -263,22 +262,8 @@ fn run(cli: Cli) -> Result<()> {
             };
             let base_names = names_on(|c| !c.base_broken);
             let head_names = names_on(|c| !c.head_broken);
-            let bmap = cached_test_drvs(
-                &mut store,
-                &repo,
-                &base,
-                sys,
-                eval::DEFAULT_PROFILE,
-                &base_names,
-            )?;
-            let hmap = cached_test_drvs(
-                &mut store,
-                &repo,
-                &head,
-                sys,
-                eval::DEFAULT_PROFILE,
-                &head_names,
-            )?;
+            let bmap = cached_test_drvs(&mut store, &repo, &base, sys, &base_names)?;
+            let hmap = cached_test_drvs(&mut store, &repo, &head, sys, &head_names)?;
             // The same diff the full set went through, so the test rows
             // classify (regression / fixed / new / meta-only …) identically.
             changed.extend(eval::changed_tests(&bmap, &hmap));

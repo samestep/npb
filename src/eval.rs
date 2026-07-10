@@ -1,7 +1,7 @@
 //! Evaluate a nixpkgs revision into an `attr -> drv` map via `nix-eval-jobs`,
 //! cached as one flat file per eval under `evals/` (DESIGN.md §4). This is the
 //! first spine primitive (DESIGN.md §6, §9): a pure fact keyed by
-//! `(commit, system, profile)`, computed at most once.
+//! `(commit, system)`, computed at most once.
 //!
 //! The revision's source comes from `builtins.fetchGit`, so Nix fetches and
 //! caches it in the store — npd manages no worktrees. `nix-eval-jobs` output is
@@ -23,31 +23,26 @@ use serde::Deserialize;
 
 use crate::model::{AttrEval, TestJob};
 
-/// Bumped when the eval file format or *how* we invoke `nix-eval-jobs` changes in
-/// a way that could alter the stored attr->drv map; cache entries under a
-/// different version are ignored (and regenerated), never parsed by newer code —
-/// this version tag is the *only* format-change mechanism (no migration code,
-/// see CLAUDE.md).
-pub const EVAL_VERSION: u32 = 4;
+/// Bumped when the eval file format, the eval config ([`EVAL_CONFIG`]), or
+/// *how* we invoke `nix-eval-jobs` changes in a way that could alter the
+/// stored attr->drv map; cache entries under a different version are ignored
+/// (and regenerated), never parsed by newer code — this version tag is the
+/// *only* format-change mechanism (no migration code, see CLAUDE.md).
+pub const EVAL_VERSION: u32 = 5;
 
-/// The default (and, for now, only) eval profile. npd owns the config so the key
-/// stays a short enumerable label rather than arbitrary Nix (DESIGN.md §6). The
-/// allow-flags are on so meta-blocked packages still yield a drv + meta rather
-/// than throwing — we want their drvpath and the option to build them anyway.
-pub const DEFAULT_PROFILE: &str = "default";
-
-fn profile_config(profile: &str) -> Result<&'static str> {
-    match profile {
-        "default" => Ok("{ allowBroken = true; allowUnfree = true; \
-                          allowUnsupportedSystem = true; allowInsecurePredicate = _: true; }"),
-        other => bail!("unknown eval profile: {other:?}"),
-    }
-}
+/// The one nixpkgs config every eval runs under. npd owns the config
+/// (DESIGN.md §6), which is what makes the eval cache key just
+/// `(commit, system)` — changing this line changes the attr→drv map, so it is
+/// by definition an [`EVAL_VERSION`] bump. The allow-flags are on so
+/// meta-blocked packages still yield a drv + meta rather than throwing — we
+/// want their drvpath and the option to build them anyway.
+const EVAL_CONFIG: &str = "{ allowBroken = true; allowUnfree = true; \
+                             allowUnsupportedSystem = true; allowInsecurePredicate = _: true; }";
 
 // --- nix-eval-jobs output ---------------------------------------------------
 
 /// The slice of `meta` we consume (from `--meta`): the availability bits
-/// nixpkgs' check-meta computes. The profile's allow-flags let these packages
+/// nixpkgs' check-meta computes. [`EVAL_CONFIG`]'s allow-flags let these packages
 /// evaluate to a drv anyway; the bits say they shouldn't be *built* by default.
 #[derive(Deserialize, Default)]
 struct RawMeta {
@@ -102,15 +97,14 @@ fn nix_escape(s: &str) -> String {
 /// revision's source is fetched by `builtins.fetchGit`. Interpolants are
 /// escaped exactly as in [`build_tests_expr`] — the repo path in particular is
 /// user input (`--nixpkgs`).
-fn build_expr(repo: &Path, commit: &str, system: &str, profile: &str) -> Result<String> {
-    let cfg = profile_config(profile)?;
-    Ok(format!(
+fn build_expr(repo: &Path, commit: &str, system: &str) -> String {
+    format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
-         {{ system = \"{}\"; config = {cfg}; }}",
+         {{ system = \"{}\"; config = {EVAL_CONFIG}; }}",
         nix_escape(&repo.display().to_string()),
         nix_escape(commit),
         nix_escape(system),
-    ))
+    )
 }
 
 /// Run one `nix-eval-jobs` invocation with `workers` worker processes, each
@@ -121,12 +115,11 @@ fn run_eval_pb(
     repo: &Path,
     commit: &str,
     system: &str,
-    profile: &str,
     workers: usize,
     per_worker_mb: u64,
     pb: &ProgressBar,
 ) -> Result<Vec<AttrEval>> {
-    let expr = build_expr(repo, commit, system, profile)?;
+    let expr = build_expr(repo, commit, system);
     let short: String = commit.chars().take(12).collect();
     let label = format!("{short} ({system}, {workers}w)");
     stream_jobs(&expr, workers, per_worker_mb, pb, &label, raw_to_attr_eval)
@@ -264,7 +257,7 @@ fn stream_jobs<T>(
 // change's *changed set*, also build their `passthru.tests`. This is a small,
 // targeted eval over the (few) changed attrs, distinct from the full-set eval —
 // and it *is* cached, per package, in SQLite (see `store::Store` and `main`): a
-// test's drv is a pure function of `(commit, system, profile, package-attr)`, so
+// test's drv is a pure function of `(commit, system, package-attr)`, so
 // `eval_tests` runs only over the packages a run hasn't cached yet (the misses),
 // and a fully-cached re-run touches no `nix-eval-jobs` at all. It's a SQLite
 // fact, not a flat eval file, because the access pattern is keyed/incremental
@@ -301,14 +294,7 @@ fn stream_jobs<T>(
 /// derivations, so it never forces a derivation's internals, and each recursed
 /// leaf is wrapped in `tryEval` so one throwing test errors only itself — the
 /// per-leaf isolation nix-eval-jobs would otherwise give the untransformed tree.
-fn build_tests_expr(
-    repo: &Path,
-    commit: &str,
-    system: &str,
-    profile: &str,
-    attrs: &[String],
-) -> Result<String> {
-    let cfg = profile_config(profile)?;
+fn build_tests_expr(repo: &Path, commit: &str, system: &str, attrs: &[String]) -> String {
     let list: String = attrs
         .iter()
         .map(|a| format!("\"{}\" ", nix_escape(a)))
@@ -351,12 +337,12 @@ in
 lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 // { recurseForDerivations = true; }
 "#;
-    Ok(TEMPLATE
+    TEMPLATE
         .replace("@REPO@", &nix_escape(&repo.display().to_string()))
         .replace("@COMMIT@", &nix_escape(commit))
         .replace("@SYSTEM@", &nix_escape(system))
-        .replace("@CFG@", cfg)
-        .replace("@ATTRS@", &list))
+        .replace("@CFG@", EVAL_CONFIG)
+        .replace("@ATTRS@", &list)
 }
 
 /// Evaluate the `passthru.tests` of `attrs` at `commit`/`system` into [`TestJob`]s
@@ -367,13 +353,12 @@ pub fn eval_tests(
     repo: &Path,
     commit: &str,
     system: &str,
-    profile: &str,
     attrs: &[String],
 ) -> Result<Vec<TestJob>> {
     if attrs.is_empty() {
         return Ok(Vec::new());
     }
-    let expr = build_tests_expr(repo, commit, system, profile, attrs)?;
+    let expr = build_tests_expr(repo, commit, system, attrs);
     // A targeted eval over a small changed set: a couple of workers is plenty,
     // and each still re-evaluates the nixpkgs spine, so more would only waste RAM.
     let workers = attrs.len().clamp(1, 4);
@@ -597,10 +582,10 @@ pub fn db_path() -> Result<PathBuf> {
 // line-by-line, so no whole-file buffer is ever materialized (see
 // `changed_set`).
 
-fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
-    Ok(cache_root()?.join("evals").join(format!(
-        "{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv.zst"
-    )))
+fn eval_path(commit: &str, system: &str) -> Result<PathBuf> {
+    Ok(cache_root()?
+        .join("evals")
+        .join(format!("{commit}-{system}-v{EVAL_VERSION}.tsv.zst")))
 }
 
 /// Write an eval to its file, sorted by attr, zstd-compressed, atomically: a
@@ -936,16 +921,8 @@ fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<Change
 /// [`merge_rows`]: each side is decompressed on its own thread
 /// ([`spawn_eval_decoder`]) and consumed line-by-line ([`LineCursor`]), so the
 /// two decompressions overlap each other *and* the merge.
-pub fn changed_set(
-    base: &str,
-    head: &str,
-    system: &str,
-    profile: &str,
-) -> Result<Vec<ChangedAttr>> {
-    changed_set_files(
-        &eval_path(base, system, profile)?,
-        &eval_path(head, system, profile)?,
-    )
+pub fn changed_set(base: &str, head: &str, system: &str) -> Result<Vec<ChangedAttr>> {
+    changed_set_files(&eval_path(base, system)?, &eval_path(head, system)?)
 }
 
 /// [`changed_set`] on explicit file paths (separable for tests).
@@ -989,15 +966,10 @@ pub fn changed_tests(
 /// Ensure every `(commit, system)` pair has a cached eval file, computing the
 /// misses concurrently under a RAM-slot budget (see [`eval_plan`]) — no
 /// oversubscription, no killing in-flight work.
-pub fn eval_pairs(
-    repo: &Path,
-    pairs: &[(String, String)],
-    profile: &str,
-    opts: EvalOpts,
-) -> Result<()> {
+pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     for (i, (commit, system)) in pairs.iter().enumerate() {
-        if !eval_path(commit, system, profile)?.exists() {
+        if !eval_path(commit, system)?.exists() {
             todo.push(i);
         }
     }
@@ -1029,20 +1001,12 @@ pub fn eval_pairs(
             let sem = &sem;
             handles.push(s.spawn(move || -> Result<()> {
                 sem.acquire();
-                let r = run_eval_pb(
-                    repo,
-                    commit,
-                    system,
-                    profile,
-                    plan.workers,
-                    plan.per_worker_mb,
-                    &pb,
-                );
+                let r = run_eval_pb(repo, commit, system, plan.workers, plan.per_worker_mb, &pb);
                 sem.release();
                 // Persist as soon as this eval completes (the write is atomic):
                 // a full-set eval costs minutes, and a *sibling* eval failing —
                 // e.g. one OOM among four — must not discard finished work.
-                write_eval(&eval_path(commit, system, profile)?, &r?)
+                write_eval(&eval_path(commit, system)?, &r?)
             }));
         }
         // Join everything before propagating the first error, so no result is
@@ -1064,7 +1028,6 @@ pub fn eval_two(
     base: &str,
     head: &str,
     systems: &[String],
-    profile: &str,
     opts: EvalOpts,
 ) -> Result<()> {
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
@@ -1074,7 +1037,7 @@ pub fn eval_two(
     for s in systems {
         pairs.push((head.to_string(), s.clone()));
     }
-    eval_pairs(repo, &pairs, profile, opts)
+    eval_pairs(repo, &pairs, opts)
 }
 
 #[cfg(test)]
@@ -1320,7 +1283,7 @@ mod tests {
     #[test]
     fn full_expr_fetches_and_imports() {
         let repo = Path::new("/repo");
-        let full = build_expr(repo, "abc123", "aarch64-linux", "default").unwrap();
+        let full = build_expr(repo, "abc123", "aarch64-linux");
         assert!(full.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
         assert!(full.contains("allowBroken = true"));
     }

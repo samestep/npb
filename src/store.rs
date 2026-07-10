@@ -30,8 +30,8 @@ CREATE TABLE IF NOT EXISTS observation (
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 
 -- The `--tests` passthru.tests eval cache (DESIGN.md §4, §6). A test's drv is a
--- pure function of (commit, system, profile, package-attr), so we cache per
--- package and reuse across reviews at a commit. `test_pkg` marks a package fully
+-- pure function of (commit, system, package-attr), so we cache per package and
+-- reuse across reviews at a commit. `test_pkg` marks a package fully
 -- evaluated (present even when it has zero tests, so a no-test package isn't
 -- re-evaluated every run); `test_drv` holds each resolved `<pkg>.tests.<name>`
 -- drv (a package may contribute zero rows). Full drv paths, like `observation`.
@@ -41,21 +41,19 @@ CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 CREATE TABLE IF NOT EXISTS test_pkg (
     commit_  TEXT NOT NULL,
     system   TEXT NOT NULL,
-    profile  TEXT NOT NULL,
     pkg_attr TEXT NOT NULL,
-    PRIMARY KEY (commit_, system, profile, pkg_attr)
+    PRIMARY KEY (commit_, system, pkg_attr)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS test_drv (
     commit_   TEXT NOT NULL,
     system    TEXT NOT NULL,
-    profile   TEXT NOT NULL,
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
     broken    INTEGER NOT NULL,
-    PRIMARY KEY (commit_, system, profile, test_attr)
+    PRIMARY KEY (commit_, system, test_attr)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (commit_, system, profile, pkg_attr);
+CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (commit_, system, pkg_attr);
 ";
 
 fn source_str(s: Source) -> &'static str {
@@ -197,7 +195,6 @@ impl Store {
         &self,
         commit: &str,
         system: &str,
-        profile: &str,
         pkgs: &[String],
     ) -> Result<std::collections::HashSet<String>> {
         let mut out = std::collections::HashSet::new();
@@ -209,11 +206,11 @@ impl Store {
             .join(",");
         let sql = format!(
             "SELECT pkg_attr FROM test_pkg \
-             WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND pkg_attr IN ({placeholders})",
+             WHERE commit_ = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [commit, system, profile]
+            [commit, system]
                 .into_iter()
                 .chain(pkgs.iter().map(String::as_str)),
         );
@@ -233,33 +230,24 @@ impl Store {
         &mut self,
         commit: &str,
         system: &str,
-        profile: &str,
         pkgs: &[String],
         jobs: &[TestJob],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         for pkg in pkgs {
             tx.execute(
-                "INSERT OR REPLACE INTO test_pkg (commit_, system, profile, pkg_attr) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![commit, system, profile, pkg],
+                "INSERT OR REPLACE INTO test_pkg (commit_, system, pkg_attr) \
+                 VALUES (?1, ?2, ?3)",
+                params![commit, system, pkg],
             )?;
         }
         for j in jobs {
             if let Some(drv) = &j.drv_path {
                 tx.execute(
                     "INSERT OR REPLACE INTO test_drv \
-                     (commit_, system, profile, pkg_attr, test_attr, drv_path, broken) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        commit,
-                        system,
-                        profile,
-                        j.pkg_attr,
-                        j.test_attr,
-                        drv,
-                        j.broken
-                    ],
+                     (commit_, system, pkg_attr, test_attr, drv_path, broken) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![commit, system, j.pkg_attr, j.test_attr, drv, j.broken],
                 )?;
             }
         }
@@ -274,7 +262,6 @@ impl Store {
         &self,
         commit: &str,
         system: &str,
-        profile: &str,
         pkgs: &[String],
     ) -> Result<std::collections::HashMap<String, (String, bool)>> {
         let mut out = std::collections::HashMap::new();
@@ -286,11 +273,11 @@ impl Store {
             .join(",");
         let sql = format!(
             "SELECT test_attr, drv_path, broken FROM test_drv \
-             WHERE commit_ = ?1 AND system = ?2 AND profile = ?3 AND pkg_attr IN ({placeholders})",
+             WHERE commit_ = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [commit, system, profile]
+            [commit, system]
                 .into_iter()
                 .chain(pkgs.iter().map(String::as_str)),
         );
@@ -350,12 +337,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("npd-testcache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
-        let (c, sys, prof) = ("commitA", "aarch64-linux", "default");
+        let (c, sys) = ("commitA", "aarch64-linux");
         let pkgs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
         // Nothing cached yet.
         assert!(
-            s.tests_cached_pkgs(c, sys, prof, &pkgs(&["hello", "ripgrep"]))
+            s.tests_cached_pkgs(c, sys, &pkgs(&["hello", "ripgrep"]))
                 .unwrap()
                 .is_empty()
         );
@@ -382,19 +369,19 @@ mod tests {
                 broken: false,
             },
         ];
-        s.cache_test_eval(c, sys, prof, &pkgs(&["hello", "ripgrep"]), &jobs)
+        s.cache_test_eval(c, sys, &pkgs(&["hello", "ripgrep"]), &jobs)
             .unwrap();
 
         // Both packages are now marked evaluated — including the no-test one, so
         // it isn't re-evaluated (negative caching).
         let done = s
-            .tests_cached_pkgs(c, sys, prof, &pkgs(&["hello", "ripgrep", "curl"]))
+            .tests_cached_pkgs(c, sys, &pkgs(&["hello", "ripgrep", "curl"]))
             .unwrap();
         assert!(done.contains("hello") && done.contains("ripgrep") && !done.contains("curl"));
 
         // hello resolves to its two drv'd tests (the errored one is not stored),
         // each carrying its own meta-blocked bit.
-        let hd = s.tests_drvs_for(c, sys, prof, &pkgs(&["hello"])).unwrap();
+        let hd = s.tests_drvs_for(c, sys, &pkgs(&["hello"])).unwrap();
         assert_eq!(hd.len(), 2);
         assert_eq!(
             hd.get("hello.tests.run"),
@@ -406,13 +393,13 @@ mod tests {
         );
         // ripgrep is cached-done but has no test drvs.
         assert!(
-            s.tests_drvs_for(c, sys, prof, &pkgs(&["ripgrep"]))
+            s.tests_drvs_for(c, sys, &pkgs(&["ripgrep"]))
                 .unwrap()
                 .is_empty()
         );
         // a different commit shares nothing.
         assert!(
-            s.tests_cached_pkgs("commitB", sys, prof, &pkgs(&["hello"]))
+            s.tests_cached_pkgs("commitB", sys, &pkgs(&["hello"]))
                 .unwrap()
                 .is_empty()
         );

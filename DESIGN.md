@@ -102,7 +102,7 @@ again, Nix rebuilds or substitutes it.
 
 The two fact kinds have opposite access patterns, so they get different backends.
 
-**Evals → one flat file per `(commit, system, profile)`** under `evals/`, sorted
+**Evals → one flat file per `(commit, system)`** under `evals/`, sorted
 `attr\tdrv` lines (empty drv = no derivation; a third field `b` marks the few
 attrs whose meta says broken/unsupported/insecure; `src/eval.rs`). The drv is stored
 stripped of its constant `/nix/store/…​.drv` prefix/suffix, and the whole file is
@@ -142,7 +142,7 @@ commit, and full drv paths are stored as-is like the observation log.
 ```
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log + --tests cache (tiny)
-  evals/<commit>-<sys>-<profile>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
+  evals/<commit>-<sys>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -210,10 +210,13 @@ nixpkgs revision, the platform, and the nixpkgs *config* (allowlists like
 `allowBroken`/`allowUnfree`/`allowUnsupportedSystem`, `permittedInsecurePackages`,
 overlays, `config.allowAliases`, …). The trap is letting a user pass arbitrary
 Nix as config — that isn't cleanly hashable. `npd` avoids it by **defining the
-eval config itself**: a single canonical profile (or a small set of named
-profiles), so `config` is a short enumerable label, not arbitrary code. The key
-is then just `(commit, system, profile)`, plus an `npd`-eval-version tag bumped
-if we ever change *how* we invoke `nix-eval-jobs`.
+eval config itself**: one fixed allow-everything config (`EVAL_CONFIG` in
+`src/eval.rs`), so the key is just `(commit, system)` plus the `npd`
+eval-version tag, which is bumped whenever anything that could alter the
+stored map changes — the file format, *how* `nix-eval-jobs` is invoked, or the
+config itself. (An earlier design threaded a named "profile" label through the
+key to leave room for several configs; with exactly one config ever defined,
+the label was redundant with the version tag and was dropped.)
 
 Caching is sound because nixpkgs evaluation is deterministic given those inputs
 (drv paths are content-addressed by their inputs, stable across time and
@@ -260,7 +263,7 @@ marked-broken / …) exactly like any other attr — a delta view, a superset of
 #397's one-shot head-only build.
 
 This eval **is cached**, but *per package* rather than as a whole-set file. A
-test's drv is a pure function of `(commit, system, profile, package-attr)` — it
+test's drv is a pure function of `(commit, system, package-attr)` — it
 does not depend on the base/head pairing — so the cache keys on the package, not
 the changed set, which means a package evaluated in one review is reused in any
 other at that commit. Each run looks up which changed packages are already
@@ -365,8 +368,8 @@ macOS (see `stream_jobs` in `src/eval.rs`); drop that once the fix reaches the
 
 Recorded for context:
 
-- *Eval cache key* → `(commit, system, profile)` with an eval-version tag; not a
-  can of worms because `npd` owns the config (§6).
+- *Eval cache key* → `(commit, system)` with an eval-version tag standing in
+  for the fixed config; not a can of worms because `npd` owns the config (§6).
 - *Concurrency* → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.
