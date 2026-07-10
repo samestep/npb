@@ -704,16 +704,33 @@ pub struct ChangedAttr {
 
 /// The changed set between two cached evals — one [`ChangedAttr`] for each attr
 /// whose drv *or* meta-blocked bit differs — reading both eval files whole and
-/// handing the parsed rows to [`diff`].
+/// handing the parsed rows to [`diff`]. The two sides are independent until the
+/// diff, so each stage (read+decompress, then parse) runs them on parallel
+/// threads — that's most of a warm run's in-process time, and this halves it.
+/// Two stages rather than one because [`parse_eval`] borrows from the
+/// decompressed buffer, which must outlive its thread.
 pub fn changed_set(
     base: &str,
     head: &str,
     system: &str,
     profile: &str,
 ) -> Result<Vec<ChangedAttr>> {
-    let bbuf = read_eval(&eval_path(base, system, profile)?)?;
-    let hbuf = read_eval(&eval_path(head, system, profile)?)?;
-    Ok(diff(&parse_eval(&bbuf), &parse_eval(&hbuf)))
+    let bpath = eval_path(base, system, profile)?;
+    let hpath = eval_path(head, system, profile)?;
+    // In both stages the main thread does the head side BEFORE joining the
+    // spawned base thread — joining first would serialize the two sides.
+    let (bbuf, hbuf) = thread::scope(|s| {
+        let b = s.spawn(|| read_eval(&bpath));
+        let h = read_eval(&hpath);
+        (b.join().expect("read_eval panicked"), h)
+    });
+    let (bbuf, hbuf) = (bbuf?, hbuf?);
+    let (brows, hrows) = thread::scope(|s| {
+        let b = s.spawn(|| parse_eval(&bbuf));
+        let h = parse_eval(&hbuf);
+        (b.join().expect("parse_eval panicked"), h)
+    });
+    Ok(diff(&brows, &hrows))
 }
 
 /// The changed rows between two attr-sorted row lists: one [`ChangedAttr`] for
