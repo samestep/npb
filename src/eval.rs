@@ -391,12 +391,21 @@ const MAX_WORKERS_PER_EVAL: u64 = 8;
 
 /// Optional overrides for the parallel-eval sizing (see [`eval_plan`]). Every
 /// field `None` means "auto-size from system RAM"; the CLI surfaces each as a
-/// global flag so the scheme can be tuned point-by-point without env vars.
-#[derive(Debug, Clone, Copy, Default)]
+/// global flag (this struct doubles as the clap group) so the scheme can be
+/// tuned point-by-point without env vars.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub struct EvalOpts {
+    /// RAM budget for parallel evaluation, MiB (default: 80% of *available* RAM).
+    #[arg(long)]
     pub mem_budget_mb: Option<u64>,
+    /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
+    #[arg(long)]
     pub worker_mem_mb: Option<u64>,
+    /// Number of evaluations to run at once (default: auto from the RAM budget).
+    #[arg(long = "eval-concurrency")]
     pub concurrency: Option<u64>,
+    /// `nix-eval-jobs` workers per evaluation (default: auto, clamped 1–8).
+    #[arg(long = "eval-workers")]
     pub workers: Option<u64>,
 }
 

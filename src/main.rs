@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::Command as Proc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser};
+use clap::Parser;
 
 use crate::model::BuildPolicy;
 
@@ -61,37 +61,10 @@ struct Cli {
     /// Everything on: implies --tests and --build-broken.
     #[arg(long)]
     max: bool,
+    /// Parallel-evaluation sizing knobs; each unset flag is auto-sized from
+    /// system RAM (see `eval::eval_plan`).
     #[command(flatten)]
-    eval: EvalArgs,
-}
-
-/// Parallel-evaluation sizing knobs. Each unset flag is auto-sized from system
-/// RAM (see `eval::eval_plan`).
-#[derive(Args, Clone, Copy, Default)]
-struct EvalArgs {
-    /// RAM budget for parallel evaluation, MiB (default: 80% of *available* RAM).
-    #[arg(long)]
-    mem_budget_mb: Option<u64>,
-    /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
-    #[arg(long)]
-    worker_mem_mb: Option<u64>,
-    /// Number of evaluations to run at once (default: auto from the RAM budget).
-    #[arg(long)]
-    eval_concurrency: Option<u64>,
-    /// `nix-eval-jobs` workers per evaluation (default: auto, clamped 1–8).
-    #[arg(long)]
-    eval_workers: Option<u64>,
-}
-
-impl EvalArgs {
-    fn opts(self) -> eval::EvalOpts {
-        eval::EvalOpts {
-            mem_budget_mb: self.mem_budget_mb,
-            worker_mem_mb: self.worker_mem_mb,
-            concurrency: self.eval_concurrency,
-            workers: self.eval_workers,
-        }
-    }
+    eval: eval::EvalOpts,
 }
 
 /// The host Nix system double, e.g. `aarch64-linux`.
@@ -208,7 +181,7 @@ fn run(cli: Cli) -> Result<()> {
         prefer_local: cli.prefer_local,
         build_broken,
     };
-    let opts = cli.eval.opts();
+    let opts = cli.eval;
     let repo = resolve_repo(cli.nixpkgs)?;
     let (base, head) = resolve_base_head(&repo, cli.base, cli.head)?;
     let systems = resolve_systems(cli.system);
