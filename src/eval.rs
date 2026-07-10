@@ -65,7 +65,7 @@ struct RawJob {
     /// dotted label is wanted — see the test eval.
     attr_path: Vec<String>,
     /// `None` when evaluation of the attr errored (the job line carries an
-    /// `error` message instead, which we don't keep — `nix log`/re-eval has it).
+    /// `error` message instead, which we don't keep — re-evaluating reproduces it).
     drv_path: Option<String>,
     meta: Option<RawMeta>,
 }
@@ -591,10 +591,10 @@ pub fn db_path() -> Result<PathBuf> {
 // for other shapes: changing it is an EVAL_VERSION bump, so old files are
 // ignored and regenerated, never mis-parsed as if they were stripped.
 //
-// The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller; a full
-// study weighed the level and alternatives — a two-file split, higher levels —
-// and landed on the default). We diff by reading a file whole and decompressing
-// it, so a single stream is the right shape; the merge is unchanged.
+// The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller at the
+// default level; higher levels and a two-file split bought little). We diff by
+// reading a file whole and decompressing it, so a single stream is the right
+// shape.
 
 fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
     Ok(cache_root()?.join("evals").join(format!(

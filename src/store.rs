@@ -11,10 +11,9 @@ use rusqlite::{Connection, params};
 
 use crate::model::{Observation, Outcome, Source, TestJob};
 
-// This schema is the only one npd has ever had, and it must stay that way:
-// there is no migration code here by design (see CLAUDE.md). Change it freely
-// and in place — the whole store is a re-derivable cache, so the remedy for an
-// incompatible change is deleting `~/.cache/nix-npd`, never a compat shim.
+// No migrations, ever (CLAUDE.md): change this schema freely and in place. The
+// whole store is a re-derivable cache, so the remedy for an incompatible
+// change is deleting `~/.cache/nix-npd`, never a compat shim.
 const SCHEMA: &str = "
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
 -- `local`/`cache` fact here per drv.

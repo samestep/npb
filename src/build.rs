@@ -5,9 +5,9 @@
 //! keeps every fact observed so far — and drvs nix never attempted are
 //! attributed from a post-build output-validity check.
 //!
-//! This is the first writer to the observation log, and the reason it exists:
-//! Nix remembers successful builds (the store), but *forgets failures* — so
-//! without this, a known-failing derivation gets retried on every run.
+//! The observation log exists because Nix remembers successful builds (the
+//! store) but *forgets failures* — without it, a known-failing derivation
+//! gets retried on every run.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};

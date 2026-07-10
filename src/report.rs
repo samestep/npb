@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn render_sections_tokens_grouping_and_folding() {
         let entries = vec![
-            // regression (state changed → open)
+            // a regression
             entry(
                 "pkgA",
                 State::Built,
@@ -323,7 +323,7 @@ mod tests {
                 Some("/b/a.drv"),
                 Some("/h/a.drv"),
             ),
-            // two distinct blocked drvs (state changed → open), transitive glyph 🚫
+            // two distinct blocked drvs, transitive glyph 🚫
             entry(
                 "dep1",
                 State::Built,
@@ -346,7 +346,7 @@ mod tests {
                 Some("/b/k"),
                 Some("/h/k"),
             ),
-            // two attrs sharing one drv, unchanged (state same → collapsed, grouped)
+            // two attrs sharing one drv, unchanged (grouped onto one line)
             entry(
                 "z.foo",
                 State::Built,

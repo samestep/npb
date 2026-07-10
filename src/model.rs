@@ -13,7 +13,10 @@
 ///
 /// Pure fact: fully determined by (commit, system, config). `drv_path` is
 /// `None` when evaluation itself errored (assertion, IFD failure, …) — distinct
-/// from a *build* failure, which is an [`Observation`]. `broken` folds
+/// from a *build* failure, which is an [`Observation`]. The diff and report
+/// deliberately render an errored attr as *absent* (➖): in a delta view an
+/// eval breakage is visible as the attr disappearing, so no separate error
+/// state is needed. `broken` folds
 /// `meta.broken` / `meta.unsupported` / `meta.insecure` into one bit: the
 /// profile's allow-flags let such a package evaluate to a drv anyway, but by
 /// default it is not *built* (like nixpkgs-review) — see [`BuildPolicy`].

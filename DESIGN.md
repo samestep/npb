@@ -289,7 +289,9 @@ of six states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependen
 failed — the transitive/cascade case, kept distinct from a direct failure), `🚧`
 marked broken (meta broken/unsupported/insecure — not attempted by default; a
 real build fact from a `--build-broken` run outranks the marking), `➖`
-absent (no such attr on that side — a *known* fact, never a `?`), `❓` unbuilt
+absent (no such attr on that side, or it no longer evaluates — a *known* fact,
+never a `?`; in a delta view an eval breakage is visible as disappearance, so
+there is no separate eval-error state), `❓` unbuilt
 (has a drv, no fact yet; only under `--no-build`). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
