@@ -395,13 +395,13 @@ const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 const MAX_WORKERS_PER_EVAL: usize = 8;
 
 /// Optional overrides for the parallel-eval sizing. `None` means "auto": the
-/// width comes from splitting the machine's cores across the evals (see
-/// [`initial_workers`]); RAM is not planned for — an eval that dies is retried
-/// narrower instead ([`eval_pairs`]).
+/// width comes from splitting the machine's cores *and total RAM* across the
+/// evals (see [`initial_workers`]); the dynamic part of RAM is not planned
+/// for — an eval that dies is retried narrower instead ([`eval_pairs`]).
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub struct EvalOpts {
     /// `nix-eval-jobs` workers per evaluation (default: the machine's cores
-    /// split across the evals, clamped 1–8).
+    /// and total RAM split across the evals, clamped 1–8).
     #[arg(long = "eval-workers")]
     pub workers: Option<u64>,
     /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
@@ -426,15 +426,57 @@ impl std::fmt::Display for EvalAborted {
 
 impl std::error::Error for EvalAborted {}
 
+/// Total physical RAM in MiB. Unlike *available* RAM (which the old planner
+/// used, and which lies — it moves while a minutes-long eval runs), this is an
+/// invariant of the machine, so the width heuristic may plan from it. Linux:
+/// `/proc/meminfo MemTotal`; macOS: `sysctl -n hw.memsize`; else 8 GiB.
+fn total_mem_mb() -> u64 {
+    if let Ok(s) = fs::read_to_string("/proc/meminfo")
+        && let Some(kb) = s
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|n| n.parse::<u64>().ok())
+    {
+        return kb / 1024;
+    }
+    Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|bytes| bytes / 1024 / 1024)
+        .unwrap_or(8192)
+}
+
 /// The starting width for each of `n_jobs` concurrent evals: the user's
 /// `--eval-workers` if given, else the machine's cores split across the evals
-/// (rounding up — a little CPU oversubscription beats idle cores), clamped to
-/// [`MAX_WORKERS_PER_EVAL`].
-fn initial_workers(cores: usize, n_jobs: usize, user: Option<u64>) -> usize {
-    match user {
-        Some(w) => (w as usize).max(1),
-        None => cores.div_ceil(n_jobs.max(1)).clamp(1, MAX_WORKERS_PER_EVAL),
+/// (rounding up — a little CPU oversubscription beats idle cores), **bounded
+/// so the batch's worst case fits in total RAM** (every worker at its heap
+/// cap), clamped to [`MAX_WORKERS_PER_EVAL`].
+///
+/// The RAM bound plans only from invariants (total RAM, the cap) — the
+/// recovery ladder in [`eval_pairs`] still covers the dynamic part. Without
+/// it, a wide first attempt on a small-RAM machine starts a *global* OOM
+/// hunt, and the kernel's victim is not always a worker (it can be npd, or an
+/// unrelated process), in which case the ladder's detector never fires.
+fn initial_workers(
+    cores: usize,
+    mem_mb: u64,
+    per_worker_mb: u64,
+    n_jobs: usize,
+    user: Option<u64>,
+) -> usize {
+    if let Some(w) = user {
+        return (w as usize).max(1);
     }
+    let n = n_jobs.max(1);
+    let by_cpu = cores.div_ceil(n);
+    let slots = (mem_mb / per_worker_mb.max(1)).max(1) as usize;
+    let by_ram = (slots / n).max(1);
+    by_cpu.min(by_ram).clamp(1, MAX_WORKERS_PER_EVAL)
 }
 
 // --- cache ------------------------------------------------------------------
@@ -880,7 +922,13 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let width = initial_workers(cores, todo.len(), opts.workers);
+    let width = initial_workers(
+        cores,
+        total_mem_mb(),
+        per_worker_mb,
+        todo.len(),
+        opts.workers,
+    );
     let mp = MultiProgress::new();
     thread::scope(|s| -> Result<()> {
         let mut handles = Vec::new();
@@ -1192,14 +1240,19 @@ mod tests {
     }
 
     #[test]
-    fn initial_workers_splits_cores() {
-        // Cores split across the evals, rounded up, clamped to 1..=8.
-        assert_eq!(initial_workers(18, 2, None), 8); // ceil(18/2)=9, clamped
-        assert_eq!(initial_workers(18, 6, None), 3);
-        assert_eq!(initial_workers(4, 6, None), 1);
-        assert_eq!(initial_workers(8, 1, None), 8);
+    fn initial_workers_splits_cores_and_ram() {
+        const G: u64 = 1024;
+        // Plenty of RAM: the cores split governs (rounded up, clamped 1..=8).
+        assert_eq!(initial_workers(18, 256 * G, 4 * G, 2, None), 8); // ceil(18/2)=9→8
+        assert_eq!(initial_workers(18, 256 * G, 4 * G, 6, None), 3);
+        assert_eq!(initial_workers(4, 256 * G, 4 * G, 6, None), 1);
+        // RAM-bound: total/(cap×jobs) governs — 31 GiB, 4 GiB caps.
+        assert_eq!(initial_workers(18, 31 * G, 4 * G, 2, None), 3); // 7 slots / 2
+        assert_eq!(initial_workers(18, 31 * G, 4 * G, 6, None), 1);
+        // Never zero, even when one worker's cap exceeds total RAM.
+        assert_eq!(initial_workers(18, 2 * G, 4 * G, 2, None), 1);
         // --eval-workers wins verbatim (floored at 1).
-        assert_eq!(initial_workers(18, 2, Some(2)), 2);
-        assert_eq!(initial_workers(18, 2, Some(0)), 1);
+        assert_eq!(initial_workers(18, 31 * G, 4 * G, 2, Some(9)), 9);
+        assert_eq!(initial_workers(18, 31 * G, 4 * G, 2, Some(0)), 1);
     }
 }

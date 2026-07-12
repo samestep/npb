@@ -224,21 +224,27 @@ machines); IFD is still deterministic, and impurities like `currentSystem` are
 fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, once
 `npd` owns the config.
 
-**Scheduling parallel evals — recover, don't predict.** A report needs up to
-2×#systems full-set evals; they all run concurrently, each with `nix-eval-jobs`
-workers = the machine's cores split across the evals (rounded up, clamped 1–8 —
-each worker redundantly re-imports the nixpkgs spine, so width has diminishing
-returns). RAM is deliberately *not* planned for: an earlier design measured
-available RAM at launch and divided it into per-worker slots, but the snapshot
-lies (free RAM moves while a minutes-long eval runs — the plan could still
-OOM) and the slot arithmetic idled cores. Instead npd **recovers**: the
-integrity gate already detects a fatal `nix-eval-jobs` abort (in practice a
-worker OOM-killed when the widths oversubscribe RAM) and refuses the truncated
-result, and the scheduler retries *just that eval* at half its width, halving
-to a floor of one worker — the per-worker heap cap (`--worker-mem-mb`, default
-4 GiB, enforced by `nix-eval-jobs` itself) is the only memory bound. Because
-every eval persists the moment it completes, a retry re-pays only the eval
-that died, so the worst case is one wasted too-wide attempt per starved eval.
+**Scheduling parallel evals — plan from invariants, recover from the rest.** A
+report needs up to 2×#systems full-set evals; they all run concurrently, each
+with `nix-eval-jobs` workers = the machine's cores split across the evals
+(rounded up, clamped 1–8 — each worker redundantly re-imports the nixpkgs
+spine, so width has diminishing returns), **bounded so the batch's worst case
+(every worker at its heap cap) fits in total RAM**. Only invariants are
+planned from — core count, total RAM, the per-worker cap (`--worker-mem-mb`,
+default 4 GiB, enforced by `nix-eval-jobs` itself). The *dynamic* part of RAM
+is deliberately not: an earlier design measured *available* RAM at launch and
+divided it into slots, but that snapshot lies (free RAM moves while a
+minutes-long eval runs — the plan could still OOM, with no recovery) and the
+slot arithmetic idled cores. Instead npd **recovers**: the integrity gate
+detects a fatal `nix-eval-jobs` abort (in practice a worker OOM-killed) and
+refuses the truncated result, and the scheduler retries *just that eval* at
+half its width, halving to a floor of one worker. Because every eval persists
+the moment it completes, a retry re-pays only the eval that died — the worst
+case is one wasted too-wide attempt per starved eval. (The total-RAM bound
+matters because a global OOM's victim is not always a worker — the kernel can
+take npd itself or an unrelated process, and then the ladder's detector never
+fires; keeping the planned worst case inside the machine makes worker-death
+the overwhelmingly likely failure mode, which is the one we can recover from.)
 `--eval-workers` overrides the starting width.
 
 `eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
