@@ -240,7 +240,13 @@ detects a fatal `nix-eval-jobs` abort (in practice a worker OOM-killed) and
 refuses the truncated result, and the scheduler retries *just that eval* at
 half its width, halving to a floor of one worker. Because every eval persists
 the moment it completes, a retry re-pays only the eval that died — the worst
-case is one wasted too-wide attempt per starved eval. (The total-RAM bound
+case is one wasted too-wide attempt per starved eval. The ladder has a final
+**concurrency rung**: an eval that aborts even at one worker is deferred and
+re-run *alone* (re-laddering from the single-job width) after its siblings
+finish — width recovery alone can't help when RAM per *concurrent eval* is
+the binding constraint (measured: an 8 GiB cgroup fits two full-set evals at
+no width whatsoever, but fits them serialized at 4.4 GiB peak), so the
+ladder's reachable set must include full serialization. (The total-RAM bound
 matters because a global OOM's victim is not always a worker — the kernel can
 take npd itself or an unrelated process, and then the ladder's detector never
 fires; keeping the planned worst case inside the machine makes worker-death

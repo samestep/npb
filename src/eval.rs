@@ -480,8 +480,9 @@ fn initial_workers(
 /// when the widths oversubscribe RAM) is retried at half its width, halving
 /// down to one worker — the integrity gate in [`stream_jobs`] is the detector,
 /// and per-eval persistence means a retry re-pays only the eval that died,
-/// never its finished siblings. See DESIGN §6 for why this replaced planning
-/// from a measured RAM budget.
+/// never its finished siblings. An eval still aborting at one worker is
+/// deferred and re-run *alone* after the rest finish (the concurrency rung).
+/// See DESIGN §6 for why this replaced planning from a measured RAM budget.
 pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     // Dedupe: `npd X X` (or repeated --system) would otherwise run the same
@@ -500,55 +501,112 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let width = initial_workers(
-        cores,
-        total_mem_mb(),
-        per_worker_mb,
-        todo.len(),
-        opts.workers,
-    );
+    let mem_mb = total_mem_mb();
+    let width = initial_workers(cores, mem_mb, per_worker_mb, todo.len(), opts.workers);
     let mp = MultiProgress::new();
-    thread::scope(|s| -> Result<()> {
+
+    // Phase 1: every miss concurrently, each down its own width ladder. An
+    // eval that aborts even at one worker isn't necessarily infeasible — its
+    // *siblings* may be what's eating the RAM — so it's deferred, not failed.
+    let deferred = thread::scope(|s| -> Result<Vec<usize>> {
         let mut handles = Vec::new();
         for &i in &todo {
             let (commit, system) = (&pairs[i].0, &pairs[i].1);
             let mp = &mp;
-            handles.push(s.spawn(move || -> Result<()> {
-                let mut workers = width;
-                loop {
-                    // A fresh bar per attempt: the failed attempt's abandoned
-                    // bar stays visible above as the record of what happened.
-                    let pb = mp.add(ProgressBar::new_spinner());
-                    match run_eval_pb(repo, commit, system, workers, per_worker_mb, &pb) {
-                        // Persist immediately (the write is atomic): a sibling
-                        // eval failing later must not discard finished work.
-                        Ok(attrs) => return write_eval(&eval_path(commit, system)?, &attrs),
-                        Err(e) if workers > 1 && e.downcast_ref::<EvalAborted>().is_some() => {
-                            workers /= 2;
-                            // Through the MultiProgress so the note doesn't
-                            // tear the sibling evals' live bars.
-                            let _ = mp.println(format!(
-                                "  eval of {} ({system}) aborted — likely out of memory; \
-                                 retrying with {workers} worker(s)",
-                                &commit[..12.min(commit.len())],
-                            ));
-                        }
-                        Err(e) => return Err(e),
+            handles.push(s.spawn(move || -> Result<Option<usize>> {
+                match run_ladder(repo, commit, system, width, per_worker_mb, mp)? {
+                    LadderEnd::Done => Ok(None),
+                    LadderEnd::Exhausted(_) => {
+                        let _ = mp.println(format!(
+                            "  eval of {} ({system}) aborts even with one worker; \
+                             deferring it until the other evals finish",
+                            &commit[..12.min(commit.len())],
+                        ));
+                        Ok(Some(i))
                     }
                 }
             }));
         }
         // Join everything before propagating the first error, so no result is
         // dropped mid-write and every progress bar reaches a final state.
+        let mut deferred = Vec::new();
         let mut result = Ok(());
         for h in handles {
-            let r = h.join().expect("eval thread panicked");
-            if result.is_ok() {
-                result = r;
+            match h.join().expect("eval thread panicked") {
+                Ok(Some(i)) => deferred.push(i),
+                Ok(None) => {}
+                Err(e) => {
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
             }
         }
-        result
-    })
+        result.map(|()| deferred)
+    })?;
+
+    // Phase 2 — the concurrency rung: the deferred evals get the machine to
+    // themselves, one at a time, re-laddering from the single-job width. This
+    // extends the ladder's reach to full serialization, the winning strategy
+    // when RAM per *concurrent eval* (not per worker) is the binding
+    // constraint. Only an eval that aborts at one worker, alone, is a real
+    // failure.
+    for &i in &deferred {
+        let (commit, system) = (&pairs[i].0, &pairs[i].1);
+        let solo = initial_workers(cores, mem_mb, per_worker_mb, 1, opts.workers);
+        match run_ladder(repo, commit, system, solo, per_worker_mb, &mp)? {
+            LadderEnd::Done => {}
+            LadderEnd::Exhausted(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// How one trip down [`run_ladder`] ended: the eval persisted, or it kept
+/// aborting all the way down to one worker (the final abort attached).
+enum LadderEnd {
+    Done,
+    Exhausted(anyhow::Error),
+}
+
+/// Run one eval down the halving ladder, from `width` workers to 1, persisting
+/// on success. Aborts (see [`EvalAborted`]) halve the width; other errors
+/// propagate immediately.
+fn run_ladder(
+    repo: &Path,
+    commit: &str,
+    system: &str,
+    mut width: usize,
+    per_worker_mb: u64,
+    mp: &MultiProgress,
+) -> Result<LadderEnd> {
+    loop {
+        // A fresh bar per attempt: the failed attempt's abandoned bar stays
+        // visible above as the record of what happened.
+        let pb = mp.add(ProgressBar::new_spinner());
+        match run_eval_pb(repo, commit, system, width, per_worker_mb, &pb) {
+            // Persist immediately (the write is atomic): a sibling eval
+            // failing later must not discard finished work.
+            Ok(attrs) => {
+                write_eval(&eval_path(commit, system)?, &attrs)?;
+                return Ok(LadderEnd::Done);
+            }
+            Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
+                if width == 1 {
+                    return Ok(LadderEnd::Exhausted(e));
+                }
+                width /= 2;
+                // Through the MultiProgress so the note doesn't tear the
+                // sibling evals' live bars.
+                let _ = mp.println(format!(
+                    "  eval of {} ({system}) aborted — likely out of memory; \
+                     retrying with {width} worker(s)",
+                    &commit[..12.min(commit.len())],
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Ensure both commits are evaluated across all systems (they run concurrently).
