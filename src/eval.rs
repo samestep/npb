@@ -13,11 +13,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
@@ -233,17 +232,17 @@ fn stream_jobs<T>(
     // the streamed output is silently TRUNCATED — we got some attrs but not
     // all. Caching that would poison every future diff/report with phantom
     // "removed" packages, so we refuse it outright rather than trust a partial.
+    // The [`EvalAborted`] marker is what lets the scheduler retry narrower.
     if !status.success() {
         pb.abandon_with_message(format!("eval of {label} failed (truncated)"));
-        bail!(
+        return Err(anyhow::Error::new(EvalAborted).context(format!(
             "nix-eval-jobs did not finish evaluating {label}: it exited \
              {status} after streaming {} attr(s), so the result is truncated and \
-             will NOT be cached. A worker most likely died — commonly out-of-memory: \
-             reduce the worker count or --max-memory-size so their caps fit in RAM. \
+             will NOT be cached. A worker most likely died — commonly out-of-memory. \
              Last stderr:\n{}",
             attrs.len(),
             stderr_tail,
-        );
+        )));
     }
     // Declare success only after the integrity gate: a truncated eval must not
     // flash an "evaluated …" line before the error.
@@ -386,161 +385,55 @@ pub fn eval_tests(
     r
 }
 
-// --- concurrency: a memory-slot budget over parallel evals -------------------
+// --- concurrency: recover, don't predict (DESIGN §6) -------------------------
 
 /// Default per-worker heap cap (matches nix-eval-jobs' own 4 GiB default).
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 /// A single eval sees diminishing returns past this many workers (each worker
 /// redundantly re-evaluates the package-set spine), so cap the auto-derived
-/// width here even when the RAM budget could afford more.
-const MAX_WORKERS_PER_EVAL: u64 = 8;
+/// width here even when the cores split could afford more.
+const MAX_WORKERS_PER_EVAL: usize = 8;
 
-/// Optional overrides for the parallel-eval sizing (see [`eval_plan`]). Every
-/// field `None` means "auto-size from system RAM"; the CLI surfaces each as a
-/// global flag (this struct doubles as the clap group) so the scheme can be
-/// tuned point-by-point without env vars.
+/// Optional overrides for the parallel-eval sizing. `None` means "auto": the
+/// width comes from splitting the machine's cores across the evals (see
+/// [`initial_workers`]); RAM is not planned for — an eval that dies is retried
+/// narrower instead ([`eval_pairs`]).
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub struct EvalOpts {
-    /// RAM budget for parallel evaluation, MiB (default: 80% of *available* RAM).
-    #[arg(long)]
-    pub mem_budget_mb: Option<u64>,
+    /// `nix-eval-jobs` workers per evaluation (default: the machine's cores
+    /// split across the evals, clamped 1–8).
+    #[arg(long = "eval-workers")]
+    pub workers: Option<u64>,
     /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
     #[arg(long)]
     pub worker_mem_mb: Option<u64>,
-    /// Number of evaluations to run at once (default: auto from the RAM budget).
-    #[arg(long = "eval-concurrency")]
-    pub concurrency: Option<u64>,
-    /// `nix-eval-jobs` workers per evaluation (default: auto, clamped 1–8).
-    #[arg(long = "eval-workers")]
-    pub workers: Option<u64>,
 }
 
-/// *Currently available* system RAM in MiB (not total), so the auto-sizer never
-/// oversubscribes what's actually free — otherwise a machine already using most
-/// of its RAM (e.g. a host whose VM holds half of it) would OOM/swap. Falls back
-/// to total, then to a conservative 8 GiB, if the available figure isn't
-/// obtainable. Linux: `/proc/meminfo`; macOS: `vm_stat` / `sysctl hw.memsize`.
-fn available_mem_mb() -> u64 {
-    // Linux: MemAvailable (kernel's estimate of allocatable-without-swap); fall
-    // back to MemTotal on kernels too old to report it.
-    if let Ok(s) = fs::read_to_string("/proc/meminfo") {
-        let field = |name: &str| {
-            s.lines()
-                .find(|l| l.starts_with(name))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse::<u64>().ok())
-        };
-        if let Some(kb) = field("MemAvailable:").or_else(|| field("MemTotal:")) {
-            return kb / 1024;
-        }
-    }
-    // macOS: reclaimable pages from `vm_stat`, else total from `sysctl`.
-    macos_available_mb().or_else(macos_total_mb).unwrap_or(8192)
-}
+/// A fatal `nix-eval-jobs` abort (non-zero exit): the streamed output was
+/// truncated and discarded. A marker type so the scheduler can recognize it
+/// through the anyhow chain and retry that eval with fewer workers.
+#[derive(Debug)]
+struct EvalAborted;
 
-/// macOS available RAM (MiB): free + inactive + speculative + purgeable pages,
-/// per `vm_stat`. A heuristic (like Activity Monitor's "available"), but far
-/// better than assuming all of `hw.memsize` is free.
-fn macos_available_mb() -> Option<u64> {
-    let out = Command::new("vm_stat")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    // Header: "Mach Virtual Memory Statistics: (page size of 16384 bytes)".
-    let page = text
-        .split("page size of ")
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(16384);
-    let pages = |name: &str| -> u64 {
-        text.lines()
-            .find(|l| l.trim_start().starts_with(name))
-            .and_then(|l| l.rsplit(':').next())
-            .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    let avail = pages("Pages free")
-        + pages("Pages inactive")
-        + pages("Pages speculative")
-        + pages("Pages purgeable");
-    (avail > 0).then_some(avail * page / 1024 / 1024)
-}
-
-/// macOS total physical RAM (MiB) via `sysctl -n hw.memsize` (bytes).
-fn macos_total_mb() -> Option<u64> {
-    Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|bytes| bytes / 1024 / 1024)
-}
-
-/// How to run a batch of `n_jobs` evals: how many at once, how wide each, and
-/// the per-worker heap cap. Derived from a RAM budget (default 80% of currently
-/// *available* RAM) divided into `per_worker_mb` slots; each knob is overridable
-/// via [`EvalOpts`] so the scheme can be benchmarked point-by-point.
-struct EvalPlan {
-    concurrency: usize,
-    workers: usize,
-    per_worker_mb: u64,
-    budget_mb: u64,
-    slots: u64,
-}
-
-fn eval_plan(n_jobs: usize, opts: EvalOpts) -> EvalPlan {
-    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
-    let budget_mb = opts
-        .mem_budget_mb
-        .unwrap_or_else(|| available_mem_mb() * 8 / 10);
-    let slots = (budget_mb / per_worker_mb).max(1);
-    // Run as many evals at once as fit in the budget (but no more than we have),
-    // splitting the slots evenly across them; each override wins if set.
-    let concurrency = opts
-        .concurrency
-        .unwrap_or(slots)
-        .min(n_jobs.max(1) as u64)
-        .max(1);
-    let workers = opts
-        .workers
-        .unwrap_or_else(|| (slots / concurrency).clamp(1, MAX_WORKERS_PER_EVAL))
-        .max(1);
-    EvalPlan {
-        concurrency: concurrency as usize,
-        workers: workers as usize,
-        per_worker_mb,
-        budget_mb,
-        slots,
+impl std::fmt::Display for EvalAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "nix-eval-jobs aborted before finishing (output truncated)"
+        )
     }
 }
 
-/// A counting semaphore (std has none): admits at most `permits` evals at once.
-struct Semaphore {
-    m: Mutex<usize>,
-    cv: Condvar,
-}
+impl std::error::Error for EvalAborted {}
 
-impl Semaphore {
-    fn new(permits: usize) -> Self {
-        Semaphore {
-            m: Mutex::new(permits),
-            cv: Condvar::new(),
-        }
-    }
-    fn acquire(&self) {
-        let mut n = self.m.lock().unwrap();
-        while *n == 0 {
-            n = self.cv.wait(n).unwrap();
-        }
-        *n -= 1;
-    }
-    fn release(&self) {
-        *self.m.lock().unwrap() += 1;
-        self.cv.notify_one();
+/// The starting width for each of `n_jobs` concurrent evals: the user's
+/// `--eval-workers` if given, else the machine's cores split across the evals
+/// (rounding up — a little CPU oversubscription beats idle cores), clamped to
+/// [`MAX_WORKERS_PER_EVAL`].
+fn initial_workers(cores: usize, n_jobs: usize, user: Option<u64>) -> usize {
+    match user {
+        Some(w) => (w as usize).max(1),
+        None => cores.div_ceil(n_jobs.max(1)).clamp(1, MAX_WORKERS_PER_EVAL),
     }
 }
 
@@ -963,9 +856,15 @@ pub fn changed_tests(
     diff(&rows(base), &rows(head))
 }
 
-/// Ensure every `(commit, system)` pair has a cached eval file, computing the
-/// misses concurrently under a RAM-slot budget (see [`eval_plan`]) — no
-/// oversubscription, no killing in-flight work.
+/// Ensure every `(commit, system)` pair has a cached eval file. The misses all
+/// run concurrently, each starting at the cores-split width
+/// ([`initial_workers`]); RAM is deliberately *not* planned for. Instead,
+/// **recover**: an eval that aborts fatally (in practice a worker OOM-killed
+/// when the widths oversubscribe RAM) is retried at half its width, halving
+/// down to one worker — the integrity gate in [`stream_jobs`] is the detector,
+/// and per-eval persistence means a retry re-pays only the eval that died,
+/// never its finished siblings. See DESIGN §6 for why this replaced planning
+/// from a measured RAM budget.
 pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     for (i, (commit, system)) in pairs.iter().enumerate() {
@@ -977,36 +876,40 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         return Ok(());
     }
 
-    let plan = eval_plan(todo.len(), opts);
-    let sem = Semaphore::new(plan.concurrency);
+    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let width = initial_workers(cores, todo.len(), opts.workers);
     let mp = MultiProgress::new();
-    // Print through the MultiProgress so this shares indicatif's stderr surface
-    // and terminal handling (drawn above the bars on a TTY, hidden otherwise)
-    // rather than a bare eprintln! that would bypass and tear the progress bars.
-    let _ = mp.println(format!(
-        "  eval plan: {} job(s), budget {}MB / {}MB per worker = {} slot(s) \
-         -> {} concurrent x {} worker(s)",
-        todo.len(),
-        plan.budget_mb,
-        plan.per_worker_mb,
-        plan.slots,
-        plan.concurrency,
-        plan.workers,
-    ));
     thread::scope(|s| -> Result<()> {
         let mut handles = Vec::new();
         for &i in &todo {
             let (commit, system) = (&pairs[i].0, &pairs[i].1);
-            let pb = mp.add(ProgressBar::new_spinner());
-            let sem = &sem;
+            let mp = &mp;
             handles.push(s.spawn(move || -> Result<()> {
-                sem.acquire();
-                let r = run_eval_pb(repo, commit, system, plan.workers, plan.per_worker_mb, &pb);
-                sem.release();
-                // Persist as soon as this eval completes (the write is atomic):
-                // a full-set eval costs minutes, and a *sibling* eval failing —
-                // e.g. one OOM among four — must not discard finished work.
-                write_eval(&eval_path(commit, system)?, &r?)
+                let mut workers = width;
+                loop {
+                    // A fresh bar per attempt: the failed attempt's abandoned
+                    // bar stays visible above as the record of what happened.
+                    let pb = mp.add(ProgressBar::new_spinner());
+                    match run_eval_pb(repo, commit, system, workers, per_worker_mb, &pb) {
+                        // Persist immediately (the write is atomic): a sibling
+                        // eval failing later must not discard finished work.
+                        Ok(attrs) => return write_eval(&eval_path(commit, system)?, &attrs),
+                        Err(e) if workers > 1 && e.downcast_ref::<EvalAborted>().is_some() => {
+                            workers /= 2;
+                            // Through the MultiProgress so the note doesn't
+                            // tear the sibling evals' live bars.
+                            let _ = mp.println(format!(
+                                "  eval of {} ({system}) aborted — likely out of memory; \
+                                 retrying with {workers} worker(s)",
+                                &commit[..12.min(commit.len())],
+                            ));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }));
         }
         // Join everything before propagating the first error, so no result is
@@ -1289,20 +1192,14 @@ mod tests {
     }
 
     #[test]
-    fn available_mem_is_sane() {
-        // Whatever the platform, we must get a positive figure (never the 8 GiB
-        // fallback silently masking a probe bug on the CI host), and on Linux it
-        // can't exceed total RAM.
-        let avail = available_mem_mb();
-        assert!(avail > 0);
-        if let Ok(s) = fs::read_to_string("/proc/meminfo")
-            && let Some(total) = s
-                .lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse::<u64>().ok())
-        {
-            assert!(avail <= total / 1024, "available {avail} MiB > total");
-        }
+    fn initial_workers_splits_cores() {
+        // Cores split across the evals, rounded up, clamped to 1..=8.
+        assert_eq!(initial_workers(18, 2, None), 8); // ceil(18/2)=9, clamped
+        assert_eq!(initial_workers(18, 6, None), 3);
+        assert_eq!(initial_workers(4, 6, None), 1);
+        assert_eq!(initial_workers(8, 1, None), 8);
+        // --eval-workers wins verbatim (floored at 1).
+        assert_eq!(initial_workers(18, 2, Some(2)), 2);
+        assert_eq!(initial_workers(18, 2, Some(0)), 1);
     }
 }

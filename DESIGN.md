@@ -224,6 +224,23 @@ machines); IFD is still deterministic, and impurities like `currentSystem` are
 fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, once
 `npd` owns the config.
 
+**Scheduling parallel evals — recover, don't predict.** A report needs up to
+2×#systems full-set evals; they all run concurrently, each with `nix-eval-jobs`
+workers = the machine's cores split across the evals (rounded up, clamped 1–8 —
+each worker redundantly re-imports the nixpkgs spine, so width has diminishing
+returns). RAM is deliberately *not* planned for: an earlier design measured
+available RAM at launch and divided it into per-worker slots, but the snapshot
+lies (free RAM moves while a minutes-long eval runs — the plan could still
+OOM) and the slot arithmetic idled cores. Instead npd **recovers**: the
+integrity gate already detects a fatal `nix-eval-jobs` abort (in practice a
+worker OOM-killed when the widths oversubscribe RAM) and refuses the truncated
+result, and the scheduler retries *just that eval* at half its width, halving
+to a floor of one worker — the per-worker heap cap (`--worker-mem-mb`, default
+4 GiB, enforced by `nix-eval-jobs` itself) is the only memory bound. Because
+every eval persists the moment it completes, a retry re-pays only the eval
+that died, so the worst case is one wasted too-wide attempt per starved eval.
+`--eval-workers` overrides the starting width.
+
 `eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
 pure). Each attr carries its drv plus one meta bit — marked
 broken/unsupported/insecure — since meta is *not* part of the drv hash, so the
@@ -331,7 +348,7 @@ read-only rendering.
 The spine is implemented (✓).
 
 1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`), evals run
-   in parallel under a RAM-slot budget.
+   in parallel with an OOM-recovery ladder (§6).
 2. ✓ the two-way diff (base defaults to the merge-base with `master`).
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,

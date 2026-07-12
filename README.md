@@ -46,11 +46,12 @@ with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),
 `--build-broken` (build meta-blocked packages too), `--max` (everything on:
 implies `--tests` and `--build-broken`),
-`--system` (repeatable), `--nixpkgs`, and RAM-sizing knobs
-for the parallel evaluator. Under the hood: evals cached as flat per-commit files
-(diffed by a linear merge), a tiny SQLite observation log, streamed
-`nix-eval-jobs` run in parallel under a RAM budget, and one batched `nom` build
-with concurrent cache probing.
+`--system` (repeatable), `--nixpkgs`, and sizing knobs for the parallel
+evaluator (`--eval-workers`, `--worker-mem-mb`). Under the hood: evals cached
+as flat per-commit files (diffed by a streaming linear merge), a tiny SQLite
+observation log, streamed `nix-eval-jobs` run in parallel across the machine's
+cores (an eval that dies — usually a worker OOM — retries at half width), and
+one batched `nom` build with concurrent cache probing.
 
 ## Development
 
