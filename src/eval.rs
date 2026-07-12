@@ -909,8 +909,11 @@ pub fn changed_tests(
 /// from a measured RAM budget.
 pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
+    // Dedupe: `npd X X` (or repeated --system) would otherwise run the same
+    // eval twice concurrently — harmless (the write is atomic) but 2× the work.
+    let mut seen = std::collections::HashSet::new();
     for (i, (commit, system)) in pairs.iter().enumerate() {
-        if !eval_path(commit, system)?.exists() {
+        if !eval_path(commit, system)?.exists() && seen.insert((commit, system)) {
             todo.push(i);
         }
     }
