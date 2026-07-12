@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::cache;
-use crate::eval;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
@@ -212,7 +211,7 @@ fn build_outcomes(drvs: &[&str]) -> Result<HashMap<String, bool>> {
 /// For each target, consult `policy` against the observation log; then build the
 /// whole build set at once.
 pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
-    build_targets_at(&eval::db_path()?, targets, policy)
+    build_targets_at(&crate::paths::db_path()?, targets, policy)
 }
 
 /// [`build_targets`] against an explicit observation DB (separable for tests).

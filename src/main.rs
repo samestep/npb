@@ -7,7 +7,9 @@
 mod build;
 mod cache;
 mod eval;
+mod evalfile;
 mod model;
+mod paths;
 mod report;
 mod store;
 
@@ -63,7 +65,7 @@ struct Cli {
     #[arg(long)]
     max: bool,
     /// Parallel-evaluation sizing knobs; each unset flag is auto-sized from
-    /// system RAM (see `eval::eval_plan`).
+    /// the machine's cores and total RAM (see `eval::initial_workers`).
     #[command(flatten)]
     eval: eval::EvalOpts,
 }
@@ -185,7 +187,9 @@ fn cached_test_drvs(
 /// the bit flipped). The marking is a property of the *attr*, not the recipe,
 /// so the deduped target is broken only if EVERY row wanting this drv is
 /// marked: any unmarked row is a legitimate request to build it.
-fn assemble_targets(per_system_changed: &[(String, Vec<eval::ChangedAttr>)]) -> Vec<build::Target> {
+fn assemble_targets(
+    per_system_changed: &[(String, Vec<evalfile::ChangedAttr>)],
+) -> Vec<build::Target> {
     let mut targets: Vec<build::Target> = Vec::new();
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     for (sys, changed) in per_system_changed {
@@ -233,9 +237,9 @@ fn run(cli: Cli) -> Result<()> {
     // The changed set per system — each attr's drv + meta-blocked bit per side —
     // from a linear merge of the two sorted eval files. Computed once, reused
     // for build+render.
-    let mut per_system_changed: Vec<(String, Vec<eval::ChangedAttr>)> = Vec::new();
+    let mut per_system_changed: Vec<(String, Vec<evalfile::ChangedAttr>)> = Vec::new();
     for sys in &systems {
-        let changed = eval::changed_set(&base, &head, sys)?;
+        let changed = evalfile::changed_set(&base, &head, sys)?;
         per_system_changed.push((sys.clone(), changed));
     }
 
@@ -248,9 +252,9 @@ fn run(cli: Cli) -> Result<()> {
     // marked broken contributes no tests (a test drv depends on the package,
     // so building it would build the broken package) unless --build-broken.
     if tests {
-        let mut store = store::Store::open(&eval::db_path()?)?;
+        let mut store = store::Store::open(&paths::db_path()?)?;
         for (sys, changed) in per_system_changed.iter_mut() {
-            let names_on = |unbroken: fn(&eval::ChangedAttr) -> bool| -> Vec<String> {
+            let names_on = |unbroken: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
                 let mut v: Vec<String> = changed
                     .iter()
                     .filter(|c| build_broken || unbroken(c))
@@ -266,7 +270,7 @@ fn run(cli: Cli) -> Result<()> {
             let hmap = cached_test_drvs(&mut store, &repo, &head, sys, &head_names)?;
             // The same diff the full set went through, so the test rows
             // classify (regression / fixed / new / meta-only …) identically.
-            changed.extend(eval::changed_tests(&bmap, &hmap));
+            changed.extend(evalfile::changed_tests(&bmap, &hmap));
         }
     }
 
@@ -281,7 +285,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // Render from the (now-populated) log: reduce each side to a state.
-    let store = store::Store::open(&eval::db_path()?)?;
+    let store = store::Store::open(&paths::db_path()?)?;
     let mut per_system = Vec::new();
     for (sys, changed) in &per_system_changed {
         let mut entries = Vec::new();
@@ -322,8 +326,8 @@ mod tests {
         head_drv: Option<&str>,
         base_broken: bool,
         head_broken: bool,
-    ) -> eval::ChangedAttr {
-        eval::ChangedAttr {
+    ) -> evalfile::ChangedAttr {
+        evalfile::ChangedAttr {
             attr: attr.into(),
             base_drv: base_drv.map(str::to_string),
             head_drv: head_drv.map(str::to_string),
