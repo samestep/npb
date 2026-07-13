@@ -247,11 +247,16 @@ assembled into the one cached file and the partials are deleted. Small atoms
 are what make everything cheap: an abort re-pays seconds (not a whole eval),
 idle slots drain any eval's remaining shards (no straggler eval), and the
 degenerate case — a machine that fits only one worker — is just the queue at
-one slot, not a special phase. The costs: each shard job re-imports the
+one slot, not a special phase. The cost: each shard job re-imports the
 nixpkgs spine (a few seconds; single-digit percent of a shard's runtime at
-this size), and a giant single subtree (`linuxKernel`, the python package
-sets) can't be split below one top-level name, so it bounds the tail at
-roughly a minute. `--eval-slots` overrides the starting slot count.
+this size). Giant subtrees (`haskellPackages`, `linuxKernel`, the python
+package sets — ~20k attrs each) would otherwise be indivisible ~minute shards
+that bound the makespan once slots ≥ total-work/max-shard (measured 1.39× over
+the perfect-packing bound at 15 slots), so the planner splits them: attr
+counts from any prior same-system eval (nixpkgs' shape drifts slowly) flag
+oversized names, whose children are enumerated and packed recursively —
+shards are sized by estimated attrs, not name count, wherever statistics
+exist. A first-ever run has no statistics and eats the tail once. `--eval-slots` overrides the starting slot count.
 
 > Two earlier schemes are recorded for context. A *planner* divided measured
 > available RAM into per-eval worker slots — but that snapshot lies (free RAM
