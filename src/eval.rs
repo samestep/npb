@@ -428,29 +428,6 @@ impl std::fmt::Display for EvalAborted {
 
 impl std::error::Error for EvalAborted {}
 
-/// A shard that evaluated (exit 0) but produced **zero** attrs. A ~400-name
-/// slice of nixpkgs' top level always contains derivations, so an empty result
-/// means the shard did not really run — a `nix-eval-jobs` edge case, not a real
-/// answer. Caching it would drop those names from the eval permanently (evals
-/// are never re-validated, DESIGN §6), so we refuse it: retry a few times (the
-/// cause is usually transient — memory pressure on a big set), then fail the
-/// whole eval loudly rather than assemble and cache an incomplete file. This is
-/// the completeness invariant that a plain exit-code gate can't provide.
-#[derive(Debug)]
-struct EmptyShard;
-
-impl std::fmt::Display for EmptyShard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "shard evaluated to zero attrs")
-    }
-}
-
-impl std::error::Error for EmptyShard {}
-
-/// How many times to retry a shard that comes back empty before giving up and
-/// failing the eval (rather than caching an incomplete result).
-const MAX_EMPTY_SHARD_RETRIES: usize = 3;
-
 /// The memory ceiling npd plans slots from: total physical RAM, further capped
 /// by any cgroup limit the process runs under (a container, or a systemd
 /// `MemoryMax=` scope). Unlike *available* RAM (which the old planner used,
@@ -592,9 +569,6 @@ struct Shard {
     eval: usize,
     /// Range within that eval's name list.
     names: std::ops::Range<usize>,
-    /// How many times this shard has come back empty (see [`EmptyShard`]); it's
-    /// requeued up to [`MAX_EMPTY_SHARD_RETRIES`] before the eval fails.
-    empty_attempts: usize,
 }
 
 /// Ensure every `(commit, system)` pair has a cached eval file, via **one
@@ -659,7 +633,6 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
             queue.push_back(Shard {
                 eval: idx,
                 names: s..e,
-                empty_attempts: 0,
             });
             shards_total += 1;
             s = e;
@@ -801,7 +774,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                             None
                         }
                     };
-                    let Some(mut shard) = shard else {
+                    let Some(shard) = shard else {
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     };
@@ -810,12 +783,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
 
                     let step = || -> Result<()> {
                         let ppath = partial_path(ev.commit, ev.system, names)?;
-                        // Distrust an *empty* partial: a real shard is never empty
-                        // (see `EmptyShard`), so treat one as absent and re-run —
-                        // this self-heals a partial an older run may have left.
-                        let cached =
-                            crate::evalfile::read_partial(&ppath)?.filter(|r| !r.is_empty());
-                        let rows = match cached {
+                        let rows = match crate::evalfile::read_partial(&ppath)? {
                             // Resumed from a prior run: the streamer's per-attr
                             // callback never fires, so credit the attrs here —
                             // otherwise a resumed eval's count trails its shards.
@@ -835,12 +803,6 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                                         ev.attrs_done.fetch_add(1, Ordering::Relaxed);
                                     },
                                 )?;
-                                // A zero-attr result means the shard didn't really
-                                // run — refuse it so we never persist or assemble an
-                                // incomplete eval (the scheduler retries it).
-                                if rows.is_empty() {
-                                    bail!(EmptyShard);
-                                }
                                 // Best-effort: a failed persist only costs the
                                 // ability to resume this shard later.
                                 let _ = crate::evalfile::write_partial(&ppath, &rows);
@@ -885,34 +847,6 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                                 ev.label,
                             ));
                             q.lock().unwrap().queue.push_back(shard);
-                        }
-                        Err(e) if e.downcast_ref::<EmptyShard>().is_some() => {
-                            // A real shard is never empty, so this is a
-                            // nix-eval-jobs miss, not an answer. Retry (the cause
-                            // is usually transient); give up loudly rather than
-                            // cache an incomplete eval if it persists.
-                            shard.empty_attempts += 1;
-                            let first = names.first().map(String::as_str).unwrap_or("?");
-                            let last = names.last().map(String::as_str).unwrap_or("?");
-                            if shard.empty_attempts >= MAX_EMPTY_SHARD_RETRIES {
-                                let mut g = q.lock().unwrap();
-                                if g.fatal.is_none() {
-                                    g.fatal = Some(e.context(format!(
-                                        "shard [{first}..{last}] of {} evaluated to zero \
-                                         attrs {MAX_EMPTY_SHARD_RETRIES} times; refusing to \
-                                         cache an incomplete eval",
-                                        ev.label,
-                                    )));
-                                }
-                            } else {
-                                display.lock().unwrap().print_above(&format!(
-                                    "  a shard of {} [{first}..{last}] came back empty; \
-                                     retrying ({}/{MAX_EMPTY_SHARD_RETRIES})",
-                                    ev.label, shard.empty_attempts,
-                                ));
-                                thread::sleep(Duration::from_millis(200));
-                                q.lock().unwrap().queue.push_back(shard);
-                            }
                         }
                         Err(e) => {
                             let mut g = q.lock().unwrap();
