@@ -215,6 +215,71 @@ pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
 }
 
 /// [`build_targets`] against an explicit observation DB (separable for tests).
+/// Probe the substituter for every target the log knows nothing about and
+/// record a `Cache`/`Built` observation per hit — the fact-gathering half of
+/// the decision phase, separable so its HTTP round trips can run early
+/// ([`preprobe`]) and hide behind whatever else is still going on.
+///
+/// We only probe drvs with *no fact*: a probe can only change the decision
+/// there. A drv with any local observation is already decided (built → skip;
+/// failed/blocked → skip-fail, since a local failure outranks cache presence
+/// anyway), and a recorded cache hit is decided too. This is what keeps a
+/// re-run of an unchanged report near-instant: we don't re-probe (HTTP +
+/// `nix-store`) the failures every time. Probes run concurrently
+/// (`cache::in_cache_many`), and under --recheck/--prefer-local (which force
+/// genuine local builds) not at all. Idempotent: recorded facts make the next
+/// call a no-op.
+fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -> Result<()> {
+    if policy.recheck || policy.prefer_local {
+        return Ok(());
+    }
+    let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
+    let obs_by_drv = store.load_observations_many(&drv_refs)?;
+    let has_fact = |drv: &str| {
+        obs_by_drv.get(drv).is_some_and(|obs| {
+            obs.iter().any(|o| {
+                o.source == Source::Local
+                    || (o.source == Source::Cache && o.outcome == Outcome::Built)
+            })
+        })
+    };
+    // A broken target the policy will skip anyway isn't worth an HTTP probe.
+    let skipped_broken = |t: &Target| t.broken && !policy.build_broken;
+    let mut to_probe: Vec<String> = Vec::new();
+    let mut system_of: HashMap<&str, &str> = HashMap::new();
+    let mut seen = HashSet::new();
+    for t in targets {
+        if !has_fact(&t.drv_path) && !skipped_broken(t) && seen.insert(t.drv_path.clone()) {
+            to_probe.push(t.drv_path.clone());
+            system_of.insert(t.drv_path.as_str(), t.system.as_str());
+        }
+    }
+    let probed = cache::in_cache_many(&to_probe);
+    let now = unix_now();
+    for drv in &to_probe {
+        if probed.get(drv).copied().unwrap_or(false) {
+            store.add_observation(&Observation {
+                drv_path: drv.clone(),
+                source: Source::Cache,
+                outcome: Outcome::Built,
+                when: now,
+                system: system_of.get(drv.as_str()).map(|s| s.to_string()),
+                duration_s: None,
+                machine: None,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Run [`probe_new_facts`] for a target set ahead of the build phase — called
+/// per system as soon as its evals land, so the substituter round trips
+/// overlap the remaining evals instead of serializing after them.
+pub fn preprobe(targets: &[Target], policy: BuildPolicy) -> Result<()> {
+    let mut store = Store::open(&crate::paths::db_path()?)?;
+    probe_new_facts(&mut store, targets, policy)
+}
+
 fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
     let mut store = Store::open(db)?;
     let host = hostname();
@@ -222,8 +287,10 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // (substitutable) output means we needn't build at all.
     let force = policy.recheck || policy.prefer_local;
 
-    // One SQLite round-trip for every target's history, rather than one query
-    // each — so an all-known set costs a single query, not N.
+    // Gather any missing cache facts (usually a no-op: `preprobe` already ran
+    // per system while evals were still finishing), then load every target's
+    // history in one SQLite round-trip — an all-known set costs a single query.
+    probe_new_facts(&mut store, targets, policy)?;
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
     let obs_of = |drv: &str| obs_by_drv.get(drv).map(Vec::as_slice).unwrap_or(&[]);
@@ -233,60 +300,15 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .iter()
             .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built)
     };
-    let local_built = |drv: &str| {
-        obs_of(drv)
-            .iter()
-            .any(|o| o.source == Source::Local && o.outcome == Outcome::Built)
-    };
-    // We only probe the cache for drvs we have *no fact* about — a probe can only
-    // change the decision there. A drv with any local observation is already
-    // decided (built → skip; failed/blocked → skip-fail, since a local failure
-    // outranks cache presence anyway), and a recorded cache hit is decided too.
-    // This is what keeps a re-run of an unchanged report near-instant: we don't
-    // re-probe (HTTP + `nix-store`) the failures every time. Probes that do run
-    // run concurrently (see `cache::in_cache_many`).
-    let has_fact =
-        |drv: &str| obs_of(drv).iter().any(|o| o.source == Source::Local) || cache_built(drv);
-    // A broken target the policy will skip anyway isn't worth an HTTP probe.
-    let skipped_broken = |t: &Target| t.broken && !policy.build_broken;
-    let mut to_probe: Vec<String> = Vec::new();
-    if !force {
-        let mut seen = HashSet::new();
-        for t in targets {
-            if !has_fact(&t.drv_path) && !skipped_broken(t) && seen.insert(t.drv_path.clone()) {
-                to_probe.push(t.drv_path.clone());
-            }
-        }
-    }
-    let probed = cache::in_cache_many(&to_probe);
-    let substitutable =
-        |drv: &str| !force && (cache_built(drv) || probed.get(drv).copied().unwrap_or(false));
+    let substitutable = |drv: &str| !force && cache_built(drv);
 
-    // Pass 1: decide per target. Skips are silent — a fully-cached run must print
-    // nothing.
-    let now = unix_now();
+    // Pass 1: decide per target, purely from the (just-refreshed) log. Skips
+    // are silent — a fully-cached run must print nothing.
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
-        let sub = substitutable(&t.drv_path);
-        match policy.decide(observations, sub, t.broken) {
-            Decision::Build => to_build.push(i),
-            // Substitutable but not built here: record a Cache fact (deduped) so
-            // the report reflects it and a re-run needn't probe the cache again.
-            Decision::SkipOk => {
-                if sub && !local_built(&t.drv_path) && !cache_built(&t.drv_path) {
-                    store.add_observation(&Observation {
-                        drv_path: t.drv_path.clone(),
-                        source: Source::Cache,
-                        outcome: Outcome::Built,
-                        when: now,
-                        system: Some(t.system.clone()),
-                        duration_s: None,
-                        machine: None,
-                    })?;
-                }
-            }
-            Decision::SkipFail | Decision::SkipBroken => {}
+        if policy.decide(observations, substitutable(&t.drv_path), t.broken) == Decision::Build {
+            to_build.push(i);
         }
     }
 
