@@ -47,11 +47,12 @@ with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
 `--build-broken` (build meta-blocked packages too), `--max` (everything on:
 implies `--tests` and `--build-broken`),
 `--system` (repeatable), `--nixpkgs`, and sizing knobs for the parallel
-evaluator (`--eval-workers`, `--worker-mem-mb`). Under the hood: evals cached
+evaluator (`--eval-slots`, `--worker-mem-mb`). Under the hood: evals cached
 as flat per-commit files (diffed by a streaming linear merge), a tiny SQLite
-observation log, streamed `nix-eval-jobs` run in parallel across the machine's
-cores (an eval that dies — usually a worker OOM — retries at half width), and
-one batched `nom` build with concurrent cache probing.
+observation log, evaluation as one queue of `nix-eval-jobs` shard jobs
+(a shard that dies — usually a worker OOM — just requeues while the slot
+count backs off; interrupted evals resume at shard granularity), and one
+batched `nom` build with concurrent cache probing.
 
 ## Development
 

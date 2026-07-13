@@ -64,8 +64,8 @@ struct Cli {
     /// Everything on: implies --tests and --build-broken.
     #[arg(long)]
     max: bool,
-    /// Parallel-evaluation sizing knobs; each unset flag is auto-sized from
-    /// the machine's cores and total RAM (see `eval::initial_workers`).
+    /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
+    /// cores and total RAM (see `eval::eval_slots`).
     #[command(flatten)]
     eval: eval::EvalOpts,
 }

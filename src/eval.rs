@@ -11,12 +11,14 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
@@ -100,38 +102,29 @@ fn build_expr(repo: &Path, commit: &str, system: &str) -> String {
     )
 }
 
-/// Run one `nix-eval-jobs` invocation with `workers` worker processes, each
-/// heap-capped at `per_worker_mb` (nix-eval-jobs restarts a worker that exceeds
-/// it, so total memory ≈ `workers * per_worker_mb`). Progress is streamed onto
-/// the caller-supplied `pb`, letting several evals share one MultiProgress.
-fn run_eval_pb(
-    repo: &Path,
-    commit: &str,
-    system: &str,
-    workers: usize,
-    per_worker_mb: u64,
-    pb: &ProgressBar,
-) -> Result<Vec<AttrEval>> {
-    let expr = build_expr(repo, commit, system);
-    let short: String = commit.chars().take(12).collect();
-    let label = format!("{short} ({system}, {workers}w)");
-    stream_jobs(&expr, workers, per_worker_mb, pb, &label, raw_to_attr_eval)
+/// Scrub the evaluator's environment of the variables nixpkgs is known to
+/// leak into derivations via `builtins.getEnv` (drbd bakes `$SHELL` into its
+/// Makefile patch), so cached evals don't depend on the shell npd was launched
+/// from — `getEnv` then returns `""`, matching a hermetic evaluation.
+fn scrub_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("SHELL");
+    cmd
 }
 
 /// Run one `nix-eval-jobs --expr <expr>` (with `workers` workers each capped at
-/// `per_worker_mb`), streaming its NDJSON stdout through `map_job` into
-/// `AttrEval`s and rendering progress onto `pb`. `label` names the run in the
-/// progress bar and the integrity-gate error. Shared by the cached full-set eval
-/// (`map_job` → [`AttrEval`], keyed on `attr`) and the targeted test eval
+/// `per_worker_mb`), streaming its NDJSON stdout through `map_job` into a vec.
+/// `on_item` fires per streamed job so callers can render progress however they
+/// like; `label` names the run in the integrity-gate error. Shared by the
+/// sharded full-set eval (`map_job` → [`AttrEval`]) and the targeted test eval
 /// (`map_job` → [`TestJob`], relabelled from `attrPath`) — both stream the same
 /// job shape and want the same truncation gate, so it's generic over the output.
 fn stream_jobs<T>(
     expr: &str,
     workers: usize,
     per_worker_mb: u64,
-    pb: &ProgressBar,
     label: &str,
     map_job: impl Fn(RawJob) -> T,
+    mut on_item: impl FnMut(),
 ) -> Result<Vec<T>> {
     // nix-eval-jobs prints a full Nix traceback per errored attr (megabytes over a
     // whole package set), and the actionable per-attr error is already in the
@@ -158,20 +151,19 @@ fn stream_jobs<T>(
     } else {
         per_worker_mb
     };
-    let mut child = Command::new("nix-eval-jobs")
-        .args([
-            "--meta",
-            "--workers",
-            &workers.to_string(),
-            "--max-memory-size",
-            &max_memory_size.to_string(),
-            "--expr",
-            expr,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
+    let mut child = scrub_env(Command::new("nix-eval-jobs").args([
+        "--meta",
+        "--workers",
+        &workers.to_string(),
+        "--max-memory-size",
+        &max_memory_size.to_string(),
+        "--expr",
+        expr,
+    ]))
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let stderr_tail = thread::spawn(move || {
@@ -186,17 +178,6 @@ fn stream_jobs<T>(
         ring.into_iter().collect::<Vec<_>>().join("\n")
     });
 
-    // A full-set eval takes minutes (and is pathologically slow on macOS — see
-    // DESIGN); show a live elapsed timer next to the attr counter (like `nom`'s
-    // build timer) so a slow eval reads as "still working", not "hung". The
-    // `{elapsed}` field is re-rendered on every steady tick, so it ticks even
-    // between attrs; the counter updates as attrs stream in.
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} ⏱ {elapsed} {msg}").expect("valid template"),
-    );
-    pb.reset_elapsed();
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_message(format!("evaluating {label}"));
     let mut attrs = Vec::new();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>()
     {
@@ -209,11 +190,10 @@ fn stream_jobs<T>(
                 // EOF) before surfacing the parse error.
                 let _ = child.kill();
                 let _ = child.wait();
-                pb.abandon_with_message(format!("eval of {label} failed"));
                 return Err(e);
             }
         }
-        pb.set_message(format!("evaluating {label} — {} attrs", attrs.len()));
+        on_item();
     }
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
@@ -226,9 +206,8 @@ fn stream_jobs<T>(
     // the streamed output is silently TRUNCATED — we got some attrs but not
     // all. Caching that would poison every future diff/report with phantom
     // "removed" packages, so we refuse it outright rather than trust a partial.
-    // The [`EvalAborted`] marker is what lets the scheduler retry narrower.
+    // The [`EvalAborted`] marker is what lets the scheduler requeue the shard.
     if !status.success() {
-        pb.abandon_with_message(format!("eval of {label} failed (truncated)"));
         return Err(anyhow::Error::new(EvalAborted).context(format!(
             "nix-eval-jobs did not finish evaluating {label}: it exited \
              {status} after streaming {} attr(s), so the result is truncated and \
@@ -238,9 +217,6 @@ fn stream_jobs<T>(
             stderr_tail,
         )));
     }
-    // Declare success only after the integrity gate: a truncated eval must not
-    // flash an "evaluated …" line before the error.
-    pb.finish_with_message(format!("evaluated {label} — {} attrs", attrs.len()));
     Ok(attrs)
 }
 
@@ -358,6 +334,11 @@ pub fn eval_tests(
     let short: String = commit.chars().take(12).collect();
     let label = format!("tests {short} ({system})");
     let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} ⏱ {elapsed} {msg}").expect("valid template"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message(format!("evaluating {label}"));
     // Label and split from `attrPath` (unquoted elements) rather than `attr`
     // (which nix-eval-jobs quotes for the dotted package component, e.g.
     // `"python3Packages.requests".tests.foo`): element 0 is the package we asked
@@ -374,30 +355,33 @@ pub fn eval_tests(
             broken,
         }
     };
-    let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &pb, &label, map);
+    let mut n = 0usize;
+    let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &label, map, || {
+        n += 1;
+        pb.set_message(format!("evaluating {label} — {n} tests"));
+    });
     pb.finish_and_clear();
     r
 }
 
-// --- concurrency: recover, don't predict (DESIGN §6) -------------------------
+// --- scheduling: one queue of shards (DESIGN §6) ------------------------------
 
 /// Default per-worker heap cap (matches nix-eval-jobs' own 4 GiB default).
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
-/// A single eval sees diminishing returns past this many workers (each worker
-/// redundantly re-evaluates the package-set spine), so cap the auto-derived
-/// width here even when the cores split could afford more.
-const MAX_WORKERS_PER_EVAL: usize = 8;
 
-/// Optional overrides for the parallel-eval sizing. `None` means "auto": the
-/// width comes from splitting the machine's cores *and total RAM* across the
-/// evals (see [`initial_workers`]); the dynamic part of RAM is not planned
-/// for — an eval that dies is retried narrower instead ([`eval_pairs`]).
+/// Top-level attr names per shard. Larger shards amortize the per-job nixpkgs
+/// import (a few seconds each); smaller ones requeue more cheaply and balance
+/// better. At ~400 names a typical shard runs tens of seconds at one worker,
+/// putting the import tax in the single-digit percent range (measured).
+const NAMES_PER_SHARD: usize = 400;
+
+/// Optional overrides for the eval scheduler; `None` = auto from the machine's
+/// invariants (see [`eval_slots`]).
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub struct EvalOpts {
-    /// `nix-eval-jobs` workers per evaluation (default: the machine's cores
-    /// and total RAM split across the evals, clamped 1–8).
-    #[arg(long = "eval-workers")]
-    pub workers: Option<u64>,
+    /// Concurrent shard evaluations (default: min(cores, total RAM / worker cap)).
+    #[arg(long = "eval-slots")]
+    pub slots: Option<u64>,
     /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
     #[arg(long)]
     pub worker_mem_mb: Option<u64>,
@@ -405,7 +389,7 @@ pub struct EvalOpts {
 
 /// A fatal `nix-eval-jobs` abort (non-zero exit): the streamed output was
 /// truncated and discarded. A marker type so the scheduler can recognize it
-/// through the anyhow chain and retry that eval with fewer workers.
+/// through the anyhow chain and requeue the shard at reduced concurrency.
 #[derive(Debug)]
 struct EvalAborted;
 
@@ -445,44 +429,94 @@ fn total_mem_mb() -> u64 {
         .unwrap_or(8192)
 }
 
-/// The starting width for each of `n_jobs` concurrent evals: the user's
-/// `--eval-workers` if given, else the machine's cores split across the evals
-/// (rounding up — a little CPU oversubscription beats idle cores), **bounded
-/// so the batch's worst case fits in total RAM** (every worker at its heap
-/// cap), clamped to [`MAX_WORKERS_PER_EVAL`].
-///
-/// The RAM bound plans only from invariants (total RAM, the cap) — the
-/// recovery ladder in [`eval_pairs`] still covers the dynamic part. Without
-/// it, a wide first attempt on a small-RAM machine starts a *global* OOM
-/// hunt, and the kernel's victim is not always a worker (it can be npd, or an
-/// unrelated process), in which case the ladder's detector never fires.
-fn initial_workers(
-    cores: usize,
-    mem_mb: u64,
-    per_worker_mb: u64,
-    n_jobs: usize,
-    user: Option<u64>,
-) -> usize {
-    if let Some(w) = user {
-        return (w as usize).max(1);
+/// The number of concurrent shard jobs to start with: the user's
+/// `--eval-slots` if given, else bounded by the machine's *invariants* — one
+/// worker per slot, so cores, and total RAM divided by the per-worker heap
+/// cap. The dynamic part of RAM is handled by feedback, not planning: the
+/// queue sheds slots when a shard is OOM-killed ([`eval_pairs`]).
+fn eval_slots(cores: usize, mem_mb: u64, per_worker_mb: u64, user: Option<u64>) -> usize {
+    match user {
+        Some(s) => (s as usize).max(1),
+        None => cores.min((mem_mb / per_worker_mb.max(1)).max(1) as usize),
     }
-    let n = n_jobs.max(1);
-    let by_cpu = cores.div_ceil(n);
-    let slots = (mem_mb / per_worker_mb.max(1)).max(1) as usize;
-    let by_ram = (slots / n).max(1);
-    by_cpu.min(by_ram).clamp(1, MAX_WORKERS_PER_EVAL)
 }
 
-/// Ensure every `(commit, system)` pair has a cached eval file. The misses all
-/// run concurrently, each starting at the cores-split width
-/// ([`initial_workers`]); RAM is deliberately *not* planned for. Instead,
-/// **recover**: an eval that aborts fatally (in practice a worker OOM-killed
-/// when the widths oversubscribe RAM) is retried at half its width, halving
-/// down to one worker — the integrity gate in [`stream_jobs`] is the detector,
-/// and per-eval persistence means a retry re-pays only the eval that died,
-/// never its finished siblings. An eval still aborting at one worker is
-/// deferred and re-run *alone* after the rest finish (the concurrency rung).
-/// See DESIGN §6 for why this replaced planning from a measured RAM budget.
+/// The top-level attr names of the package set at `(commit, system)` — the
+/// space the shards partition. Cheap (well under a second warm): forcing
+/// `attrNames` touches no derivations. The literal `recurseForDerivations`
+/// key is dropped to mirror how `nix-eval-jobs` skips it when walking a set.
+fn enumerate_names(repo: &Path, commit: &str, system: &str) -> Result<Vec<String>> {
+    let expr = format!("builtins.attrNames ({})", build_expr(repo, commit, system));
+    let out = scrub_env(
+        Command::new("nix-instantiate").args(["--eval", "--strict", "--json", "-E", &expr]),
+    )
+    .output()
+    .context("running nix-instantiate (attr names)")?;
+    if !out.status.success() {
+        bail!(
+            "enumerating top-level attrs of {commit} ({system}) failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let mut names: Vec<String> =
+        serde_json::from_slice(&out.stdout).context("parsing attr names")?;
+    names.retain(|n| n != "recurseForDerivations");
+    Ok(names)
+}
+
+/// The eval expression for one shard: the same import as the whole-set walk,
+/// narrowed to `names` via `listToAttrs`. Each value stays a thunk forced
+/// per-attr in the worker, so walk semantics and error isolation match the
+/// monolithic root exactly — validated byte-for-byte against a whole-set eval
+/// (DESIGN §6).
+fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> String {
+    let list: String = names
+        .iter()
+        .map(|n| format!("\"{}\" ", nix_escape(n)))
+        .collect();
+    format!(
+        "let pkgs = {}; in builtins.listToAttrs \
+         (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
+        build_expr(repo, commit, system)
+    )
+}
+
+/// Where one shard's completed rows persist until its whole eval is assembled
+/// (then the eval's `partial/` dir is deleted). Content-addressed by the
+/// shard's names, so a change in sharding layout simply misses rather than
+/// resuming from the wrong rows. This is what makes an interrupted (^C, OOM,
+/// crash) eval resumable: only unfinished shards re-run.
+fn partial_path(commit: &str, system: &str, names: &[String]) -> Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    names.hash(&mut h);
+    Ok(crate::paths::cache_root()?
+        .join("evals")
+        .join("partial")
+        .join(format!(
+            "{commit}-{system}-v{}",
+            crate::evalfile::EVAL_VERSION
+        ))
+        .join(format!("{:016x}.tsv", h.finish())))
+}
+
+/// One unit of work: a slice of one eval's top-level names.
+struct Shard {
+    /// Index into the per-eval state vec.
+    eval: usize,
+    /// Range within that eval's name list.
+    names: std::ops::Range<usize>,
+}
+
+/// Ensure every `(commit, system)` pair has a cached eval file, via **one
+/// global queue of shards** (DESIGN §6): each eval's top-level names are
+/// split into [`NAMES_PER_SHARD`] slices, and every shard is an independent
+/// one-worker `nix-eval-jobs` job. [`eval_slots`] jobs run at once; a shard
+/// that aborts (in practice a worker OOM-kill) is simply requeued while the
+/// slot count backs off multiplicatively — and creeps back up on sustained
+/// success (AIMD). Completed shards persist immediately ([`partial_path`]),
+/// so any interruption resumes at shard granularity; when an eval's last
+/// shard lands, its rows are assembled and written as the one cached file.
 pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     // Dedupe: `npd X X` (or repeated --system) would otherwise run the same
@@ -501,111 +535,187 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let mem_mb = total_mem_mb();
-    let width = initial_workers(cores, mem_mb, per_worker_mb, todo.len(), opts.workers);
+    let slots = eval_slots(cores, total_mem_mb(), per_worker_mb, opts.slots);
     let mp = MultiProgress::new();
 
-    // Phase 1: every miss concurrently, each down its own width ladder. An
-    // eval that aborts even at one worker isn't necessarily infeasible — its
-    // *siblings* may be what's eating the RAM — so it's deferred, not failed.
-    let deferred = thread::scope(|s| -> Result<Vec<usize>> {
-        let mut handles = Vec::new();
-        for &i in &todo {
-            let (commit, system) = (&pairs[i].0, &pairs[i].1);
-            let mp = &mp;
-            handles.push(s.spawn(move || -> Result<Option<usize>> {
-                match run_ladder(repo, commit, system, width, per_worker_mb, mp)? {
-                    LadderEnd::Done => Ok(None),
-                    LadderEnd::Exhausted(_) => {
-                        let _ = mp.println(format!(
-                            "  eval of {} ({system}) aborts even with one worker; \
-                             deferring it until the other evals finish",
-                            &commit[..12.min(commit.len())],
-                        ));
-                        Ok(Some(i))
-                    }
-                }
-            }));
-        }
-        // Join everything before propagating the first error, so no result is
-        // dropped mid-write and every progress bar reaches a final state.
-        let mut deferred = Vec::new();
-        let mut result = Ok(());
-        for h in handles {
-            match h.join().expect("eval thread panicked") {
-                Ok(Some(i)) => deferred.push(i),
-                Ok(None) => {}
-                Err(e) => {
-                    if result.is_ok() {
-                        result = Err(e);
-                    }
-                }
-            }
-        }
-        result.map(|()| deferred)
-    })?;
-
-    // Phase 2 — the concurrency rung: the deferred evals get the machine to
-    // themselves, one at a time, re-laddering from the single-job width. This
-    // extends the ladder's reach to full serialization, the winning strategy
-    // when RAM per *concurrent eval* (not per worker) is the binding
-    // constraint. Only an eval that aborts at one worker, alone, is a real
-    // failure.
-    for &i in &deferred {
-        let (commit, system) = (&pairs[i].0, &pairs[i].1);
-        let solo = initial_workers(cores, mem_mb, per_worker_mb, 1, opts.workers);
-        match run_ladder(repo, commit, system, solo, per_worker_mb, &mp)? {
-            LadderEnd::Done => {}
-            LadderEnd::Exhausted(e) => return Err(e),
-        }
+    /// Per-eval bookkeeping shared by the queue workers.
+    struct Eval<'a> {
+        commit: &'a str,
+        system: &'a str,
+        label: String,
+        names: Vec<String>,
+        shards_total: usize,
+        shards_done: AtomicUsize,
+        attrs_done: AtomicUsize,
+        rows: Mutex<Vec<AttrEval>>,
+        pb: ProgressBar,
     }
-    Ok(())
-}
 
-/// How one trip down [`run_ladder`] ended: the eval persisted, or it kept
-/// aborting all the way down to one worker (the final abort attached).
-enum LadderEnd {
-    Done,
-    Exhausted(anyhow::Error),
-}
-
-/// Run one eval down the halving ladder, from `width` workers to 1, persisting
-/// on success. Aborts (see [`EvalAborted`]) halve the width; other errors
-/// propagate immediately.
-fn run_ladder(
-    repo: &Path,
-    commit: &str,
-    system: &str,
-    mut width: usize,
-    per_worker_mb: u64,
-    mp: &MultiProgress,
-) -> Result<LadderEnd> {
-    loop {
-        // A fresh bar per attempt: the failed attempt's abandoned bar stays
-        // visible above as the record of what happened.
-        let pb = mp.add(ProgressBar::new_spinner());
-        match run_eval_pb(repo, commit, system, width, per_worker_mb, &pb) {
-            // Persist immediately (the write is atomic): a sibling eval
-            // failing later must not discard finished work.
-            Ok(attrs) => {
-                write_eval(&eval_path(commit, system)?, &attrs)?;
-                return Ok(LadderEnd::Done);
-            }
-            Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
-                if width == 1 {
-                    return Ok(LadderEnd::Exhausted(e));
-                }
-                width /= 2;
-                // Through the MultiProgress so the note doesn't tear the
-                // sibling evals' live bars.
-                let _ = mp.println(format!(
-                    "  eval of {} ({system}) aborted — likely out of memory; \
-                     retrying with {width} worker(s)",
-                    &commit[..12.min(commit.len())],
-                ));
-            }
-            Err(e) => return Err(e),
+    let mut evals: Vec<Eval> = Vec::new();
+    let mut queue: VecDeque<Shard> = VecDeque::new();
+    for &i in &todo {
+        let (commit, system) = (&pairs[i].0, &pairs[i].1);
+        let names = enumerate_names(repo, commit, system)?;
+        let idx = evals.len();
+        let mut shards_total = 0;
+        let mut s = 0;
+        while s < names.len() {
+            let e = (s + NAMES_PER_SHARD).min(names.len());
+            queue.push_back(Shard {
+                eval: idx,
+                names: s..e,
+            });
+            shards_total += 1;
+            s = e;
         }
+        let short: String = commit.chars().take(12).collect();
+        let pb = mp.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} ⏱ {elapsed} {msg}")
+                .expect("valid template"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_message(format!("evaluating {short} ({system})"));
+        evals.push(Eval {
+            commit,
+            system,
+            label: format!("{short} ({system})"),
+            names,
+            shards_total,
+            shards_done: AtomicUsize::new(0),
+            attrs_done: AtomicUsize::new(0),
+            rows: Mutex::new(Vec::new()),
+            pb,
+        });
+    }
+
+    struct Q {
+        queue: VecDeque<Shard>,
+        /// Shards not yet completed (queued or running); requeues don't count
+        /// down, so workers only exit when everything truly finished (or on a
+        /// fatal error).
+        outstanding: usize,
+        fatal: Option<anyhow::Error>,
+    }
+    let q = Mutex::new(Q {
+        outstanding: queue.len(),
+        queue,
+        fatal: None,
+    });
+    // AIMD over the slot count: halve on an abort (multiplicative decrease),
+    // +1 back toward the starting value per few clean shards (additive
+    // increase) — titrating concurrency against whatever RAM is really
+    // available right now instead of measuring it.
+    let target = AtomicUsize::new(slots);
+    let successes = AtomicUsize::new(0);
+
+    thread::scope(|s| {
+        for w in 0..slots {
+            let (q, target, successes, evals, mp) = (&q, &target, &successes, &evals, &mp);
+            s.spawn(move || {
+                loop {
+                    let shard = {
+                        let mut g = q.lock().unwrap();
+                        if g.fatal.is_some() || g.outstanding == 0 {
+                            return;
+                        }
+                        // Parked slots (w >= target) and an empty-but-not-done
+                        // queue both just wait: an aborted shard may requeue.
+                        if w < target.load(Ordering::Relaxed) {
+                            g.queue.pop_front()
+                        } else {
+                            None
+                        }
+                    };
+                    let Some(shard) = shard else {
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    };
+                    let ev = &evals[shard.eval];
+                    let names = &ev.names[shard.names.clone()];
+
+                    let step = || -> Result<()> {
+                        let ppath = partial_path(ev.commit, ev.system, names)?;
+                        let rows = match crate::evalfile::read_partial(&ppath)? {
+                            Some(rows) => rows, // resumed from a prior run
+                            None => {
+                                let expr = shard_expr(repo, ev.commit, ev.system, names);
+                                let rows = stream_jobs(
+                                    &expr,
+                                    1,
+                                    per_worker_mb,
+                                    &ev.label,
+                                    raw_to_attr_eval,
+                                    || {
+                                        let n = ev.attrs_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                        ev.pb.set_message(format!(
+                                            "evaluating {} — {} attrs, {}/{} shards",
+                                            ev.label,
+                                            n,
+                                            ev.shards_done.load(Ordering::Relaxed),
+                                            ev.shards_total,
+                                        ));
+                                    },
+                                )?;
+                                // Best-effort: a failed persist only costs the
+                                // ability to resume this shard later.
+                                let _ = crate::evalfile::write_partial(&ppath, &rows);
+                                rows
+                            }
+                        };
+                        ev.rows.lock().unwrap().extend(rows);
+                        let done = ev.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == ev.shards_total {
+                            let rows = std::mem::take(&mut *ev.rows.lock().unwrap());
+                            write_eval(&eval_path(ev.commit, ev.system)?, &rows)?;
+                            if let Some(dir) = ppath.parent() {
+                                let _ = fs::remove_dir_all(dir);
+                            }
+                            ev.pb.finish_with_message(format!(
+                                "evaluated {} — {} attrs",
+                                ev.label,
+                                rows.len()
+                            ));
+                        }
+                        Ok(())
+                    };
+
+                    match step() {
+                        Ok(()) => {
+                            q.lock().unwrap().outstanding -= 1;
+                            let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
+                            let t = target.load(Ordering::Relaxed);
+                            if n % 4 == 0 && t < slots {
+                                target.store(t + 1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
+                            let t = target.load(Ordering::Relaxed);
+                            let nt = (t / 2).max(1);
+                            target.store(nt, Ordering::Relaxed);
+                            successes.store(0, Ordering::Relaxed);
+                            let _ = mp.println(format!(
+                                "  a shard of {} aborted — likely out of memory; \
+                                 requeued, slots {t} -> {nt}",
+                                ev.label,
+                            ));
+                            q.lock().unwrap().queue.push_back(shard);
+                        }
+                        Err(e) => {
+                            let mut g = q.lock().unwrap();
+                            if g.fatal.is_none() {
+                                g.fatal = Some(e);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    match q.into_inner().unwrap().fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -683,19 +793,30 @@ mod tests {
     }
 
     #[test]
-    fn initial_workers_splits_cores_and_ram() {
+    fn eval_slots_from_invariants() {
         const G: u64 = 1024;
-        // Plenty of RAM: the cores split governs (rounded up, clamped 1..=8).
-        assert_eq!(initial_workers(18, 256 * G, 4 * G, 2, None), 8); // ceil(18/2)=9→8
-        assert_eq!(initial_workers(18, 256 * G, 4 * G, 6, None), 3);
-        assert_eq!(initial_workers(4, 256 * G, 4 * G, 6, None), 1);
-        // RAM-bound: total/(cap×jobs) governs — 31 GiB, 4 GiB caps.
-        assert_eq!(initial_workers(18, 31 * G, 4 * G, 2, None), 3); // 7 slots / 2
-        assert_eq!(initial_workers(18, 31 * G, 4 * G, 6, None), 1);
-        // Never zero, even when one worker's cap exceeds total RAM.
-        assert_eq!(initial_workers(18, 2 * G, 4 * G, 2, None), 1);
-        // --eval-workers wins verbatim (floored at 1).
-        assert_eq!(initial_workers(18, 31 * G, 4 * G, 2, Some(9)), 9);
-        assert_eq!(initial_workers(18, 31 * G, 4 * G, 2, Some(0)), 1);
+        // Core-bound when RAM is plentiful; RAM-bound (total / worker cap)
+        // when it isn't; never zero; --eval-slots wins verbatim (floored at 1).
+        assert_eq!(eval_slots(18, 256 * G, 4 * G, None), 18);
+        assert_eq!(eval_slots(18, 31 * G, 4 * G, None), 7);
+        assert_eq!(eval_slots(4, 2 * G, 4 * G, None), 1);
+        assert_eq!(eval_slots(18, 31 * G, 4 * G, Some(3)), 3);
+        assert_eq!(eval_slots(18, 31 * G, 4 * G, Some(0)), 1);
+    }
+
+    #[test]
+    fn shard_expr_subsets_the_import() {
+        let e = shard_expr(
+            Path::new("/repo"),
+            "abc123",
+            "aarch64-linux",
+            &["hello".into(), "with\"quote".into()],
+        );
+        // The same import as the whole-set walk, narrowed via listToAttrs,
+        // names escaped.
+        assert!(e.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
+        assert!(e.contains("builtins.listToAttrs"));
+        assert!(e.contains(r#""hello" "#));
+        assert!(e.contains(r#""with\"quote" "#));
     }
 }

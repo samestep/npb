@@ -143,6 +143,8 @@ commit, and full drv paths are stored as-is like the observation log.
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log + --tests cache (tiny)
   evals/<commit>-<sys>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
+  evals/partial/<eval>/<hash>.tsv    # in-flight shard results (§6); deleted
+                                     # once the eval file is assembled
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -224,34 +226,46 @@ machines); IFD is still deterministic, and impurities like `currentSystem` are
 fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, once
 `npd` owns the config.
 
-**Scheduling parallel evals — plan from invariants, recover from the rest.** A
-report needs up to 2×#systems full-set evals; they all run concurrently, each
-with `nix-eval-jobs` workers = the machine's cores split across the evals
-(rounded up, clamped 1–8 — each worker redundantly re-imports the nixpkgs
-spine, so width has diminishing returns), **bounded so the batch's worst case
-(every worker at its heap cap) fits in total RAM**. Only invariants are
-planned from — core count, total RAM, the per-worker cap (`--worker-mem-mb`,
-default 4 GiB, enforced by `nix-eval-jobs` itself). The *dynamic* part of RAM
-is deliberately not: an earlier design measured *available* RAM at launch and
-divided it into slots, but that snapshot lies (free RAM moves while a
-minutes-long eval runs — the plan could still OOM, with no recovery) and the
-slot arithmetic idled cores. Instead npd **recovers**: the integrity gate
-detects a fatal `nix-eval-jobs` abort (in practice a worker OOM-killed) and
-refuses the truncated result, and the scheduler retries *just that eval* at
-half its width, halving to a floor of one worker. Because every eval persists
-the moment it completes, a retry re-pays only the eval that died — the worst
-case is one wasted too-wide attempt per starved eval. The ladder has a final
-**concurrency rung**: an eval that aborts even at one worker is deferred and
-re-run *alone* (re-laddering from the single-job width) after its siblings
-finish — width recovery alone can't help when RAM per *concurrent eval* is
-the binding constraint (measured: an 8 GiB cgroup fits two full-set evals at
-no width whatsoever, but fits them serialized at 4.4 GiB peak), so the
-ladder's reachable set must include full serialization. (The total-RAM bound
-matters because a global OOM's victim is not always a worker — the kernel can
-take npd itself or an unrelated process, and then the ladder's detector never
-fires; keeping the planned worst case inside the machine makes worker-death
-the overwhelmingly likely failure mode, which is the one we can recover from.)
-`--eval-workers` overrides the starting width.
+**Scheduling — one queue of shards.** The scheduling and failure atom is not a
+whole-set eval but a **shard**: a ~400-name slice of one eval's top-level attr
+names (enumerated by one cheap `builtins.attrNames` call), evaluated by its
+own one-worker `nix-eval-jobs` over the same import narrowed via `listToAttrs`
+— validated byte-for-byte to reproduce the monolithic walk (thunks force
+per-attr in the worker, so error isolation is identical). All shards of all
+pending evals share **one global queue** and one knob: the number of slots
+(concurrent shard jobs), started at `min(cores, total RAM / worker cap)` —
+invariants only. The dynamic part of RAM is handled by feedback, TCP-style
+(AIMD), instead of measurement: a shard that aborts (in practice a worker
+OOM-kill, caught by the integrity gate) is simply **requeued** while the slot
+count halves; sustained success creeps it back up. Completed shards persist
+immediately under `evals/partial/`, so any interruption — ^C, OOM, crash —
+resumes at shard granularity; when an eval's last shard lands, its rows are
+assembled into the one cached file and the partials are deleted. Small atoms
+are what make everything cheap: an abort re-pays seconds (not a whole eval),
+idle slots drain any eval's remaining shards (no straggler eval), and the
+degenerate case — a machine that fits only one worker — is just the queue at
+one slot, not a special phase. The costs: each shard job re-imports the
+nixpkgs spine (a few seconds; single-digit percent of a shard's runtime at
+this size), and a giant single subtree (`linuxKernel`, the python package
+sets) can't be split below one top-level name, so it bounds the tail at
+roughly a minute. `--eval-slots` overrides the starting slot count.
+
+> Two earlier schemes are recorded for context. A *planner* divided measured
+> available RAM into per-eval worker slots — but that snapshot lies (free RAM
+> moves during a minutes-long eval, with no recovery when it did) and the
+> arithmetic idled cores. A *width ladder* then retried a whole aborted eval
+> at halving worker counts, with a final serialize-alone rung — it worked, but
+> every rung re-paid minutes because the retry atom was the whole eval, and
+> cross-eval balance was still fixed at spawn. Both dissolved into the queue:
+> the ladder *is* the slot count backing off, the rung *is* the queue draining
+> to one slot, and rebalancing is what a shared queue does natively.
+
+**Eval purity vs `builtins.getEnv`.** A handful of nixpkgs packages leak the
+*environment* into their derivations (drbd bakes `$SHELL` into a Makefile
+patch), so two evals of the same `(commit, system)` from different shells
+disagree on those drvs. npd scrubs the known offenders from the evaluator's
+environment (`SHELL` removed, so `getEnv` yields `""`, matching a hermetic
+eval) — the cache key stays honest without hashing the environment.
 
 `eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
 pure). Each attr carries its drv plus one meta bit — marked
