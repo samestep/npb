@@ -247,16 +247,24 @@ assembled into the one cached file and the partials are deleted. Small atoms
 are what make everything cheap: an abort re-pays seconds (not a whole eval),
 idle slots drain any eval's remaining shards (no straggler eval), and the
 degenerate case — a machine that fits only one worker — is just the queue at
-one slot, not a special phase. The cost: each shard job re-imports the
+one slot, not a special phase. The costs: each shard job re-imports the
 nixpkgs spine (a few seconds; single-digit percent of a shard's runtime at
-this size). Giant subtrees (`haskellPackages`, `linuxKernel`, the python
-package sets — ~20k attrs each) would otherwise be indivisible ~minute shards
-that bound the makespan once slots ≥ total-work/max-shard (measured 1.39× over
-the perfect-packing bound at 15 slots), so the planner splits them: attr
-counts from any prior same-system eval (nixpkgs' shape drifts slowly) flag
-oversized names, whose children are enumerated and packed recursively —
-shards are sized by estimated attrs, not name count, wherever statistics
-exist. A first-ever run has no statistics and eats the tail once. `--eval-slots` overrides the starting slot count.
+this size), and a giant single subtree (`haskellPackages`, `linuxKernel`, the
+python package sets, ~20k attrs each) is one indivisible ~minute shard that
+bounds the makespan once slots ≥ total-work/max-shard (measured 1.39× over the
+perfect-packing bound at 15 slots).
+
+> Recursive splitting of those subtrees was tried and **backed out** after
+> measurement: selecting attrs inside a giant package set forces that set's
+> *fixpoint construction* (~15 s for `haskellPackages`) in **every** child
+> shard — and once more to enumerate its names — so splitting a ~60 s subtree
+> into k shards costs ~k×15 s of new work for a tail floor that can never drop
+> below the construction cost. Net effect, measured on identical work: one
+> fresh eval went 122 s → 191 s on a 7-slot machine, and the projected ~19 s
+> tail win at 15 slots is eaten by the same overhead. Splitting only makes
+> sense with a time model that knows each subtree's construction cost, or
+> upstream support for sharing a constructed set across workers — revisit
+> there, not with attr-count heuristics. `--eval-slots` overrides the starting slot count.
 
 > Two earlier schemes are recorded for context. A *planner* divided measured
 > available RAM into per-eval worker slots — but that snapshot lies (free RAM

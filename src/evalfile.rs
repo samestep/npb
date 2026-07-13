@@ -112,39 +112,6 @@ pub fn write_partial(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     Ok(())
 }
 
-/// The attr column (sorted, as stored) of the newest cached eval for `system`
-/// — any commit — or `None` if none exists. The shard planner's size
-/// statistics: nixpkgs' shape drifts slowly, so *some* recent eval is a good
-/// predictor of how many attrs live under each prefix (`eval::plan_shards`).
-pub fn newest_eval_attrs(system: &str) -> Result<Option<Vec<String>>> {
-    let dir = cache_root()?.join("evals");
-    let suffix = format!("-{system}-v{EVAL_VERSION}.tsv.zst");
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(None), // no cache yet
-    };
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for e in entries.flatten() {
-        if e.file_name().to_string_lossy().ends_with(&suffix)
-            && let Ok(md) = e.metadata()
-            && let Ok(t) = md.modified()
-            && newest.as_ref().is_none_or(|(bt, _)| t > *bt)
-        {
-            newest = Some((t, e.path()));
-        }
-    }
-    let Some((_, path)) = newest else {
-        return Ok(None);
-    };
-    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let tsv = zstd::decode_all(&bytes[..])
-        .with_context(|| format!("decompressing {}", path.display()))?;
-    let tsv = String::from_utf8(tsv).with_context(|| format!("{} not UTF-8", path.display()))?;
-    Ok(Some(
-        tsv.lines().map(|l| parse_line(l).0.to_string()).collect(),
-    ))
-}
-
 /// Load a shard partial written by [`write_partial`]; `None` if absent.
 pub fn read_partial(path: &Path) -> Result<Option<Vec<AttrEval>>> {
     let text = match fs::read_to_string(path) {

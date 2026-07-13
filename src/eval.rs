@@ -441,31 +441,12 @@ fn eval_slots(cores: usize, mem_mb: u64, per_worker_mb: u64, user: Option<u64>) 
     }
 }
 
-/// The `pkgs."a"."b"` accessor for an attr-path prefix.
-fn accessor(path: &[String]) -> String {
-    let mut s = String::from("pkgs");
-    for seg in path {
-        s.push_str(&format!(".\"{}\"", nix_escape(seg)));
-    }
-    s
-}
-
-/// The attr names of the set at `path` under the package set at
-/// `(commit, system)` (`path = []` is the top level — well under a second
-/// warm, since forcing `attrNames` touches no derivations; a deeper set pays
-/// that set's fixpoint). The literal `recurseForDerivations` key is dropped to
-/// mirror how `nix-eval-jobs` skips it when walking a set.
-fn enumerate_names(
-    repo: &Path,
-    commit: &str,
-    system: &str,
-    path: &[String],
-) -> Result<Vec<String>> {
-    let expr = format!(
-        "let pkgs = {}; in builtins.attrNames {}",
-        build_expr(repo, commit, system),
-        accessor(path),
-    );
+/// The top-level attr names of the package set at `(commit, system)` — the
+/// space the shards partition. Cheap (well under a second warm): forcing
+/// `attrNames` touches no derivations. The literal `recurseForDerivations`
+/// key is dropped to mirror how `nix-eval-jobs` skips it when walking a set.
+fn enumerate_names(repo: &Path, commit: &str, system: &str) -> Result<Vec<String>> {
+    let expr = format!("builtins.attrNames ({})", build_expr(repo, commit, system));
     let out = scrub_env(
         Command::new("nix-instantiate").args(["--eval", "--strict", "--json", "-E", &expr]),
     )
@@ -473,8 +454,7 @@ fn enumerate_names(
     .context("running nix-instantiate (attr names)")?;
     if !out.status.success() {
         bail!(
-            "enumerating attrs of {commit} ({system}) at {:?} failed:\n{}",
-            path.join("."),
+            "enumerating top-level attrs of {commit} ({system}) failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -485,95 +465,30 @@ fn enumerate_names(
 }
 
 /// The eval expression for one shard: the same import as the whole-set walk,
-/// narrowed to `names` (living at attr-path prefix `path`) via `listToAttrs`.
-/// Each value stays a thunk forced per-attr in the worker, so walk semantics
-/// and error isolation match the monolithic root exactly — validated
-/// byte-for-byte against a whole-set eval (DESIGN §6). A non-empty `path` is
-/// rebuilt as recursable wrapper sets so the emitted attr labels keep their
-/// full dotted form (`linuxKernel.packages.linux_6_6.drbd`).
-fn shard_expr(
-    repo: &Path,
-    commit: &str,
-    system: &str,
-    path: &[String],
-    names: &[String],
-) -> String {
+/// narrowed to `names` via `listToAttrs`. Each value stays a thunk forced
+/// per-attr in the worker, so walk semantics and error isolation match the
+/// monolithic root exactly — validated byte-for-byte against a whole-set eval
+/// (DESIGN §6).
+fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> String {
     let list: String = names
         .iter()
         .map(|n| format!("\"{}\" ", nix_escape(n)))
         .collect();
-    let mut set = format!(
-        "builtins.listToAttrs (map (n: {{ name = n; value = {}.${{n}}; }}) [ {list}])",
-        accessor(path)
-    );
-    for seg in path.iter().rev() {
-        set = format!(
-            "{{ \"{}\" = {{ recurseForDerivations = true; }} // {set}; }}",
-            nix_escape(seg)
-        );
-    }
-    format!("let pkgs = {}; in {set}", build_expr(repo, commit, system))
-}
-
-/// A shard's target size in (estimated) attrs — roughly 10 s of one-worker
-/// evaluation — and the size past which a single name's subtree is split into
-/// its children instead of packed whole. Without the split, `haskellPackages`
-/// or `linuxKernel` (~20k attrs each) is one indivisible ~minute shard that
-/// bounds the whole eval's makespan once slots ≥ total-work/max-shard
-/// (measured: 1.39× over the perfect-packing bound at 15 slots).
-const SHARD_TARGET_ATTRS: usize = 1600;
-const SPLIT_THRESHOLD: usize = 4000;
-
-/// Pack `names` (at prefix `path`) into shards of ~[`SHARD_TARGET_ATTRS`],
-/// recursing into any name whose subtree the size statistics call oversized.
-/// `count` answers "how many attrs under this path?" from a prior eval of the
-/// same system (`None` = unknown: a first-ever run, or a brand-new attr — then
-/// packed by name count alone). `enumerate` lists a set's children; if it
-/// fails or returns nothing (the value isn't a set, or throws), the name is
-/// packed whole and the worker surfaces whatever the walk finds — exactly as
-/// the monolithic walk would.
-fn plan_shards(
-    path: &[String],
-    names: &[String],
-    count: &dyn Fn(&[String]) -> Option<usize>,
-    enumerate: &mut dyn FnMut(&[String]) -> Result<Vec<String>>,
-    out: &mut Vec<(Vec<String>, Vec<String>)>,
-) -> Result<()> {
-    let mut cur: Vec<String> = Vec::new();
-    let mut cur_attrs = 0usize;
-    for n in names {
-        let mut sub = path.to_vec();
-        sub.push(n.clone());
-        let c = count(&sub);
-        if c.is_some_and(|c| c > SPLIT_THRESHOLD)
-            && let Ok(children) = enumerate(&sub)
-            && !children.is_empty()
-        {
-            plan_shards(&sub, &children, count, enumerate, out)?;
-            continue;
-        }
-        cur.push(n.clone());
-        cur_attrs += c.unwrap_or(1).max(1);
-        if cur_attrs >= SHARD_TARGET_ATTRS || cur.len() >= NAMES_PER_SHARD {
-            out.push((path.to_vec(), std::mem::take(&mut cur)));
-            cur_attrs = 0;
-        }
-    }
-    if !cur.is_empty() {
-        out.push((path.to_vec(), cur));
-    }
-    Ok(())
+    format!(
+        "let pkgs = {}; in builtins.listToAttrs \
+         (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
+        build_expr(repo, commit, system)
+    )
 }
 
 /// Where one shard's completed rows persist until its whole eval is assembled
 /// (then the eval's `partial/` dir is deleted). Content-addressed by the
-/// shard's path + names, so a change in sharding layout simply misses rather
-/// than resuming from the wrong rows. This is what makes an interrupted (^C,
-/// OOM, crash) eval resumable: only unfinished shards re-run.
-fn partial_path(commit: &str, system: &str, path: &[String], names: &[String]) -> Result<PathBuf> {
+/// shard's names, so a change in sharding layout simply misses rather than
+/// resuming from the wrong rows. This is what makes an interrupted (^C, OOM,
+/// crash) eval resumable: only unfinished shards re-run.
+fn partial_path(commit: &str, system: &str, names: &[String]) -> Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
     names.hash(&mut h);
     Ok(crate::paths::cache_root()?
         .join("evals")
@@ -585,14 +500,12 @@ fn partial_path(commit: &str, system: &str, path: &[String], names: &[String]) -
         .join(format!("{:016x}.tsv", h.finish())))
 }
 
-/// One unit of work: some of one eval's attr names, at an attr-path prefix
-/// (`path = []` for top level; deeper when [`plan_shards`] split a giant
-/// subtree).
+/// One unit of work: a slice of one eval's top-level names.
 struct Shard {
     /// Index into the per-eval state vec.
     eval: usize,
-    path: Vec<String>,
-    names: Vec<String>,
+    /// Range within that eval's name list.
+    names: std::ops::Range<usize>,
 }
 
 /// Ensure every `(commit, system)` pair has a cached eval file, via **one
@@ -630,6 +543,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         commit: &'a str,
         system: &'a str,
         label: String,
+        names: Vec<String>,
         shards_total: usize,
         shards_done: AtomicUsize,
         attrs_done: AtomicUsize,
@@ -641,32 +555,18 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     let mut queue: VecDeque<Shard> = VecDeque::new();
     for &i in &todo {
         let (commit, system) = (&pairs[i].0, &pairs[i].1);
-        let names = enumerate_names(repo, commit, system, &[])?;
-        // Size statistics from any prior eval of this system: sorted attrs, so
-        // "attrs under this prefix" is two binary searches.
-        let stats = crate::evalfile::newest_eval_attrs(system)?;
-        let count = |p: &[String]| -> Option<usize> {
-            let attrs = stats.as_ref()?;
-            let joined = p.join(".");
-            let mut prefix = joined.clone();
-            prefix.push('.');
-            let start = attrs.partition_point(|a| a.as_str() < joined.as_str());
-            let end =
-                attrs.partition_point(|a| a.as_str() < prefix.as_str() || a.starts_with(&prefix));
-            Some(end - start)
-        };
-        let mut enumerate =
-            |p: &[String]| -> Result<Vec<String>> { enumerate_names(repo, commit, system, p) };
-        let mut plan: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-        plan_shards(&[], &names, &count, &mut enumerate, &mut plan)?;
+        let names = enumerate_names(repo, commit, system)?;
         let idx = evals.len();
-        let shards_total = plan.len();
-        for (path, names) in plan {
+        let mut shards_total = 0;
+        let mut s = 0;
+        while s < names.len() {
+            let e = (s + NAMES_PER_SHARD).min(names.len());
             queue.push_back(Shard {
                 eval: idx,
-                path,
-                names,
+                names: s..e,
             });
+            shards_total += 1;
+            s = e;
         }
         let short: String = commit.chars().take(12).collect();
         let pb = mp.add(ProgressBar::new_spinner());
@@ -680,6 +580,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
             commit,
             system,
             label: format!("{short} ({system})"),
+            names,
             shards_total,
             shards_done: AtomicUsize::new(0),
             attrs_done: AtomicUsize::new(0),
@@ -731,19 +632,14 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                         continue;
                     };
                     let ev = &evals[shard.eval];
+                    let names = &ev.names[shard.names.clone()];
 
                     let step = || -> Result<()> {
-                        let ppath = partial_path(ev.commit, ev.system, &shard.path, &shard.names)?;
+                        let ppath = partial_path(ev.commit, ev.system, names)?;
                         let rows = match crate::evalfile::read_partial(&ppath)? {
                             Some(rows) => rows, // resumed from a prior run
                             None => {
-                                let expr = shard_expr(
-                                    repo,
-                                    ev.commit,
-                                    ev.system,
-                                    &shard.path,
-                                    &shard.names,
-                                );
+                                let expr = shard_expr(repo, ev.commit, ev.system, names);
                                 let rows = stream_jobs(
                                     &expr,
                                     1,
@@ -910,76 +806,17 @@ mod tests {
 
     #[test]
     fn shard_expr_subsets_the_import() {
-        // Top level: the same import as the whole-set walk, narrowed via
-        // listToAttrs, names escaped.
         let e = shard_expr(
             Path::new("/repo"),
             "abc123",
             "aarch64-linux",
-            &[],
             &["hello".into(), "with\"quote".into()],
         );
+        // The same import as the whole-set walk, narrowed via listToAttrs,
+        // names escaped.
         assert!(e.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
         assert!(e.contains("builtins.listToAttrs"));
-        assert!(e.contains(r#"pkgs.${n}"#));
         assert!(e.contains(r#""hello" "#));
         assert!(e.contains(r#""with\"quote" "#));
-
-        // A split subtree: selected through the path, and rebuilt under
-        // recursable wrappers so labels keep their full dotted form.
-        let e = shard_expr(
-            Path::new("/repo"),
-            "abc123",
-            "aarch64-linux",
-            &["linuxKernel".into(), "packages".into()],
-            &["linux_6_6".into()],
-        );
-        assert!(e.contains(r#"pkgs."linuxKernel"."packages".${n}"#));
-        assert!(e.contains(r#"{ "linuxKernel" = { recurseForDerivations = true; } // { "packages" = { recurseForDerivations = true; } //"#));
-    }
-
-    #[test]
-    fn plan_shards_packs_and_splits() {
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // Stats: `giant` is over the split threshold; its child `giant.big`
-        // still is (recursive split); everything else is modest.
-        let count = |p: &[String]| -> Option<usize> {
-            Some(match p.join(".").as_str() {
-                "giant" => 20_000,
-                "giant.big" => 19_000,
-                "new" => return None, // unseen attr: unknown size
-                s if s.starts_with("giant.big.") => 100,
-                s if s.starts_with("giant.") => 300,
-                _ => 900,
-            })
-        };
-        let mut enumerated: Vec<String> = Vec::new();
-        let mut enumerate = |p: &[String]| -> Result<Vec<String>> {
-            enumerated.push(p.join("."));
-            Ok(match p.join(".").as_str() {
-                "giant" => names(&["big", "small1", "small2"]),
-                "giant.big" => names(&["x1", "x2", "x3"]),
-                other => panic!("unexpected enumeration of {other}"),
-            })
-        };
-        let mut out = Vec::new();
-        plan_shards(
-            &[],
-            &names(&["a", "b", "giant", "new", "z"]),
-            &count,
-            &mut enumerate,
-            &mut out,
-        )
-        .unwrap();
-        // Only the oversized subtrees were enumerated.
-        assert_eq!(enumerated, vec!["giant".to_string(), "giant.big".into()]);
-        // a+b pack to one shard (1800 ≥ target); giant.big's children pack
-        // under path [giant, big]; giant's small children under [giant];
-        // new+z finish the top level.
-        assert!(out.contains(&(vec![], names(&["a", "b"]))));
-        assert!(out.contains(&(names(&["giant", "big"]), names(&["x1", "x2", "x3"]))));
-        assert!(out.contains(&(names(&["giant"]), names(&["small1", "small2"]))));
-        assert!(out.contains(&(vec![], names(&["new", "z"]))));
-        assert_eq!(out.len(), 4);
     }
 }
