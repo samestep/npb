@@ -8,6 +8,7 @@ mod build;
 mod cache;
 mod eval;
 mod evalfile;
+mod live;
 mod model;
 mod paths;
 mod report;

@@ -16,14 +16,18 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use console::style;
 use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
+use crate::live::{Live, human_elapsed};
 use crate::model::{AttrEval, TestJob};
+
+/// Braille spinner frames (indicatif's default set), advanced one per redraw.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The one nixpkgs config every eval runs under. npd owns the config
 /// (DESIGN.md §6), which is what makes the eval cache key just
@@ -333,12 +337,8 @@ pub fn eval_tests(
     let workers = attrs.len().clamp(1, 4);
     let short: String = commit.chars().take(12).collect();
     let label = format!("tests {short} ({system})");
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} ⏱ {elapsed} {msg}").expect("valid template"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_message(format!("evaluating {label}"));
+    let mut live = Live::new();
+    let start = Instant::now();
     // Label and split from `attrPath` (unquoted elements) rather than `attr`
     // (which nix-eval-jobs quotes for the dotted package component, e.g.
     // `"python3Packages.requests".tests.foo`): element 0 is the package we asked
@@ -356,11 +356,17 @@ pub fn eval_tests(
         }
     };
     let mut n = 0usize;
+    let mut tick = 0usize;
     let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &label, map, || {
         n += 1;
-        pb.set_message(format!("evaluating {label} — {n} tests"));
+        tick += 1;
+        let spin = style(SPINNER[tick % SPINNER.len()]).cyan();
+        live.draw(&[format!(
+            "{spin} ⏱ {} evaluating {label} — {n} tests",
+            human_elapsed(start.elapsed())
+        )]);
     });
-    pb.finish_and_clear();
+    live.clear();
     r
 }
 
@@ -575,20 +581,26 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         .map(|n| n.get())
         .unwrap_or(4);
     let slots = eval_slots(cores, total_mem_mb(), per_worker_mb, opts.slots);
-    let mp = MultiProgress::new();
 
     /// Per-eval bookkeeping shared by the queue workers.
     struct Eval<'a> {
         commit: &'a str,
         system: &'a str,
+        short: String,
         label: String,
         names: Vec<String>,
         shards_total: usize,
         shards_done: AtomicUsize,
+        /// Shards of this eval a worker is evaluating right now — the middle of
+        /// the `done + running / total` triple the line shows.
+        shards_running: AtomicUsize,
         attrs_done: AtomicUsize,
         rows: Mutex<Vec<AttrEval>>,
-        pb: ProgressBar,
     }
+
+    // Widest system name in play, so the per-eval lines align into columns
+    // instead of wobbling as the verb / system / attr count change width.
+    let sys_w = todo.iter().map(|&i| pairs[i].1.len()).max().unwrap_or(0);
 
     let mut evals: Vec<Eval> = Vec::new();
     let mut queue: VecDeque<Shard> = VecDeque::new();
@@ -608,25 +620,73 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
             s = e;
         }
         let short: String = commit.chars().take(12).collect();
-        let pb = mp.add(ProgressBar::new_spinner());
-        pb.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} ⏱ {elapsed} {msg}")
-                .expect("valid template"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message(format!("evaluating {short} ({system})"));
         evals.push(Eval {
             commit,
             system,
             label: format!("{short} ({system})"),
+            short,
             names,
             shards_total,
             shards_done: AtomicUsize::new(0),
+            shards_running: AtomicUsize::new(0),
             attrs_done: AtomicUsize::new(0),
             rows: Mutex::new(Vec::new()),
-            pb,
         });
     }
+
+    // The live display: one line per eval plus, at the bottom, the one timer —
+    // every eval starts within the same instant, so a per-eval clock apiece was
+    // just near-identical timers jittering out of sync (a single elapsed plus a
+    // running grand total reads cleaner). A refresher thread owns every write;
+    // workers only bump atomics. See `crate::live` for why it truncates rather
+    // than pads (resize stays sane).
+    let display = Mutex::new(Live::new());
+    let start = Instant::now();
+
+    // One line per eval; `done + running / total` shards (the `+running` term
+    // elided once nothing is in flight), attrs right-aligned so the count sits
+    // in a fixed column. `attrs_done` includes rows recovered from partials, so
+    // a resumed eval's count matches its shard count.
+    let render = |ev: &Eval| -> String {
+        let done = ev.shards_done.load(Ordering::Relaxed);
+        let running = ev.shards_running.load(Ordering::Relaxed);
+        let attrs = ev.attrs_done.load(Ordering::Relaxed);
+        let verb = if done == ev.shards_total {
+            "evaluated"
+        } else {
+            "evaluating"
+        };
+        let shards = if running > 0 {
+            format!("{done}+{running}/{}", ev.shards_total)
+        } else {
+            format!("{done}/{}", ev.shards_total)
+        };
+        format!(
+            "  {verb:<10} {short} {system:<sys_w$}  {attrs:>6} attrs  {shards} shards",
+            short = ev.short,
+            system = ev.system,
+        )
+    };
+    let render_total = |evals: &[Eval]| -> String {
+        let (mut done, mut running, mut total, mut attrs) = (0, 0, 0, 0);
+        for ev in evals {
+            done += ev.shards_done.load(Ordering::Relaxed);
+            running += ev.shards_running.load(Ordering::Relaxed);
+            total += ev.shards_total;
+            attrs += ev.attrs_done.load(Ordering::Relaxed);
+        }
+        let verb = if done == total {
+            "evaluated"
+        } else {
+            "evaluating"
+        };
+        let shards = if running > 0 {
+            format!("{done}+{running}/{total}")
+        } else {
+            format!("{done}/{total}")
+        };
+        format!("{verb} {shards} shards, {attrs} attrs")
+    };
 
     struct Q {
         queue: VecDeque<Shard>,
@@ -649,8 +709,38 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     let successes = AtomicUsize::new(0);
 
     thread::scope(|s| {
+        // A single refresher owns every terminal write: workers only bump
+        // atomics (no rendering in the per-attr hot path), and this thread draws
+        // the whole block at a steady 100 ms until the queue drains. Advancing
+        // the spinner one frame per tick is what animates it.
+        {
+            let (q, evals, display) = (&q, &evals, &display);
+            let (render, render_total) = (&render, &render_total);
+            s.spawn(move || {
+                let mut tick = 0usize;
+                loop {
+                    let mut lines: Vec<String> = evals.iter().map(render).collect();
+                    let spin = style(SPINNER[tick % SPINNER.len()]).cyan();
+                    lines.push(format!(
+                        "{spin} ⏱ {} {}",
+                        human_elapsed(start.elapsed()),
+                        render_total(evals),
+                    ));
+                    display.lock().unwrap().draw(&lines);
+                    {
+                        let g = q.lock().unwrap();
+                        if g.fatal.is_some() || g.outstanding == 0 {
+                            return;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    tick += 1;
+                }
+            });
+        }
         for w in 0..slots {
-            let (q, target, successes, evals, mp) = (&q, &target, &successes, &evals, &mp);
+            let (q, target, successes, evals, display) =
+                (&q, &target, &successes, &evals, &display);
             s.spawn(move || {
                 loop {
                     let shard = {
@@ -676,7 +766,13 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                     let step = || -> Result<()> {
                         let ppath = partial_path(ev.commit, ev.system, names)?;
                         let rows = match crate::evalfile::read_partial(&ppath)? {
-                            Some(rows) => rows, // resumed from a prior run
+                            // Resumed from a prior run: the streamer's per-attr
+                            // callback never fires, so credit the attrs here —
+                            // otherwise a resumed eval's count trails its shards.
+                            Some(rows) => {
+                                ev.attrs_done.fetch_add(rows.len(), Ordering::Relaxed);
+                                rows
+                            }
                             None => {
                                 let expr = shard_expr(repo, ev.commit, ev.system, names);
                                 let rows = stream_jobs(
@@ -686,14 +782,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                                     &ev.label,
                                     raw_to_attr_eval,
                                     || {
-                                        let n = ev.attrs_done.fetch_add(1, Ordering::Relaxed) + 1;
-                                        ev.pb.set_message(format!(
-                                            "evaluating {} — {} attrs, {}/{} shards",
-                                            ev.label,
-                                            n,
-                                            ev.shards_done.load(Ordering::Relaxed),
-                                            ev.shards_total,
-                                        ));
+                                        ev.attrs_done.fetch_add(1, Ordering::Relaxed);
                                     },
                                 )?;
                                 // Best-effort: a failed persist only costs the
@@ -710,16 +799,17 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                             if let Some(dir) = ppath.parent() {
                                 let _ = fs::remove_dir_all(dir);
                             }
-                            ev.pb.finish_with_message(format!(
-                                "evaluated {} — {} attrs",
-                                ev.label,
-                                rows.len()
-                            ));
+                            // The assembled file is authoritative — pin the
+                            // count to it in case streamed/resumed tallies drift.
+                            ev.attrs_done.store(rows.len(), Ordering::Relaxed);
                         }
                         Ok(())
                     };
 
-                    match step() {
+                    ev.shards_running.fetch_add(1, Ordering::Relaxed);
+                    let outcome = step();
+                    ev.shards_running.fetch_sub(1, Ordering::Relaxed);
+                    match outcome {
                         Ok(()) => {
                             q.lock().unwrap().outstanding -= 1;
                             let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
@@ -733,7 +823,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                             let nt = (t / 2).max(1);
                             target.store(nt, Ordering::Relaxed);
                             successes.store(0, Ordering::Relaxed);
-                            let _ = mp.println(format!(
+                            display.lock().unwrap().print_above(&format!(
                                 "  a shard of {} aborted — likely out of memory; \
                                  requeued, slots {t} -> {nt}",
                                 ev.label,
@@ -752,9 +842,19 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         }
     });
 
+    // Erase the live block and reprint the finished lines as ordinary output, so
+    // the eval summary stays on screen and a later resize reflows it like any
+    // command's output (the block itself was already resize-safe; see
+    // `crate::live`).
+    display.lock().unwrap().clear();
     match q.into_inner().unwrap().fatal {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => {
+            for ev in &evals {
+                eprintln!("{}", render(ev));
+            }
+            Ok(())
+        }
     }
 }
 
