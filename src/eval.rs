@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -151,15 +151,30 @@ fn stream_jobs<T>(
     } else {
         per_worker_mb
     };
+    // nix-eval-jobs takes the expression inline (`--expr E`) or as a file-path
+    // positional. The `--tests` expression lists every changed package, so on a
+    // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn);
+    // writing it to a temp file and passing the path works for any size (and the
+    // small shard/full-set exprs don't care). The evaluated expression is
+    // byte-identical either way — same drvs — so this is not an EVAL_VERSION
+    // change. Kept alive until the child exits (nix-eval-jobs reads it at start).
+    let mut expr_file = tempfile::Builder::new()
+        .prefix("npd-eval-")
+        .suffix(".nix")
+        .tempfile()
+        .context("creating nix-eval-jobs expr file")?;
+    expr_file
+        .write_all(expr.as_bytes())
+        .and_then(|()| expr_file.flush())
+        .context("writing nix-eval-jobs expr file")?;
     let mut child = scrub_env(Command::new("nix-eval-jobs").args([
         "--meta",
         "--workers",
         &workers.to_string(),
         "--max-memory-size",
         &max_memory_size.to_string(),
-        "--expr",
-        expr,
     ]))
+    .arg(expr_file.path())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()
@@ -363,6 +378,13 @@ pub fn eval_tests(
         )]);
     });
     live.clear();
+    // Keep a frozen summary on screen, matching the full-set eval's line.
+    if r.is_ok() {
+        eprintln!(
+            "⏱ {} evaluated {label} — {n} tests",
+            human_elapsed(start.elapsed())
+        );
+    }
     r
 }
 

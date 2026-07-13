@@ -265,10 +265,10 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
     } else {
         let done = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
-        thread::scope(|s| {
+        let start = Instant::now();
+        let probed = thread::scope(|s| {
             s.spawn(|| {
                 let mut live = Live::new();
-                let start = Instant::now();
                 let mut tick = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     live.draw(&[format!(
@@ -285,7 +285,15 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
             let probed = cache::in_cache_many(&to_probe, &done);
             stop.store(true, Ordering::Relaxed);
             probed
-        })
+        });
+        // Keep a frozen summary on screen (like the eval's), so it's easy to see
+        // how long the probe took and how much of the set was already cached.
+        let cached = probed.values().filter(|&&v| v).count();
+        eprintln!(
+            "⏱ {} probed cache.nixos.org — {cached}/{total} already cached",
+            human_elapsed(start.elapsed()),
+        );
+        probed
     };
     let now = unix_now();
     for drv in &to_probe {
