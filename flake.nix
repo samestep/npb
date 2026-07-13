@@ -37,7 +37,11 @@
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
           # ring (via ureq's TLS) needs perl at build; rusqlite bundles sqlite (cc).
-          nativeBuildInputs = [ pkgs.perl ];
+          # git: the `--pr` resolution tests shell out to it against a fixture repo.
+          nativeBuildInputs = [
+            pkgs.perl
+            pkgs.git
+          ];
         };
         # Built once and shared by the package and every check.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;

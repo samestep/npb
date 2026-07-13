@@ -170,7 +170,10 @@ fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<b
     if err.contains("couldn't find remote ref") {
         return Ok(false);
     }
-    bail!("git fetch {ref_name} from {upstream} failed: {}", err.trim());
+    bail!(
+        "git fetch {ref_name} from {upstream} failed: {}",
+        err.trim()
+    );
 }
 
 /// Ensure PR #`pr`'s `ref_name` is present in `repo`, fetching from `upstream`
@@ -592,8 +595,8 @@ mod tests {
             .arg(local.path())
             .status()
             .unwrap();
-        let err = resolve_pr(local.path(), up.path().to_str().unwrap(), 99, false, false)
-            .unwrap_err();
+        let err =
+            resolve_pr(local.path(), up.path().to_str().unwrap(), 99, false, false).unwrap_err();
         assert!(format!("{err}").contains("not found"), "{err}");
     }
 
