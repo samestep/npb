@@ -3,10 +3,24 @@
 Read DESIGN.md before making non-trivial changes; it is the source of truth for
 the architecture and is kept up to date as part of any change that affects it.
 
-## Commit directly to `main`
+## Finishing a change: `nix flake check`, then commit to `main`
 
-Development happens on `main`. Don't create feature branches or open pull
-requests for changes here — commit straight to `main`.
+Development happens on `main` — don't create feature branches or open pull
+requests. Committing your work to `main` is part of *finishing* the task, not a
+separate step to wait for permission on.
+
+Before committing, run `nix flake check`: it is the source of truth for "does
+this pass". It builds the crate, runs the tests, runs Clippy
+(`--all-targets -- --deny warnings`), and checks formatting — so a lone
+warning, an unformatted line, or a broken `examples/` file fails it even when
+`cargo build` is happy. Local `cargo` can drift from it; the flake is what
+counts.
+
+One non-obvious gotcha: **Nix builds from the git tree, so it never sees
+untracked files.** `git add` any new file (a new `src/*.rs` module, an
+`examples/` entry) *before* running the check, or the build fails with a
+confusing `E0583` ("file not found for module") and cascade noise — the module
+simply isn't in the source Nix copied.
 
 ## No backward compatibility, ever
 
