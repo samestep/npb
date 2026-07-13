@@ -31,9 +31,25 @@ use crate::model::BuildPolicy;
 )]
 struct Cli {
     /// Base revision (default: merge-base of head and `master`).
+    #[arg(conflicts_with = "pr")]
     base: Option<String>,
     /// Head revision (default: `HEAD`).
+    #[arg(conflicts_with = "pr")]
     head: Option<String>,
+    /// Review NixOS/nixpkgs PR #N: compare its base branch against the PR
+    /// merged into that branch (GitHub's test-merge commit) — the same delta
+    /// ofborg/Hydra and nixpkgs-review evaluate. The PR's refs are fetched
+    /// into the local clone once, so a repeat run resolves them offline.
+    #[arg(long, value_name = "N")]
+    pr: Option<u64>,
+    /// With --pr: re-fetch the PR's refs even if already cached locally (to
+    /// pick up a rebased PR or a base branch that has moved since last run).
+    #[arg(long, requires = "pr")]
+    refetch: bool,
+    /// With --pr on a non-mergeable PR (no test-merge commit): compare the PR
+    /// head against its fork point with `master` instead.
+    #[arg(long, requires = "pr")]
+    fork_point: bool,
     /// nixpkgs clone to resolve the commits in (default: current directory).
     #[arg(long)]
     nixpkgs: Option<PathBuf>,
@@ -103,21 +119,122 @@ fn resolve_systems(system: Vec<String>) -> Vec<String> {
     }
 }
 
-/// `git merge-base base head` in `repo`.
-fn git_merge_base(repo: &std::path::Path, base: &str, head: &str) -> Result<String> {
+/// The canonical repo to fetch PR refs from: a PR number is a NixOS/nixpkgs
+/// identity, and the local clone's `origin` may well be a personal fork, so we
+/// never rely on a configured remote.
+const UPSTREAM: &str = "https://github.com/NixOS/nixpkgs";
+
+/// Run `git -C repo ARGS`; return trimmed stdout, or an error carrying stderr.
+fn git(repo: &std::path::Path, args: &[&str]) -> Result<String> {
     let out = Proc::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["merge-base", base, head])
+        .args(args)
         .output()
-        .context("running git merge-base")?;
+        .with_context(|| format!("running git {}", args.join(" ")))?;
     if !out.status.success() {
         bail!(
-            "git merge-base {base} {head} failed: {}",
+            "git {} failed: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+/// `git merge-base base head` in `repo`.
+fn git_merge_base(repo: &std::path::Path, base: &str, head: &str) -> Result<String> {
+    git(repo, &["merge-base", base, head])
+}
+
+/// Is `rev` resolvable to a commit in `repo`? (No network.)
+fn have_commit(repo: &std::path::Path, rev: &str) -> bool {
+    resolve_commit(repo, rev).is_ok()
+}
+
+/// Fetch `ref_name` from `upstream` into `repo`'s ref of the same name. Returns
+/// `Ok(true)` if it now exists, `Ok(false)` if `upstream` has no such ref (a
+/// conflicted PR publishes no `merge` ref), and `Err` on any other failure.
+fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<bool> {
+    let refspec = format!("+{ref_name}:{ref_name}");
+    let out = Proc::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", upstream, &refspec])
+        .output()
+        .context("running git fetch")?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("couldn't find remote ref") {
+        return Ok(false);
+    }
+    bail!("git fetch {ref_name} from {upstream} failed: {}", err.trim());
+}
+
+/// Ensure PR #`pr`'s `ref_name` is present in `repo`, fetching from `upstream`
+/// when it is absent (or always, when `refetch`). Returns whether it exists.
+fn ensure_pr_ref(
+    repo: &std::path::Path,
+    upstream: &str,
+    ref_name: &str,
+    refetch: bool,
+) -> Result<bool> {
+    if !refetch && have_commit(repo, ref_name) {
+        return Ok(true);
+    }
+    fetch_ref(repo, upstream, ref_name)
+}
+
+/// Resolve `(base, head)` for a PR review. GitHub publishes `refs/pull/N/head`
+/// (the PR tip) and, when the PR merges cleanly, `refs/pull/N/merge` — a
+/// test-merge commit whose first parent is the base-branch tip and whose second
+/// parent is the PR head. So `merge^1 → merge` is exactly the PR's patch applied
+/// on the *current* base branch (whatever branch that is), which sidesteps both
+/// merge-base downsides at once: the correct base branch, up to date. A repeat
+/// run reuses the cached refs and touches no network (a rev-parse, not the
+/// ~0.2 s merge-base walk).
+///
+/// `--fork-point` opts back into the old shape (PR head vs its merge-base with
+/// `master`) for the one case the merge commit can't cover: a PR that doesn't
+/// merge cleanly, so GitHub publishes no `merge` ref.
+fn resolve_pr(
+    repo: &std::path::Path,
+    upstream: &str,
+    pr: u64,
+    refetch: bool,
+    fork_point: bool,
+) -> Result<(String, String)> {
+    let head_ref = format!("refs/pull/{pr}/head");
+    if fork_point {
+        if !ensure_pr_ref(repo, upstream, &head_ref, refetch)? {
+            bail!("PR #{pr} not found on {upstream}");
+        }
+        let head = resolve_commit(repo, &head_ref)?;
+        let base = git_merge_base(repo, "master", &head)
+            .context("computing the PR's fork point with master")?;
+        return Ok((base, head));
+    }
+
+    let merge_ref = format!("refs/pull/{pr}/merge");
+    if !ensure_pr_ref(repo, upstream, &merge_ref, refetch)? {
+        // No test-merge commit. Distinguish a conflicted PR from a missing one
+        // by whether the (always-published) head ref exists.
+        let exists = have_commit(repo, &head_ref) || fetch_ref(repo, upstream, &head_ref)?;
+        if exists {
+            bail!(
+                "PR #{pr} is not mergeable (it conflicts with its base branch), \
+                 so GitHub publishes no test-merge commit.\n\
+                 Re-run with `--pr {pr} --fork-point` to compare the PR head \
+                 against its fork point with master instead."
+            );
+        }
+        bail!("PR #{pr} not found on {upstream}");
+    }
+    let head = resolve_commit(repo, &merge_ref)?;
+    let base = resolve_commit(repo, &format!("{merge_ref}^1"))?;
+    Ok((base, head))
 }
 
 /// Resolve a revision (ref, short/full sha, tag, `HEAD~1`, …) to a full commit
@@ -229,7 +346,10 @@ fn run(cli: Cli) -> Result<()> {
     };
     let opts = cli.eval;
     let repo = resolve_repo(cli.nixpkgs)?;
-    let (base, head) = resolve_base_head(&repo, cli.base, cli.head)?;
+    let (base, head) = match cli.pr {
+        Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.refetch, cli.fork_point)?,
+        None => resolve_base_head(&repo, cli.base, cli.head)?,
+    };
     let systems = resolve_systems(cli.system);
 
     eval::eval_two(&repo, &base, &head, &systems, opts)?;
@@ -366,6 +486,115 @@ mod tests {
         assert!(broken_of("/d/ab"));
         assert!(!broken_of("/d/t0"));
         assert!(!broken_of("/d/t1"));
+    }
+
+    /// Run git in `dir`, returning trimmed stdout; panics on failure.
+    fn g(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Proc::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Build an "upstream" repo with a mergeable PR #1 (a real `merge` ref whose
+    /// first parent is the master tip) and a non-mergeable PR #2 (a `head` ref
+    /// only). Returns (upstream_dir, a-map-of-labels→sha).
+    fn pr_fixture() -> (tempfile::TempDir, HashMap<&'static str, String>) {
+        let up = tempfile::tempdir().unwrap();
+        let d = up.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        g(d, &["commit", "--allow-empty", "-m", "A"]);
+        let a = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["commit", "--allow-empty", "-m", "B"]);
+        let b = g(d, &["rev-parse", "HEAD"]); // master tip
+        // PR #1: a clean feature branch off A, merged back with --no-ff.
+        g(d, &["checkout", "-b", "pr1", &a]);
+        g(d, &["commit", "--allow-empty", "-m", "C"]);
+        let c = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["checkout", "master"]);
+        g(d, &["merge", "--no-ff", "-m", "M", "pr1"]);
+        let m = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["update-ref", "refs/pull/1/head", &c]);
+        g(d, &["update-ref", "refs/pull/1/merge", &m]);
+        // PR #2: a head ref with no merge ref (models a conflicted PR).
+        g(d, &["checkout", "-b", "pr2", &a]);
+        g(d, &["commit", "--allow-empty", "-m", "D"]);
+        let dsha = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["update-ref", "refs/pull/2/head", &dsha]);
+        g(d, &["checkout", "master"]);
+        let shas = HashMap::from([("a", a), ("b", b), ("c", c), ("m", m), ("d", dsha)]);
+        (up, shas)
+    }
+
+    #[test]
+    fn resolve_pr_mergeable_uses_merge_and_its_first_parent() {
+        let (up, s) = pr_fixture();
+        let local = tempfile::tempdir().unwrap();
+        assert!(
+            Proc::new("git")
+                .args(["clone", "-q"])
+                .arg(up.path())
+                .arg(local.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let upstream = up.path().to_str().unwrap();
+        // Fetches the merge ref; base = merge^1 (master tip B), head = merge (M).
+        let (base, head) = resolve_pr(local.path(), upstream, 1, false, false).unwrap();
+        assert_eq!(base, s["b"]);
+        assert_eq!(head, s["m"]);
+        // Second call is offline (ref now cached) and resolves identically.
+        let (base2, head2) = resolve_pr(local.path(), "file:///does/not/exist", 1, false, false)
+            .expect("cached ref should resolve without touching upstream");
+        assert_eq!((base2, head2), (s["b"].clone(), s["m"].clone()));
+    }
+
+    #[test]
+    fn resolve_pr_non_mergeable_errors_and_suggests_fork_point() {
+        let (up, s) = pr_fixture();
+        let local = tempfile::tempdir().unwrap();
+        Proc::new("git")
+            .args(["clone", "-q"])
+            .arg(up.path())
+            .arg(local.path())
+            .status()
+            .unwrap();
+        let upstream = up.path().to_str().unwrap();
+        // No merge ref → a clear error pointing at --fork-point.
+        let err = resolve_pr(local.path(), upstream, 2, false, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not mergeable"), "{msg}");
+        assert!(msg.contains("--fork-point"), "{msg}");
+        // --fork-point: head = PR head (D), base = merge-base(master, D) = A.
+        let (base, head) = resolve_pr(local.path(), upstream, 2, false, true).unwrap();
+        assert_eq!(head, s["d"]);
+        assert_eq!(base, s["a"]);
+    }
+
+    #[test]
+    fn resolve_pr_missing_pr_errors() {
+        let (up, _s) = pr_fixture();
+        let local = tempfile::tempdir().unwrap();
+        Proc::new("git")
+            .args(["clone", "-q"])
+            .arg(up.path())
+            .arg(local.path())
+            .status()
+            .unwrap();
+        let err = resolve_pr(local.path(), up.path().to_str().unwrap(), 99, false, false)
+            .unwrap_err();
+        assert!(format!("{err}").contains("not found"), "{err}");
     }
 
     #[test]

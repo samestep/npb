@@ -296,6 +296,36 @@ attr as changed-by-this-side / by-the-other / by-both; it turned out not to
 matter in practice and was dropped. The merge base survives only as the
 *default base* of a report.)
 
+**Choosing `base` and `head`.** Three ways, in `resolve_base_head`/`resolve_pr`
+(`src/main.rs`):
+
+- *Explicit* — `npd <base> <head>` resolves each revision (ref, sha, tag,
+  `HEAD~1`, …) with `git rev-parse`.
+- *Default* — no arguments: `head = HEAD`, `base = git merge-base master HEAD`,
+  the fork point of the current branch. Cheap and offline, but it has two known
+  gaps — a change branched off a *non-`master`* base (`staging`,
+  `haskell-updates`, a release branch) is compared against the wrong branch, and
+  the base is frozen at the fork point, so drift on the base since then is
+  invisible.
+- *PR* — `npd --pr N` closes both gaps by deferring to GitHub's own test-merge
+  commit. GitHub publishes, on the **base repo** (so cross-fork PRs need no fork
+  URL), `refs/pull/N/head` (the PR tip) and — when the PR merges cleanly —
+  `refs/pull/N/merge`, a merge commit whose **first parent is the base-branch
+  tip** and second parent is the PR head. So `base = merge^1`, `head = merge`
+  is exactly the PR's patch applied on the *current* base branch, whatever that
+  branch is — the same delta ofborg/Hydra and `nixpkgs-review pr` evaluate. This
+  needs **no GitHub API and no token**: the refs come over anonymous git, unlike
+  `nixpkgs-review`, which calls the REST API to learn the merge sha (and nags for
+  `GITHUB_TOKEN`/`gh`). The refs are fetched into the local clone once and then
+  resolved with a `rev-parse` (~0 ms), so a repeat run touches no network — which
+  also *removes* the `git merge-base` walk (~0.2 s on a ~1M-commit nixpkgs) that
+  otherwise dominates a fully-cached run. `--refetch` re-fetches to pick up a
+  rebased PR or a moved base; a conflicted PR has no `merge` ref, and rather than
+  guess a base we fail with a message pointing at `--fork-point` (PR head vs its
+  merge-base with `master`, the *Default* shape). A bonus of `base = merge^1`:
+  every PR reviewed in the same window shares one base commit, so their base
+  evals are reused — where per-PR fork points never are.
+
 **`--tests` — the changed set's `passthru.tests`.** Ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397): for each
 changed package, also build its `passthru.tests` (building a test derivation *is*
@@ -382,10 +412,10 @@ are collapsed onto one line (`a = b = c`, shortest attr first), like
 `nixpkgs-review`'s aliases — npd gets this for free from its drvpath keying.
 
 An `npd` run is not merely read-only: with defaults (`head` = `HEAD`, `base` =
-merge-base with `master`) it first **builds both sides of the changed set**
-(skipping anything already known or substitutable), so a fresh report has a real
-state for every row rather than a wall of `❓`. `--no-build` opts back into pure
-read-only rendering.
+merge-base with `master`; or the PR-derived pair under `--pr`, §6) it first
+**builds both sides of the changed set** (skipping anything already known or
+substitutable), so a fresh report has a real state for every row rather than a
+wall of `❓`. `--no-build` opts back into pure read-only rendering.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
@@ -393,7 +423,8 @@ The spine is implemented (✓).
 
 1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`), evals run
    in parallel with an OOM-recovery ladder (§6).
-2. ✓ the two-way diff (base defaults to the merge-base with `master`).
+2. ✓ the two-way diff (base/head chosen explicitly, from the merge-base with
+   `master`, or from a PR's GitHub test-merge commit under `--pr`; §6).
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,
    `DepFailed`/cascade detection, and per-drv duration.
