@@ -70,8 +70,10 @@ fn in_cache(drv: &str) -> bool {
 
 /// Probe several drvs at once, returning `drv -> substitutable?`. A shared cursor
 /// hands each of [`PROBE_CONCURRENCY`] worker threads the next drv, so the wall
-/// time is `ceil(n / workers)` round-trips rather than `n`.
-pub fn in_cache_many(drvs: &[String]) -> HashMap<String, bool> {
+/// time is `ceil(n / workers)` round-trips rather than `n`. `done` is bumped as
+/// each drv resolves, so a caller can render progress for this otherwise-silent
+/// (and, on a first run over a big changed set, minute-long) network phase.
+pub fn in_cache_many(drvs: &[String], done: &AtomicUsize) -> HashMap<String, bool> {
     if drvs.is_empty() {
         return HashMap::new();
     }
@@ -86,6 +88,7 @@ pub fn in_cache_many(drvs: &[String]) -> HashMap<String, bool> {
                         let i = cursor.fetch_add(1, Ordering::Relaxed);
                         let Some(drv) = drvs.get(i) else { break };
                         local.push((drv.clone(), in_cache(drv)));
+                        done.fetch_add(1, Ordering::Relaxed);
                     }
                     local
                 })

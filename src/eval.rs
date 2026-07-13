@@ -19,15 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use console::style;
 use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
-use crate::live::{Live, human_elapsed};
+use crate::live::{Live, human_elapsed, spinner};
 use crate::model::{AttrEval, TestJob};
-
-/// Braille spinner frames (indicatif's default set), advanced one per redraw.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The one nixpkgs config every eval runs under. npd owns the config
 /// (DESIGN.md §6), which is what makes the eval cache key just
@@ -360,9 +356,9 @@ pub fn eval_tests(
     let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &label, map, || {
         n += 1;
         tick += 1;
-        let spin = style(SPINNER[tick % SPINNER.len()]).cyan();
         live.draw(&[format!(
-            "{spin} ⏱ {} evaluating {label} — {n} tests",
+            "{} ⏱ {} evaluating {label} — {n} tests",
+            spinner(tick),
             human_elapsed(start.elapsed())
         )]);
     });
@@ -720,9 +716,9 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                 let mut tick = 0usize;
                 loop {
                     let mut lines: Vec<String> = evals.iter().map(render).collect();
-                    let spin = style(SPINNER[tick % SPINNER.len()]).cyan();
                     lines.push(format!(
-                        "{spin} ⏱ {} {}",
+                        "{} ⏱ {} {}",
+                        spinner(tick),
                         human_elapsed(start.elapsed()),
                         render_total(evals),
                     ));
@@ -853,6 +849,13 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
             for ev in &evals {
                 eprintln!("{}", render(ev));
             }
+            // Keep the timer and grand total on screen (no spinner — it's frozen)
+            // so it's easy to look back at how long the eval took, like `nom`.
+            eprintln!(
+                "⏱ {} {}",
+                human_elapsed(start.elapsed()),
+                render_total(&evals),
+            );
             Ok(())
         }
     }

@@ -16,7 +16,16 @@
 use std::io;
 use std::time::Duration;
 
-use console::{Term, truncate_str};
+use console::{Term, style, truncate_str};
+
+/// Braille spinner frames (indicatif's default set).
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The cyan spinner glyph for tick `n` — the leading char of a timer line.
+/// Callers advance `n` once per redraw to animate it.
+pub fn spinner(n: usize) -> String {
+    style(SPINNER[n % SPINNER.len()]).cyan().to_string()
+}
 
 /// A block of lines redrawn in place. `drawn` is the number of rows the last
 /// frame occupied — equal to the line count, since every line is one row.

@@ -12,12 +12,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::cache;
+use crate::live::{Live, human_elapsed, spinner};
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
@@ -253,7 +256,37 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
             system_of.insert(t.drv_path.as_str(), t.system.as_str());
         }
     }
-    let probed = cache::in_cache_many(&to_probe);
+    // The probe is HTTP-bound and, on a first run over a big changed set, can
+    // take a silent minute — so show a spinner + running count while it works
+    // (a refresher thread reads the counter the probe workers bump).
+    let total = to_probe.len();
+    let probed = if to_probe.is_empty() {
+        HashMap::new()
+    } else {
+        let done = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        thread::scope(|s| {
+            s.spawn(|| {
+                let mut live = Live::new();
+                let start = Instant::now();
+                let mut tick = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    live.draw(&[format!(
+                        "{} ⏱ {} probing cache.nixos.org — {}/{total} drvs",
+                        spinner(tick),
+                        human_elapsed(start.elapsed()),
+                        done.load(Ordering::Relaxed),
+                    )]);
+                    thread::sleep(Duration::from_millis(100));
+                    tick += 1;
+                }
+                live.clear();
+            });
+            let probed = cache::in_cache_many(&to_probe, &done);
+            stop.store(true, Ordering::Relaxed);
+            probed
+        })
+    };
     let now = unix_now();
     for drv in &to_probe {
         if probed.get(drv).copied().unwrap_or(false) {
