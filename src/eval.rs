@@ -404,11 +404,50 @@ impl std::fmt::Display for EvalAborted {
 
 impl std::error::Error for EvalAborted {}
 
-/// Total physical RAM in MiB. Unlike *available* RAM (which the old planner
-/// used, and which lies — it moves while a minutes-long eval runs), this is an
-/// invariant of the machine, so the width heuristic may plan from it. Linux:
-/// `/proc/meminfo MemTotal`; macOS: `sysctl -n hw.memsize`; else 8 GiB.
+/// The memory ceiling npd plans slots from: total physical RAM, further capped
+/// by any cgroup limit the process runs under (a container, or a systemd
+/// `MemoryMax=` scope). Unlike *available* RAM (which the old planner used,
+/// and which lies — it moves while a minutes-long eval runs), both are
+/// **configured promises about the execution environment**, not measurements
+/// of a race: physical RAM via `/proc/meminfo MemTotal` (Linux) or
+/// `sysctl hw.memsize` (macOS, where cgroups don't exist and the cap is a
+/// no-op); the cgroup ceiling via [`cgroup_mem_limit_mb`]. If an admin edits a
+/// limit mid-run, the requeue feedback covers it like any other dynamic
+/// effect. Fallback 8 GiB.
 fn total_mem_mb() -> u64 {
+    let physical = physical_mem_mb();
+    match cgroup_mem_limit_mb() {
+        Some(limit) => physical.min(limit),
+        None => physical,
+    }
+}
+
+/// The tightest cgroup-v2 memory ceiling over this process's ancestry, in MiB
+/// — both `memory.max` (the OOM kill line) and `memory.high` (the reclaim
+/// throttle, just as bad for throughput). `None` when unlimited or off-Linux.
+fn cgroup_mem_limit_mb() -> Option<u64> {
+    let cg = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let root = Path::new("/sys/fs/cgroup");
+    let mut dir = PathBuf::from(format!("/sys/fs/cgroup{rel}"));
+    let mut min: Option<u64> = None;
+    while dir.starts_with(root) && dir != root {
+        for f in ["memory.max", "memory.high"] {
+            // The unlimited value is the literal string "max": parse fails, skip.
+            if let Ok(s) = fs::read_to_string(dir.join(f))
+                && let Ok(bytes) = s.trim().parse::<u64>()
+            {
+                min = Some(min.map_or(bytes, |m| m.min(bytes)));
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    min.map(|b| b / 1024 / 1024)
+}
+
+fn physical_mem_mb() -> u64 {
     if let Ok(s) = fs::read_to_string("/proc/meminfo")
         && let Some(kb) = s
             .lines()

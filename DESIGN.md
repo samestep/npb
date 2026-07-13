@@ -237,7 +237,9 @@ own one-worker `nix-eval-jobs` over the same import narrowed via `listToAttrs`
 per-attr in the worker, so error isolation is identical). All shards of all
 pending evals share **one global queue** and one knob: the number of slots
 (concurrent shard jobs), started at `min(cores, total RAM / worker cap)` —
-invariants only. The dynamic part of RAM is handled by feedback, TCP-style
+invariants only (total RAM further capped by any cgroup memory limit the
+process runs under: a container's ceiling is as much a configured promise as
+the DIMMs). The dynamic part of RAM is handled by feedback, TCP-style
 (AIMD), instead of measurement: a shard that aborts (in practice a worker
 OOM-kill, caught by the integrity gate) is simply **requeued** while the slot
 count halves; sustained success creeps it back up. Completed shards persist
