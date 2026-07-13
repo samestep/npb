@@ -245,7 +245,16 @@ OOM-kill, caught by the integrity gate) is simply **requeued** while the slot
 count halves; sustained success creeps it back up. Completed shards persist
 immediately under `evals/partial/`, so any interruption — ^C, OOM, crash —
 resumes at shard granularity; when an eval's last shard lands, its rows are
-assembled into the one cached file and the partials are deleted. Small atoms
+assembled into the one cached file and the partials are deleted. **A shard is
+only "done" if it produced ≥1 attr** — a ~400-name slice of nixpkgs' top level
+always has derivations, so a zero-attr result means the shard did not really
+run (a `nix-eval-jobs` miss, not an answer), and an empty partial is likewise
+distrusted and re-evaluated. Without this the queue's exit-code gate is not
+enough: a shard could slip through empty, and since evals are cached forever and
+never re-validated (§3) the incomplete file would silently poison every future
+diff. So an empty shard is retried, and if it persists the whole eval fails
+loudly rather than caching a short map — the completeness invariant a plain
+exit-code check can't give. Small atoms
 are what make everything cheap: an abort re-pays seconds (not a whole eval),
 idle slots drain any eval's remaining shards (no straggler eval), and the
 degenerate case — a machine that fits only one worker — is just the queue at
