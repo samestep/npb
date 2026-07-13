@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -348,7 +348,6 @@ pub fn eval_tests(
     let workers = attrs.len().clamp(1, 4);
     let short: String = commit.chars().take(12).collect();
     let label = format!("tests {short} ({system})");
-    let mut live = Live::new();
     let start = Instant::now();
     // Label and split from `attrPath` (unquoted elements) rather than `attr`
     // (which nix-eval-jobs quotes for the dotted package component, e.g.
@@ -366,23 +365,44 @@ pub fn eval_tests(
             broken,
         }
     };
-    let mut n = 0usize;
-    let mut tick = 0usize;
-    let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &label, map, || {
-        n += 1;
-        tick += 1;
-        live.draw(&[format!(
-            "{} ⏱ {} evaluating {label} — {n} tests",
-            spinner(tick),
-            human_elapsed(start.elapsed())
-        )]);
+    // A single `passthru.tests` entry is usually a `nixosTest` — evaluating one
+    // means evaluating a whole NixOS system, seconds apiece — so emissions are
+    // sparse. Drive the line from a 100ms refresher thread (not the per-emission
+    // callback, which leaves the spinner and timer frozen during a slow test and
+    // reads as a hang); the callback only bumps the count.
+    let n = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    let r = thread::scope(|s| {
+        {
+            let (n, done, label) = (&n, &done, &label);
+            s.spawn(move || {
+                let mut live = Live::new();
+                let mut tick = 0usize;
+                while !done.load(Ordering::Relaxed) {
+                    live.draw(&[format!(
+                        "{} ⏱ {} evaluating {label} — {} tests",
+                        spinner(tick),
+                        human_elapsed(start.elapsed()),
+                        n.load(Ordering::Relaxed),
+                    )]);
+                    thread::sleep(Duration::from_millis(100));
+                    tick += 1;
+                }
+                live.clear();
+            });
+        }
+        let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &label, map, || {
+            n.fetch_add(1, Ordering::Relaxed);
+        });
+        done.store(true, Ordering::Relaxed);
+        r
     });
-    live.clear();
     // Keep a frozen summary on screen, matching the full-set eval's line.
     if r.is_ok() {
         eprintln!(
-            "⏱ {} evaluated {label} — {n} tests",
-            human_elapsed(start.elapsed())
+            "⏱ {} evaluated {label} — {} tests",
+            human_elapsed(start.elapsed()),
+            n.load(Ordering::Relaxed),
         );
     }
     r
