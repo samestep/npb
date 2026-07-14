@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -890,16 +890,65 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
 
     // One shard group per `(commit, system)`; its items are the top-level attr
     // names. `meta` keeps the identifying pair per group for the closures.
+    //
+    // Enumerating a cold commit reads and hashes its whole source tree (a few
+    // seconds each — even on Nix ≥2.35, where the tree is no longer *copied*
+    // into the store, the content-addressed hash still forces a full read), and
+    // this loop runs before the shard scheduler starts its own display. So drive
+    // a small animated line here too, from a refresher thread, or a fresh
+    // multi-system run just sits silent for those seconds.
     let mut labels = Vec::new();
     let mut items = Vec::new();
     let mut meta: Vec<(&str, &str)> = Vec::new();
-    for &i in &todo {
-        let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
-        let names = enumerate_names(repo, commit, system)?;
-        let short: String = commit.chars().take(12).collect();
-        labels.push(format!("{short} {system}"));
-        items.push(names);
-        meta.push((commit, system));
+    {
+        let total = todo.len();
+        let done = AtomicUsize::new(0);
+        let current = Mutex::new(String::new());
+        let display = Mutex::new(Live::new());
+        let finished = AtomicBool::new(false);
+        let start = Instant::now();
+        let outcome = thread::scope(|s| -> Result<()> {
+            {
+                let (done, current, display, finished) = (&done, &current, &display, &finished);
+                s.spawn(move || {
+                    let mut tick = 0usize;
+                    while !finished.load(Ordering::Relaxed) {
+                        let cur = current.lock().unwrap().clone();
+                        let line = format!(
+                            "{} ⏱ {}  enumerating top-level attrs: {cur} ({}/{total})",
+                            spinner(tick),
+                            human_elapsed(start.elapsed()),
+                            done.load(Ordering::Relaxed),
+                        );
+                        display.lock().unwrap().draw(&[line]);
+                        thread::sleep(Duration::from_millis(100));
+                        tick += 1;
+                    }
+                });
+            }
+            let mut res = Ok(());
+            for &i in &todo {
+                let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
+                let short: String = commit.chars().take(12).collect();
+                *current.lock().unwrap() = format!("{short} {system}");
+                match enumerate_names(repo, commit, system) {
+                    Ok(names) => {
+                        labels.push(format!("{short} {system}"));
+                        items.push(names);
+                        meta.push((commit, system));
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        break;
+                    }
+                }
+            }
+            finished.store(true, Ordering::Relaxed);
+            res
+        });
+        display.lock().unwrap().clear();
+        outcome?;
     }
 
     run_shards(
