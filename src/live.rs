@@ -1,19 +1,29 @@
 //! A small inline multi-line live display — the eval progress readout
 //! (`crate::eval`). It redraws a block of lines in place on stderr, each line
 //! **truncated to the current terminal width** so it always occupies exactly
-//! one row. That one invariant is the whole point: `move_cursor_up(n)` then
-//! lands on the block's top even after the window is resized, whereas indicatif
-//! pads every line out to the full width — which reflows into garbage the moment
-//! the width changes (its cursor math is fixed at the *previous* width). We clear
-//! stale cells with `\x1b[K`/`\x1b[0J` (via `console`) instead of overwriting
-//! with spaces, so a shorter line leaves nothing behind and nothing to reflow.
+//! one row. That one invariant is the whole point: moving the cursor up `n` rows
+//! then lands on the block's top even after the window is resized, whereas
+//! indicatif pads every line out to the full width — which reflows into garbage
+//! the moment the width changes (its cursor math is fixed at the *previous*
+//! width). Truncated content leaves nothing to reflow.
+//!
+//! **Flicker-free, especially over a laggy SSH link.** A frame is built as one
+//! string and written once (one packet, not one per line), and:
+//! - content is *overwritten in place* then the tail cleared (`content` + `\x1b[K`),
+//!   never blanked first (`\x1b[2K` then write) — so there's no blank flash while
+//!   the new bytes are in flight;
+//! - lines unchanged since the last frame are skipped (the cursor just steps
+//!   over them), so a steady line isn't rewritten 10×/s;
+//! - the whole frame is wrapped in the *synchronized output* private mode
+//!   (`\x1b[?2026h`…`l`), so terminals that support it (iTerm2, kitty, WezTerm,
+//!   tmux ≥3.4) render it atomically — no tearing — and others ignore it.
 //!
 //! Render-only: no raw mode, no alternate screen, cursor left visible. So a ^C
 //! mid-run just leaves the last (short, unpadded) block on screen, which reflows
 //! like ordinary command output rather than the old full-width mess — no signal
 //! handler required to keep resize sane.
 
-use std::io;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use console::{Term, style, truncate_str};
@@ -32,9 +42,10 @@ pub fn spinner(n: usize) -> String {
 pub struct Live {
     term: Term,
     drawn: usize,
-    /// Last lines drawn, so [`Live::print_above`] can repaint the block under a
-    /// one-off message without the caller re-supplying them.
-    last: Vec<String>,
+    /// Lines shown last frame, and the width they were truncated at — so a frame
+    /// only rewrites the lines that changed (and forces a full redraw on resize).
+    prev: Vec<String>,
+    prev_width: usize,
 }
 
 impl Live {
@@ -42,7 +53,8 @@ impl Live {
         Self {
             term: Term::stderr(),
             drawn: 0,
-            last: Vec::new(),
+            prev: Vec::new(),
+            prev_width: 0,
         }
     }
 
@@ -53,65 +65,75 @@ impl Live {
     /// Redraw the block in place. A no-op on a non-terminal stderr (piped / CI):
     /// there is no cursor to move, and the caller's final summary still prints.
     pub fn draw(&mut self, lines: &[String]) {
-        self.last = lines.to_vec();
-        if self.term.is_term() {
-            let _ = self.repaint();
+        if !self.term.is_term() {
+            return;
         }
-    }
-
-    fn repaint(&mut self) -> io::Result<()> {
         let w = self.width();
+        // A resize changes every line's truncation, so redraw all lines then.
+        let full = w != self.prev_width || lines.len() != self.prev.len();
+
+        let mut buf = String::from("\x1b[?2026h"); // begin synchronized update
         if self.drawn > 0 {
-            self.term.move_cursor_up(self.drawn)?;
+            let _ = write!(buf, "\x1b[{}A", self.drawn); // up to the block's top row
         }
-        for line in &self.last {
-            // `clear_line` is `\r\x1b[2K`: back to column 0 and erase the row, so
-            // a line shorter than last frame's leaves no tail (no space-padding).
-            self.term.clear_line()?;
-            self.term.write_str(&truncate_str(line, w, ""))?;
-            self.term.write_str("\n")?;
+        buf.push('\r');
+        for (i, line) in lines.iter().enumerate() {
+            if full || self.prev.get(i).map(String::as_str) != Some(line.as_str()) {
+                // Overwrite in place, then clear only the tail — no blank flash.
+                buf.push_str(&truncate_str(line, w, ""));
+                buf.push_str("\x1b[K");
+            }
+            buf.push_str("\r\n"); // step to column 0 of the next row
         }
         // Fewer lines than last frame? Erase the now-orphaned rows below.
-        if self.last.len() < self.drawn {
-            self.term.clear_to_end_of_screen()?;
+        if lines.len() < self.drawn {
+            buf.push_str("\x1b[J");
         }
-        self.term.flush()?;
-        self.drawn = self.last.len();
-        Ok(())
+        buf.push_str("\x1b[?2026l"); // end synchronized update
+        let _ = self.term.write_str(&buf);
+        let _ = self.term.flush();
+
+        self.drawn = lines.len();
+        self.prev = lines.to_vec();
+        self.prev_width = w;
     }
 
     /// Emit `msg` as permanent output *above* the live block (a one-off note,
-    /// e.g. a requeued shard), then repaint the block beneath it.
+    /// e.g. a requeued shard). The block is erased and reappears on the next
+    /// [`Live::draw`], below the now-permanent message.
     pub fn print_above(&mut self, msg: &str) {
         if !self.term.is_term() {
             eprintln!("{msg}");
             return;
         }
-        let _ = (|| -> io::Result<()> {
-            let w = self.width();
-            if self.drawn > 0 {
-                self.term.move_cursor_up(self.drawn)?;
-            }
-            self.term.clear_to_end_of_screen()?; // wipe the block region
-            for l in msg.lines() {
-                self.term.write_str(&truncate_str(l, w, ""))?;
-                self.term.write_str("\n")?;
-            }
-            self.drawn = 0;
-            self.repaint() // block reappears below the now-permanent message
-        })();
+        let w = self.width();
+        let mut buf = String::from("\x1b[?2026h");
+        if self.drawn > 0 {
+            let _ = write!(buf, "\x1b[{}A", self.drawn);
+        }
+        buf.push_str("\r\x1b[J"); // to the block's top, erase it and everything below
+        for l in msg.lines() {
+            buf.push_str(&truncate_str(l, w, ""));
+            buf.push_str("\x1b[K\r\n");
+        }
+        buf.push_str("\x1b[?2026l");
+        let _ = self.term.write_str(&buf);
+        let _ = self.term.flush();
+        self.drawn = 0;
+        self.prev.clear(); // next draw redraws the block in full
     }
 
     /// Erase the block, leaving the cursor at its top. The caller then prints a
     /// clean, unpadded final summary as ordinary output.
     pub fn clear(&mut self) {
         if self.term.is_term() && self.drawn > 0 {
-            let _ = self.term.move_cursor_up(self.drawn);
-            let _ = self.term.clear_to_end_of_screen();
+            let _ = self
+                .term
+                .write_str(&format!("\x1b[{}A\r\x1b[J", self.drawn));
             let _ = self.term.flush();
         }
         self.drawn = 0;
-        self.last.clear();
+        self.prev.clear();
     }
 }
 
