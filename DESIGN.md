@@ -315,8 +315,15 @@ never builds (only the changed set of a few dozen is). The two consumers that
 drv's output paths) and the local build (`nix build <drv>^*`, §5) — get it from
 a just-in-time `eval::instantiate` step: one `nix-eval-jobs` run per
 `(commit, system)`, instantiation on, over exactly the changed attr paths
-(nested paths included, via `lib.attrByPath`), run right before building. It is
-skipped under `--no-build`, which needs neither. On a RAM-constrained machine
+(nested paths included, via `lib.attrByPath`), run right before building. These
+per-pair runs go through the **same shard scheduler** as the two eval paths
+(`run_shards`), so a fresh multi-system run instantiates all pairs concurrently
+(up to the same slot count) behind the identical live display, instead of
+silently re-importing nixpkgs once per pair in series. Each pair is *one* shard
+— the cost here is the per-run nixpkgs import, so sub-slicing a pair's handful
+of changed attrs would only re-pay that import — so this trims the phase's
+wall-time from the *sum* of the imports toward the *slowest single* one at no
+extra total work. It is skipped under `--no-build`, which needs neither. On a RAM-constrained machine
 the lean `--no-instantiate` workers are also what let npd parallelize at all —
 instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
 

@@ -399,7 +399,11 @@ pub fn eval_tests_many(
         items,
         shard_size,
         slots,
-        "tests",
+        ShardWords {
+            unit: "tests",
+            active: "evaluating",
+            done: "evaluated",
+        },
         |gi, label, pkgs, on_item| {
             let (commit, system) = meta[gi];
             let expr = build_tests_expr(repo, commit, system, pkgs);
@@ -629,23 +633,72 @@ fn select_expr(repo: &Path, commit: &str, system: &str, paths: &[String]) -> Str
 /// touch — the small changed set — are materialized here, one `nix-eval-jobs`
 /// run per `(commit, system)` with instantiation on. Streamed rows are
 /// discarded; the store write is the point. Runs only when about to build.
+///
+/// The per-pair runs go through the **same shard scheduler** as the two eval
+/// paths (`run_shards`) so they run concurrently and get the identical live
+/// display — a fresh multi-system run would otherwise sit silent through six
+/// serial nixpkgs re-imports (base+head × the systems). Each request is **one
+/// shard** (no sub-slicing): the whole cost here is the per-run nixpkgs import,
+/// so splitting a request's handful of changed attrs across shards would only
+/// re-pay that import for no gain. Concurrency is what wins — the phase's
+/// wall-time drops from the *sum* of the imports to (roughly) the *slowest*
+/// one, up to `slots` at a time, at no extra total work.
 pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> Result<()> {
-    for (commit, system, paths) in requests {
-        if paths.is_empty() {
-            continue;
-        }
-        let expr = select_expr(repo, commit, system, paths);
-        stream_jobs(
-            &expr,
-            1,
-            DEFAULT_WORKER_MEM_MB,
-            true,
-            "instantiate",
-            |_| (),
-            || {},
-        )?;
+    // Drop the sides with nothing to instantiate (a diff side can have no
+    // buildable changed attrs) so they don't clutter the display.
+    let requests: Vec<&(String, String, Vec<String>)> =
+        requests.iter().filter(|(_, _, p)| !p.is_empty()).collect();
+    if requests.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, None);
+
+    let labels: Vec<String> = requests
+        .iter()
+        .map(|(commit, system, _)| {
+            let short: String = commit.chars().take(12).collect();
+            format!("{short} {system}")
+        })
+        .collect();
+    let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
+    let meta: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|(c, s, _)| (c.as_str(), s.as_str()))
+        .collect();
+    // A shard per request: sizing at the largest request makes every group
+    // exactly one shard (no split), so each pair re-imports nixpkgs just once.
+    let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
+
+    run_shards(
+        labels,
+        items,
+        shard_size,
+        slots,
+        ShardWords {
+            unit: "drvs",
+            active: "instantiating",
+            done: "instantiated",
+        },
+        |gi, label, paths, on_item| {
+            let (commit, system) = meta[gi];
+            let expr = select_expr(repo, commit, system, paths);
+            // Streamed rows are discarded (mapped to `()`); the `.drv` writes are
+            // the point. The per-job callback drives the live count.
+            stream_jobs(
+                &expr,
+                1,
+                DEFAULT_WORKER_MEM_MB,
+                true,
+                label,
+                |_| (),
+                || on_item(1),
+            )
+        },
+        |_, _| Ok(()),
+    )
 }
 
 /// The directory holding one eval's shard partials (deleted once the eval is
@@ -674,6 +727,16 @@ fn partial_path(commit: &str, system: &str, names: &[String]) -> Result<PathBuf>
 
 // --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
 
+/// The words the shard display uses for a run: `unit` is the item noun (e.g.
+/// "attrs"), `active`/`done` the in-progress/finished verbs ("evaluating" /
+/// "evaluated"). Bundled so [`run_shards`] stays within a sane arg count.
+#[derive(Clone, Copy)]
+struct ShardWords<'a> {
+    unit: &'a str,
+    active: &'a str,
+    done: &'a str,
+}
+
 /// One group of shards run together: one line in the progress display, one
 /// assembled result. Its `items` (top-level names for the full eval, changed
 /// packages for `--tests`) are sliced into shards; the counters below drive the
@@ -695,8 +758,10 @@ struct Shard {
 }
 
 /// Run a set of shard groups through one bounded, AIMD-controlled worker pool
-/// with a live `done + running / total` display, shared by both eval paths
-/// (DESIGN §6). Persistence and resume are the caller's job (via the closures),
+/// with a live `done + running / total` display, shared by the full-set, tests,
+/// and instantiate paths (DESIGN §6). `words` supplies the item noun and the
+/// active/done verbs the display labels each group with.
+/// Persistence and resume are the caller's job (via the closures),
 /// since the full eval assembles a flat file while `--tests` returns rows for
 /// SQLite (DESIGN §4); this owns only the scheduling and the display.
 ///
@@ -710,7 +775,7 @@ fn run_shards<T: Send>(
     items: Vec<Vec<String>>,
     shard_size: usize,
     slots: usize,
-    unit: &str,
+    words: ShardWords<'_>,
     eval_shard: impl Fn(usize, &str, &[String], &(dyn Fn(usize) + Sync)) -> Result<Vec<T>> + Sync,
     on_group_complete: impl Fn(usize, Vec<T>) -> Result<()> + Sync,
 ) -> Result<()> {
@@ -757,10 +822,11 @@ fn run_shards<T: Send>(
         let done = g.shards_done.load(Ordering::Relaxed);
         let running = g.shards_running.load(Ordering::Relaxed);
         let done_items = g.items_done.load(Ordering::Relaxed);
+        let unit = words.unit;
         let verb = if done == g.shards_total {
-            "evaluated"
+            words.done
         } else {
-            "evaluating"
+            words.active
         };
         let shards = if running > 0 {
             format!("{done}+{running}/{}", g.shards_total)
@@ -768,7 +834,7 @@ fn run_shards<T: Send>(
             format!("{done}/{}", g.shards_total)
         };
         format!(
-            "  {verb:<10} {label:<label_w$}  {done_items:>6} {unit}  {shards} shards",
+            "  {verb:<13} {label:<label_w$}  {done_items:>6} {unit}  {shards} shards",
             label = g.label,
         )
     };
@@ -780,10 +846,11 @@ fn run_shards<T: Send>(
             total += g.shards_total;
             done_items += g.items_done.load(Ordering::Relaxed);
         }
+        let unit = words.unit;
         let verb = if done == total {
-            "evaluated"
+            words.done
         } else {
-            "evaluating"
+            words.active
         };
         let shards = if running > 0 {
             format!("{done}+{running}/{total}")
@@ -1086,7 +1153,11 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         items,
         opts.shard_size.unwrap_or(NAMES_PER_SHARD),
         slots,
-        "attrs",
+        ShardWords {
+            unit: "attrs",
+            active: "evaluating",
+            done: "evaluated",
+        },
         // Evaluate one shard — resuming from a persisted partial if present,
         // else streaming it and persisting the partial for a later resume.
         |gi, label, names, on_item| {
