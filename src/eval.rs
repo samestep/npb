@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
-use crate::live::{Live, human_elapsed, spinner};
+use crate::live::{human_elapsed, spinner, with_live};
 use crate::model::{AttrEval, TestJob};
 
 /// The one nixpkgs config every eval runs under. npd owns the config
@@ -813,7 +813,6 @@ fn run_shards<T: Send>(
     let slots = slots.min(queue.len());
     let label_w = groups.iter().map(|g| g.label.len()).max().unwrap_or(0);
 
-    let display = Mutex::new(Live::new());
     let start = Instant::now();
 
     // One line per group: `done + running / total` shards (the `+running` term
@@ -877,124 +876,112 @@ fn run_shards<T: Send>(
     let target = AtomicUsize::new(slots);
     let successes = AtomicUsize::new(0);
 
-    thread::scope(|s| {
-        // A single refresher owns every terminal write: workers only bump
-        // atomics, and this thread draws the whole block at a steady 100 ms
-        // (animating the spinner + timer) until the queue drains.
-        {
-            let (q, groups, display) = (&q, &groups, &display);
-            let (render, render_total) = (&render, &render_total);
-            s.spawn(move || {
-                let mut tick = 0usize;
-                loop {
-                    let mut lines: Vec<String> = groups.iter().map(render).collect();
-                    lines.push(format!(
-                        "{} ⏱ {} {}",
-                        spinner(tick),
-                        human_elapsed(start.elapsed()),
-                        render_total(),
-                    ));
-                    display.lock().unwrap().draw(&lines);
-                    {
-                        let g = q.lock().unwrap();
-                        if g.fatal.is_some() || g.outstanding == 0 {
-                            return;
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                    tick += 1;
-                }
-            });
-        }
-        for w in 0..slots {
-            let (q, target, successes, groups, display, eval_shard, on_group_complete) = (
-                &q,
-                &target,
-                &successes,
-                &groups,
-                &display,
-                &eval_shard,
-                &on_group_complete,
-            );
-            s.spawn(move || {
-                loop {
-                    let shard = {
-                        let mut g = q.lock().unwrap();
-                        if g.fatal.is_some() || g.outstanding == 0 {
-                            return;
-                        }
-                        // Parked slots (w >= target) and an empty-but-not-done
-                        // queue both just wait: an aborted shard may requeue.
-                        if w < target.load(Ordering::Relaxed) {
-                            g.queue.pop_front()
-                        } else {
-                            None
-                        }
-                    };
-                    let Some(shard) = shard else {
-                        thread::sleep(Duration::from_millis(200));
-                        continue;
-                    };
-                    let g = &groups[shard.group];
-                    let slice = &g.items[shard.items.clone()];
+    // The live block is driven by `with_live` (the shared display primitive):
+    // its refresher redraws the whole block every 100 ms off the atomics below,
+    // while `body` runs the worker pool. Workers only bump atomics and, on a
+    // requeue, emit a note above the block via the handle.
+    with_live(
+        |tick| {
+            let mut lines: Vec<String> = groups.iter().map(&render).collect();
+            lines.push(format!(
+                "{} ⏱ {} {}",
+                spinner(tick),
+                human_elapsed(start.elapsed()),
+                render_total(),
+            ));
+            lines
+        },
+        |handle| {
+            thread::scope(|s| {
+                for w in 0..slots {
+                    let (q, target, successes, groups, eval_shard, on_group_complete) = (
+                        &q,
+                        &target,
+                        &successes,
+                        &groups,
+                        &eval_shard,
+                        &on_group_complete,
+                    );
+                    s.spawn(move || {
+                        loop {
+                            let shard = {
+                                let mut g = q.lock().unwrap();
+                                if g.fatal.is_some() || g.outstanding == 0 {
+                                    return;
+                                }
+                                // Parked slots (w >= target) and an empty-but-not-done
+                                // queue both just wait: an aborted shard may requeue.
+                                if w < target.load(Ordering::Relaxed) {
+                                    g.queue.pop_front()
+                                } else {
+                                    None
+                                }
+                            };
+                            let Some(shard) = shard else {
+                                thread::sleep(Duration::from_millis(200));
+                                continue;
+                            };
+                            let g = &groups[shard.group];
+                            let slice = &g.items[shard.items.clone()];
 
-                    g.shards_running.fetch_add(1, Ordering::Relaxed);
-                    let outcome = (|| -> Result<()> {
-                        let on_item = |n: usize| {
-                            g.items_done.fetch_add(n, Ordering::Relaxed);
-                        };
-                        let rows = eval_shard(shard.group, &g.label, slice, &on_item)?;
-                        g.rows.lock().unwrap().extend(rows);
-                        let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done == g.shards_total {
-                            let rows = std::mem::take(&mut *g.rows.lock().unwrap());
-                            // Pin the count to the assembled rows in case the
-                            // streamed/resumed tallies drifted.
-                            g.items_done.store(rows.len(), Ordering::Relaxed);
-                            on_group_complete(shard.group, rows)?;
-                        }
-                        Ok(())
-                    })();
-                    g.shards_running.fetch_sub(1, Ordering::Relaxed);
+                            g.shards_running.fetch_add(1, Ordering::Relaxed);
+                            let outcome = (|| -> Result<()> {
+                                let on_item = |n: usize| {
+                                    g.items_done.fetch_add(n, Ordering::Relaxed);
+                                };
+                                let rows = eval_shard(shard.group, &g.label, slice, &on_item)?;
+                                g.rows.lock().unwrap().extend(rows);
+                                let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if done == g.shards_total {
+                                    let rows = std::mem::take(&mut *g.rows.lock().unwrap());
+                                    // Pin the count to the assembled rows in case the
+                                    // streamed/resumed tallies drifted.
+                                    g.items_done.store(rows.len(), Ordering::Relaxed);
+                                    on_group_complete(shard.group, rows)?;
+                                }
+                                Ok(())
+                            })();
+                            g.shards_running.fetch_sub(1, Ordering::Relaxed);
 
-                    match outcome {
-                        Ok(()) => {
-                            q.lock().unwrap().outstanding -= 1;
-                            let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
-                            let t = target.load(Ordering::Relaxed);
-                            if n % 4 == 0 && t < slots {
-                                target.store(t + 1, Ordering::Relaxed);
+                            match outcome {
+                                Ok(()) => {
+                                    q.lock().unwrap().outstanding -= 1;
+                                    let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
+                                    let t = target.load(Ordering::Relaxed);
+                                    if n % 4 == 0 && t < slots {
+                                        target.store(t + 1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
+                                    let t = target.load(Ordering::Relaxed);
+                                    let nt = (t / 2).max(1);
+                                    target.store(nt, Ordering::Relaxed);
+                                    successes.store(0, Ordering::Relaxed);
+                                    handle.note(&format!(
+                                        "  a shard of {} aborted — likely out of memory; \
+                                         requeued, slots {t} -> {nt}",
+                                        g.label,
+                                    ));
+                                    q.lock().unwrap().queue.push_back(shard);
+                                }
+                                Err(e) => {
+                                    let mut g = q.lock().unwrap();
+                                    if g.fatal.is_none() {
+                                        g.fatal = Some(e);
+                                    }
+                                }
                             }
                         }
-                        Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
-                            let t = target.load(Ordering::Relaxed);
-                            let nt = (t / 2).max(1);
-                            target.store(nt, Ordering::Relaxed);
-                            successes.store(0, Ordering::Relaxed);
-                            display.lock().unwrap().print_above(&format!(
-                                "  a shard of {} aborted — likely out of memory; \
-                                 requeued, slots {t} -> {nt}",
-                                g.label,
-                            ));
-                            q.lock().unwrap().queue.push_back(shard);
-                        }
-                        Err(e) => {
-                            let mut g = q.lock().unwrap();
-                            if g.fatal.is_none() {
-                                g.fatal = Some(e);
-                            }
-                        }
-                    }
+                    });
                 }
             });
-        }
-    });
+        },
+    );
 
-    // Erase the live block and reprint the finished lines as ordinary output, so
-    // the summary stays on screen and a later resize reflows it like any
-    // command's output (the block itself was already resize-safe; see
+    // `with_live` has erased the block; reprint the finished lines as ordinary
+    // output, so the summary stays on screen and a later resize reflows it like
+    // any command's output (the block itself was already resize-safe; see
     // `crate::live`).
-    display.lock().unwrap().clear();
     match q.into_inner().unwrap().fatal {
         Some(e) => Err(e),
         None => {
@@ -1038,116 +1025,61 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     // 4 GiB restart cap (`per_worker_mb`) — the two are deliberately decoupled.
     let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, opts.slots);
 
-    // One shard group per `(commit, system)`; its items are the top-level attr
-    // names. `meta` keeps the identifying pair per group for the closures.
-    //
-    // Enumerating a cold commit reads and hashes its whole source tree (a few
-    // seconds each — even on Nix ≥2.35, where the tree is no longer *copied*
-    // into the store, the content-addressed hash still forces a full read), and
-    // this runs before the shard scheduler starts its own display. Two things
-    // follow. Run the enumerations concurrently: each distinct commit's hash is
-    // independent, so base and head overlap instead of summing (measured ~2×),
-    // and Nix's fetcher locks serialize same-commit races so a warm same-commit
-    // pair still returns cheaply. And drive an animated line from a refresher
-    // thread, or a fresh multi-system run just sits silent for those seconds.
-    // Bounded by `slots` like the shard pool — a lone nix-instantiate here is
-    // ~0.5 GB (well under a shard worker's cap), so this is a conservative
-    // ceiling that can't oversubscribe RAM.
-    let mut labels = Vec::new();
-    let mut items = Vec::new();
-    let mut meta: Vec<(&str, &str)> = Vec::new();
-    {
-        let total = todo.len();
-        let names: Vec<Mutex<Option<Vec<String>>>> = (0..total).map(|_| Mutex::new(None)).collect();
-        let next = AtomicUsize::new(0);
-        let done = AtomicUsize::new(0);
-        let running = AtomicUsize::new(0);
-        let fatal: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let display = Mutex::new(Live::new());
-        let finished = AtomicBool::new(false);
-        let start = Instant::now();
-        let workers = slots.min(total).max(1);
-        thread::scope(|s| {
-            // Refresher: the sole terminal writer, animating spinner + timer.
-            {
-                let (done, running, display, finished) = (&done, &running, &display, &finished);
-                s.spawn(move || {
-                    let mut tick = 0usize;
-                    while !finished.load(Ordering::Relaxed) {
-                        let (d, r) = (
-                            done.load(Ordering::Relaxed),
-                            running.load(Ordering::Relaxed),
-                        );
-                        let count = if r > 0 {
-                            format!("{d}+{r}/{total}")
-                        } else {
-                            format!("{d}/{total}")
-                        };
-                        let line = format!(
-                            "{} ⏱ {}  enumerating top-level attrs {count}",
-                            spinner(tick),
-                            human_elapsed(start.elapsed()),
-                        );
-                        display.lock().unwrap().draw(&[line]);
-                        thread::sleep(Duration::from_millis(100));
-                        tick += 1;
-                    }
-                });
-            }
-            // Workers pull the next `todo` index off a shared counter, stash the
-            // result in its slot, and stop on the first fatal error.
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let (next, done, running, fatal, names, todo) =
-                    (&next, &done, &running, &fatal, &names, &todo);
-                handles.push(s.spawn(move || {
-                    while fatal.lock().unwrap().is_none() {
-                        let pos = next.fetch_add(1, Ordering::Relaxed);
-                        if pos >= total {
-                            return;
-                        }
-                        let i = todo[pos];
-                        let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
-                        running.fetch_add(1, Ordering::Relaxed);
-                        let outcome = enumerate_names(repo, commit, system);
-                        running.fetch_sub(1, Ordering::Relaxed);
-                        match outcome {
-                            Ok(v) => {
-                                *names[pos].lock().unwrap() = Some(v);
-                                done.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                fatal.lock().unwrap().get_or_insert(e);
-                                return;
-                            }
-                        }
-                    }
-                }));
-            }
-            for h in handles {
-                let _ = h.join();
-            }
-            finished.store(true, Ordering::Relaxed);
-        });
-        display.lock().unwrap().clear();
-        if let Some(e) = fatal.into_inner().unwrap() {
-            return Err(e);
-        }
-        // Assemble in `todo` order (no fatal error ⇒ every slot is filled).
-        for (pos, slot) in names.into_iter().enumerate() {
-            let i = todo[pos];
-            let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
-            let short: String = commit.chars().take(12).collect();
-            labels.push(format!("{short} {system}"));
-            items.push(
-                slot.into_inner()
-                    .unwrap()
-                    .expect("enumerated when no error"),
-            );
-            meta.push((commit, system));
-        }
-    }
+    // One shard group per `(commit, system)` for both phases below; `meta` keeps
+    // the identifying pair per group, `labels` the display name.
+    let meta: Vec<(&str, &str)> = todo
+        .iter()
+        .map(|&i| (pairs[i].0.as_str(), pairs[i].1.as_str()))
+        .collect();
+    let labels: Vec<String> = meta
+        .iter()
+        .map(|(commit, _)| commit.chars().take(12).collect::<String>())
+        .zip(&meta)
+        .map(|(short, (_, system))| format!("{short} {system}"))
+        .collect();
 
+    // Phase 1: enumerate each pair's top-level attr names — the space phase 2
+    // shards. This runs through the *same scheduler*, one shard per pair (the
+    // work is a single `builtins.attrNames` call — not a fannable set — so there
+    // is nothing to sub-slice): the pairs enumerate concurrently behind the
+    // shared live display instead of a bespoke pool. Enumerating a cold commit
+    // reads and hashes its whole source tree (a few seconds — even on Nix ≥2.35,
+    // where the tree is no longer *copied* into the store, the content-addressed
+    // hash still forces a full read); running the pairs concurrently overlaps
+    // those hashes instead of summing them (each distinct commit is independent —
+    // measured ~2×; Nix's fetcher locks serialize same-commit races, so a warm
+    // pair still returns cheaply). Reusing the eval slot count can't oversubscribe
+    // RAM — a lone `nix-instantiate` is ~0.5 GB, well under a shard worker's cap.
+    let enumerated: Vec<Mutex<Vec<String>>> =
+        (0..meta.len()).map(|_| Mutex::new(Vec::new())).collect();
+    run_shards(
+        labels.clone(),
+        // One placeholder item per group ⇒ exactly one shard per pair.
+        meta.iter().map(|_| vec![String::new()]).collect(),
+        1,
+        slots,
+        ShardWords {
+            unit: "attrs",
+            active: "enumerating",
+            done: "enumerated",
+        },
+        |gi, _label, _slice, on_item| {
+            let (commit, system) = meta[gi];
+            let names = enumerate_names(repo, commit, system)?;
+            on_item(names.len());
+            Ok(names)
+        },
+        |gi, names| {
+            *enumerated[gi].lock().unwrap() = names;
+            Ok(())
+        },
+    )?;
+    let items: Vec<Vec<String>> = enumerated
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect();
+
+    // Phase 2: shard-evaluate every pair's enumerated names into its cached file.
     run_shards(
         labels,
         items,

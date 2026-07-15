@@ -234,8 +234,10 @@ fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, on
 
 **Scheduling — one queue of shards.** The scheduling and failure atom is not a
 whole-set eval but a **shard**: a ~1024-name slice of one eval's top-level attr
-names (enumerated by one cheap `builtins.attrNames` call; overridable with
-`--shard-size`), evaluated by its own one-worker `nix-eval-jobs` over the same
+names — enumerated by one cheap `builtins.attrNames` call per pair, itself run
+through this same scheduler as a single-shard group so a multi-system run's
+enumerations overlap behind the shared display (the ~1024 is overridable with
+`--shard-size`) — evaluated by its own one-worker `nix-eval-jobs` over the same
 import narrowed via `listToAttrs` — validated byte-for-byte to reproduce the
 monolithic walk (thunks force per-attr in the worker, so error isolation is
 identical). Bigger shards amortize the per-shard nixpkgs re-import; ~800–1600 is
@@ -397,8 +399,13 @@ eval hands all its `(commit, system)` pairs to one queue), rather than one
 key at a time — sliced into ~2×`eval-slots` shards so the pool stays full (a
 `nixosTest` ≈ a whole NixOS system, so the AIMD memory backoff matters). It gets
 the identical `done + running / total` display. Sharing the scheduler means its
-concurrency logic is exercised — and kept correct — by both paths rather than
-diverging. Persistence stays path-specific (§4): the full eval assembles a flat
+concurrency logic is exercised — and kept correct — by **every** memory-heavy
+`nix-eval-jobs` fan-out (enumeration, the full-set eval, `--tests`, and
+instantiation, §6) rather than each re-implementing it. And every live readout in
+npd — the scheduler *and* the network-bound cache probe (§7) — animates through
+one display primitive (`live::with_live` in `src/live.rs`: a refresher thread that
+redraws a block at a steady 100 ms and tears it down on completion), so they look
+and behave identically even though their concurrency engines differ. Persistence stays path-specific (§4): the full eval assembles a flat
 file, `--tests` returns rows for the per-package SQLite cache. A fully-cached
 re-run touches no `nix-eval-jobs` at all. Caching matters here because evaluating a test's drv
 means evaluating its whole derivation graph, and a `nixosTest` in `passthru.tests`
@@ -477,6 +484,39 @@ eval/diff/build/report primitives are internal modules, not subcommands).
 
 Open refinements: remote-builder fan-out; a `Local`-vs-`Cache` fidelity probe
 (from-source build vs. substitution).
+
+**Considered direction — a per-system pipeline over the whole pre-build graph.**
+Today the phases up to the build run as global barriers: *all* pairs enumerate →
+*all* eval → *all* diffs → *all* `--tests` → *all* instantiate → probe → build. But
+the real dependency graph is a fixed pipeline replicated per system and side —
+`enumerate(c,s) → eval(c,s)`, then `diff(s) → tests(s) → instantiate(s) →
+probe(s)` — with systems independent until the report. So a straggler (one slow
+system, or a giant `haskellPackages` shard) stalls every *other* system's
+downstream phases behind it, even though they are data-independent. A pipeline
+executor (à la a per-item `pipeline()` with no barrier between stages) would let a
+fast system flow all the way to the build while a slow one is still evaluating —
+the same "small atoms, drain idle slots, no straggler phase" argument as §6,
+lifted from *within* eval to *across* phases. Two constraints shape it, and are
+why this is **not** one universal worker pool:
+
+- **Resource dimensions don't share a limit.** Eval/instantiate/enumerate are
+  RAM-bound (the `slots`/AIMD queue above); the narinfo probe is network-bound
+  (64 reused connections, no OOM notion). One pool can't serve both — the executor
+  needs *typed* resource pools, with the eval scheduler being the RAM pool.
+- **The build barrier is a soundness constraint, not a nicety** (§5): a build
+  co-scheduled with eval workers risks an OOM-killed build recorded as a false
+  `Failed`. So "everything up to builds, concurrently" is exactly the right cut —
+  the probe (network) may overlap freely, but no build starts until the RAM-heavy
+  eval-class work has drained.
+
+The prize is concentrated in the **cold-cache, multi-system** case; in the
+warm-cache iterative loop npd is built for (§1) eval is instant and little
+cross-phase slack remains, so this is gated on cold multi-system runs actually
+hurting in practice — it is *not* a general task-graph engine for what is really a
+regular pipeline. The near-term, unconditionally-worthwhile piece of it — one
+shared progress-display primitive (`live::with_live`) that every phase animates
+through — is already done (§6); the executor is the part deferred until the
+cold-run wall-time justifies it.
 
 **Known gotcha (root-caused) — `nix-eval-jobs` restarts its worker after every
 job on macOS.** The ~100× darwin slowdown (measured ~1.5 attrs/s on an

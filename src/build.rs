@@ -12,15 +12,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::cache;
-use crate::live::{Live, human_elapsed, spinner};
+use crate::live::{human_elapsed, spinner, with_live};
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
@@ -257,35 +256,25 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
         }
     }
     // The probe is HTTP-bound and, on a first run over a big changed set, can
-    // take a silent minute — so show a spinner + running count while it works
-    // (a refresher thread reads the counter the probe workers bump).
+    // take a silent minute — so drive the shared live display (`with_live`) with
+    // a spinner + running count off the counter the probe workers bump.
     let total = to_probe.len();
     let probed = if to_probe.is_empty() {
         HashMap::new()
     } else {
         let done = AtomicUsize::new(0);
-        let stop = AtomicBool::new(false);
         let start = Instant::now();
-        let probed = thread::scope(|s| {
-            s.spawn(|| {
-                let mut live = Live::new();
-                let mut tick = 0usize;
-                while !stop.load(Ordering::Relaxed) {
-                    live.draw(&[format!(
-                        "{} ⏱ {} probing cache.nixos.org — {}/{total} drvs",
-                        spinner(tick),
-                        human_elapsed(start.elapsed()),
-                        done.load(Ordering::Relaxed),
-                    )]);
-                    thread::sleep(Duration::from_millis(100));
-                    tick += 1;
-                }
-                live.clear();
-            });
-            let probed = cache::in_cache_many(&to_probe, &done);
-            stop.store(true, Ordering::Relaxed);
-            probed
-        });
+        let probed = with_live(
+            |tick| {
+                vec![format!(
+                    "{} ⏱ {} probing cache.nixos.org — {}/{total} drvs",
+                    spinner(tick),
+                    human_elapsed(start.elapsed()),
+                    done.load(Ordering::Relaxed),
+                )]
+            },
+            |_handle| cache::in_cache_many(&to_probe, &done),
+        );
         // Keep a frozen summary on screen (like the eval's), so it's easy to see
         // how long the probe took and how much of the set was already cached.
         let cached = probed.values().filter(|&&v| v).count();

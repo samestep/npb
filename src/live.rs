@@ -24,6 +24,9 @@
 //! handler required to keep resize sane.
 
 use std::fmt::Write as _;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use console::{Term, style, truncate_str};
@@ -135,6 +138,61 @@ impl Live {
         self.drawn = 0;
         self.prev.clear();
     }
+}
+
+/// A handle into a running [`with_live`] block, handed to the worker body so it
+/// can emit permanent output *above* the animated region (a one-off note like a
+/// requeued shard). [`Copy`] so the body can share it across its own workers.
+#[derive(Clone, Copy)]
+pub struct LiveHandle<'a> {
+    display: &'a Mutex<Live>,
+}
+
+impl LiveHandle<'_> {
+    /// Print `msg` as permanent output above the live block; the block redraws
+    /// below it on the next frame. Thread-safe — the workers and the refresher
+    /// share the one `Live` behind a mutex.
+    pub fn note(&self, msg: &str) {
+        self.display.lock().unwrap().print_above(msg);
+    }
+}
+
+/// Run `body` while a refresher thread animates a live progress block on stderr.
+///
+/// This is npd's single progress-display primitive: every phase that shows a
+/// live readout — the shard scheduler ([`crate::eval::run_shards`], which backs
+/// eval, `--tests`, enumeration, and instantiation) and the cache probe
+/// ([`crate::build`]) — drives it through here, so they all animate identically
+/// (a steady 100 ms redraw that keeps the spinner + timer moving even while the
+/// work itself is silent) and tear down identically. `frame(tick)` returns the
+/// block's lines for tick `tick` — the caller composes its own spinner/timer via
+/// [`spinner`]/[`human_elapsed`] — and is only ever called from the refresher,
+/// reading whatever atomics `body`'s workers bump (so those need no locking).
+/// When `body` returns, the block is erased (the caller then prints any frozen
+/// summary as ordinary output) and `body`'s value is returned; `body` gets a
+/// [`LiveHandle`] for notes above the block.
+pub fn with_live<R>(
+    frame: impl Fn(usize) -> Vec<String> + Sync,
+    body: impl FnOnce(LiveHandle<'_>) -> R,
+) -> R {
+    let display = Mutex::new(Live::new());
+    let done = AtomicBool::new(false);
+    let mut out = None;
+    thread::scope(|s| {
+        let (display, done, frame) = (&display, &done, &frame);
+        s.spawn(move || {
+            let mut tick = 0usize;
+            while !done.load(Ordering::Relaxed) {
+                display.lock().unwrap().draw(&frame(tick));
+                thread::sleep(Duration::from_millis(100));
+                tick += 1;
+            }
+        });
+        out = Some(body(LiveHandle { display }));
+        done.store(true, Ordering::Relaxed);
+    });
+    display.lock().unwrap().clear();
+    out.unwrap()
 }
 
 /// `indicatif`'s `{elapsed}` (its `HumanDuration` in alternate form): the single
