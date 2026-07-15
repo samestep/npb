@@ -18,10 +18,13 @@ you expect to just repeat).
 
 ### What `npd` is not
 
-- Not a `nixpkgs-review` replacement. The build-result **classifier / comparison
-  report** (the base×head delta grid, the composed status token) is a
-  *presentation* concern that could live upstream in nixpkgs-review as a
-  self-contained feature; `npd` keeps its own rendering for now.
+- A `nixpkgs-review` **alternative**, not a clone. It does the same core job —
+  evaluate a PR's `base → head`, build the changed set, render a delta report —
+  and on the pre-build eval path it is competitive-to-faster (measured across
+  62/31/16 GiB machines; §6). What distinguishes it is *what it keeps*: the
+  durable, `drvpath`-keyed fact store (§2–§5) that makes an *iterative* loop of
+  related reviews cheap — never repeating work whose answer it already knows —
+  where nixpkgs-review is one-shot and throws the workspace away.
 - Not a re-implementation of Nix's primitives. Evaluation goes through
   `nix-eval-jobs`; building goes through `nix build` + the existing remote
   builders. `npd` owns the **memory** and the **orchestration**, not the plumbing.
