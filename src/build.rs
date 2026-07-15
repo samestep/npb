@@ -45,16 +45,6 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-fn hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 /// nix internal-json log event (only the fields we use).
 #[derive(Deserialize)]
 struct NixEvent {
@@ -74,10 +64,10 @@ const ACT_BUILD: i64 = 105;
 /// `--log-format internal-json`, we forward it to `nom --json` for the live
 /// tree and simultaneously parse build (`type:105`) start/stop events. That
 /// gives us, per drv, whether it was *attempted* (start seen ⇒ a later failure
-/// is its own, not a dependency's) and its build duration — neither of which a
-/// plain batch build exposes. `--keep-going` so every drv is attempted.
+/// is its own, not a dependency's) — which a plain batch build doesn't expose.
+/// `--keep-going` so every drv is attempted.
 ///
-/// `on_finish(drv, secs)` fires as *every* build activity stops — the requested
+/// `on_finish(drv)` fires as *every* build activity stops — the requested
 /// drvs and their transitive dependencies alike (the caller records a
 /// dependency only when it failed; DESIGN.md §5). Nix registers a successful
 /// build's outputs *before* emitting the stop event (both the local and
@@ -93,7 +83,7 @@ const ACT_BUILD: i64 = 105;
 fn batch_build(
     drvs: &[&str],
     force: bool,
-    mut on_finish: impl FnMut(&str, f64) -> Result<()>,
+    mut on_finish: impl FnMut(&str) -> Result<()>,
 ) -> Result<(HashSet<String>, std::process::ExitStatus)> {
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
@@ -126,7 +116,7 @@ fn batch_build(
     let log = BufReader::new(nix.stderr.take().expect("stderr is piped"));
     let mut nom_in = nom.stdin.take().expect("stdin is piped");
     let mut attempted = HashSet::new();
-    let mut starts: HashMap<u64, (String, Instant)> = HashMap::new();
+    let mut starts: HashMap<u64, String> = HashMap::new();
 
     let streamed = (|| -> Result<()> {
         for line in log.lines() {
@@ -145,14 +135,14 @@ fn batch_build(
                         (ev.id, ev.fields.first().and_then(|v| v.as_str()))
                     {
                         attempted.insert(drv.to_string());
-                        starts.insert(id, (drv.to_string(), Instant::now()));
+                        starts.insert(id, drv.to_string());
                     }
                 }
                 "stop" => {
                     if let Some(id) = ev.id
-                        && let Some((drv, t0)) = starts.remove(&id)
+                        && let Some(drv) = starts.remove(&id)
                     {
-                        on_finish(&drv, t0.elapsed().as_secs_f64())?;
+                        on_finish(&drv)?;
                     }
                 }
                 _ => {}
@@ -365,8 +355,6 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
                 outcome: Outcome::Built,
                 when: now,
                 system: system_of.get(drv.as_str()).map(|s| s.to_string()),
-                duration_s: None,
-                machine: None,
             })?;
         }
     }
@@ -375,7 +363,6 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
 
 fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
     let mut store = Store::open(db)?;
-    let host = hostname();
     // --recheck / --prefer-local force a genuine local build; otherwise a cached
     // (substitutable) output means we needn't build at all.
     let force = policy.recheck || policy.prefer_local;
@@ -446,8 +433,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                         outcome: Outcome::DepFailed,
                         when: now,
                         system: Some(targets[i].system.clone()),
-                        duration_s: None,
-                        machine: Some(host.clone()),
                     })?;
                 }
             }
@@ -476,7 +461,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .collect();
         let requested: HashSet<&str> = drvs.iter().copied().collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
-        let (attempted, status) = batch_build(&drvs, force, |drv, secs| {
+        let (attempted, status) = batch_build(&drvs, force, |drv| {
             let built = drv_built(drv)?;
             if requested.contains(drv) {
                 // A requested target: record its own outcome, success or failure.
@@ -491,8 +476,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     outcome,
                     when: unix_now(),
                     system: system_of.get(drv).copied().map(str::to_string),
-                    duration_s: Some(secs),
-                    machine: Some(host.clone()),
                 })?;
                 recorded.insert(drv.to_string(), outcome);
             } else if !built {
@@ -509,8 +492,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     outcome: Outcome::Failed,
                     when: unix_now(),
                     system: None,
-                    duration_s: Some(secs),
-                    machine: Some(host.clone()),
                 })?;
             }
             Ok(())
@@ -559,8 +540,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 outcome,
                 when: now,
                 system: system_of.get(drv).copied().map(str::to_string),
-                duration_s: None,
-                machine: Some(host.clone()),
             })?;
         }
     }
@@ -589,8 +568,6 @@ mod tests {
             outcome,
             when: 1,
             system: None,
-            duration_s: None,
-            machine: None,
         }
     }
 
@@ -772,10 +749,9 @@ mod tests {
         assert_eq!(obs_of(&slow).outcome, Outcome::Built);
         assert_eq!(obs_of(&blocked).outcome, Outcome::DepFailed);
 
-        // The incrementally-recorded facts carry a duration and the system.
+        // The incrementally-recorded facts carry the system.
         let fail_obs = obs_of(&fail);
         assert_eq!(fail_obs.source, Source::Local);
-        assert!(fail_obs.duration_s.is_some());
         assert_eq!(fail_obs.system.as_deref(), Some("testsys"));
 
         let _ = fs::remove_dir_all(&dir);
@@ -870,8 +846,6 @@ mod tests {
                 outcome: Outcome::Failed,
                 when: 1,
                 system: None,
-                duration_s: Some(0.1),
-                machine: Some("host".into()),
             })
             .unwrap();
         }

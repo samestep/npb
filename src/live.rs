@@ -202,38 +202,19 @@ pub fn with_live<R>(
     out.unwrap()
 }
 
-/// `indicatif`'s `{elapsed}` (its `HumanDuration` in alternate form): the single
-/// largest sensible unit, e.g. `51s`, `2m`, `1h`. Ported so dropping indicatif
-/// doesn't change how the timer reads.
+/// Elapsed time as a plain `m:ss` clock, gaining an `h:` field once past an
+/// hour, right-padded with spaces to a fixed width so the text after the timer
+/// doesn't shift as it grows.
 pub fn human_elapsed(d: Duration) -> String {
-    // (seconds-per-unit, suffix), largest first.
-    const UNITS: &[(u64, &str)] = &[
-        (365 * 24 * 3600, "y"),
-        (7 * 24 * 3600, "w"),
-        (24 * 3600, "d"),
-        (3600, "h"),
-        (60, "m"),
-        (1, "s"),
-    ];
     let secs = d.as_secs();
-    // Pick the unit at which rounding `secs` reads naturally (matches indicatif's
-    // threshold: switch up a unit once we're within half of it).
-    let mut idx = 0;
-    for (i, &(cur, _)) in UNITS.iter().enumerate() {
-        idx = i;
-        match UNITS.get(i + 1) {
-            Some(&(next, _)) if secs + next / 2 >= cur + cur / 2 => break,
-            _ => continue,
-        }
-    }
-    let (unit, suffix) = UNITS[idx];
-    let mut t = ((secs as f64) / (unit as f64)).round() as u64;
-    // Non-second units never show "1" (indicatif clamps to 2), so we jump
-    // straight from e.g. "89s" to "2m".
-    if idx < UNITS.len() - 1 {
-        t = t.max(2);
-    }
-    format!("{t}{suffix}")
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    let clock = if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    };
+    // The widest common form is `h:mm:ss` (7 chars, up to ~10h); pad the rest.
+    format!("{clock:>7}")
 }
 
 #[cfg(test)]
@@ -241,17 +222,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elapsed_matches_indicatif_shape() {
-        assert_eq!(human_elapsed(Duration::from_secs(0)), "0s");
-        assert_eq!(human_elapsed(Duration::from_secs(51)), "51s");
-        assert_eq!(human_elapsed(Duration::from_secs(89)), "89s");
-        // switches to minutes at 90s, and never shows "1m"
-        assert_eq!(human_elapsed(Duration::from_secs(90)), "2m");
-        assert_eq!(human_elapsed(Duration::from_secs(120)), "2m");
-        assert_eq!(human_elapsed(Duration::from_secs(180)), "3m");
-        // indicatif stays in minutes until ~1.5h and never shows "1h" (min-2
-        // clamp), so 1h reads "60m" and it jumps straight to "2h".
-        assert_eq!(human_elapsed(Duration::from_secs(3600)), "60m");
-        assert_eq!(human_elapsed(Duration::from_secs(5400)), "2h");
+    fn elapsed_is_a_fixed_width_clock() {
+        // A plain m:ss clock, gaining an h: field past an hour, right-padded to a
+        // constant width so the text after the timer doesn't shift as it grows.
+        assert_eq!(human_elapsed(Duration::from_secs(0)), "   0:00");
+        assert_eq!(human_elapsed(Duration::from_secs(51)), "   0:51");
+        assert_eq!(human_elapsed(Duration::from_secs(89)), "   1:29");
+        assert_eq!(human_elapsed(Duration::from_secs(90)), "   1:30");
+        assert_eq!(human_elapsed(Duration::from_secs(3600)), "1:00:00");
+        assert_eq!(human_elapsed(Duration::from_secs(5400)), "1:30:00");
+        // Every rendering up to ~10h is the same width.
+        for s in [0, 51, 599, 3600, 35999] {
+            assert_eq!(human_elapsed(Duration::from_secs(s)).len(), 7);
+        }
     }
 }

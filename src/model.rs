@@ -78,9 +78,6 @@ pub struct Observation {
     pub outcome: Outcome,
     pub when: i64,
     pub system: Option<String>,
-    /// Wall-clock build time; `None` when the fact came from a cache probe.
-    pub duration_s: Option<f64>,
-    pub machine: Option<String>,
 }
 
 /// What the build policy says to do about a derivation.
@@ -174,8 +171,6 @@ mod tests {
             outcome,
             when: 0,
             system: None,
-            duration_s: None,
-            machine: None,
         }
     }
 

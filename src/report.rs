@@ -279,8 +279,6 @@ mod tests {
             outcome,
             when: 0,
             system: None,
-            duration_s: None,
-            machine: None,
         }
     }
 

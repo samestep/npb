@@ -23,9 +23,7 @@ CREATE TABLE IF NOT EXISTS observation (
     source     TEXT    NOT NULL,
     outcome    TEXT    NOT NULL,
     when_      INTEGER NOT NULL,
-    system     TEXT,
-    duration_s REAL,
-    machine    TEXT
+    system     TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 
@@ -119,16 +117,14 @@ impl Store {
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
         self.conn.execute(
             "INSERT INTO observation \
-             (drv_path, source, outcome, when_, system, duration_s, machine) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (drv_path, source, outcome, when_, system) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 o.drv_path,
                 source_str(o.source),
                 outcome_str(o.outcome),
                 o.when,
                 o.system,
-                o.duration_s,
-                o.machine,
             ],
         )?;
         Ok(())
@@ -158,7 +154,7 @@ impl Store {
         // `WHERE drv_path IN (?,?,…)` with one placeholder per drv.
         let placeholders = placeholders(drv_paths.len());
         let sql = format!(
-            "SELECT drv_path, source, outcome, when_, system, duration_s, machine \
+            "SELECT drv_path, source, outcome, when_, system \
              FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -170,20 +166,16 @@ impl Store {
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<f64>>(5)?,
-                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         for row in rows {
-            let (drv_path, source, outcome, when, system, duration_s, machine) = row?;
+            let (drv_path, source, outcome, when, system) = row?;
             out.entry(drv_path.clone()).or_default().push(Observation {
                 drv_path,
                 source: source_from(&source)?,
                 outcome: outcome_from(&outcome)?,
                 when,
                 system,
-                duration_s,
-                machine,
             });
         }
         Ok(out)
@@ -335,8 +327,6 @@ mod tests {
             outcome,
             when,
             system: Some("aarch64-linux".into()),
-            duration_s: Some(1.5),
-            machine: Some("host".into()),
         };
         s.add_observation(&mk(Outcome::Failed, 100)).unwrap();
         s.add_observation(&mk(Outcome::Built, 200)).unwrap();
@@ -346,7 +336,6 @@ mod tests {
         assert_eq!(got[0].outcome, Outcome::Failed); // oldest first
         assert_eq!(got[1].outcome, Outcome::Built);
         assert_eq!(got[1].source, Source::Local);
-        assert_eq!(got[1].duration_s, Some(1.5));
         // a different drv is independent
         assert!(s.load_observations("/nix/store/y.drv").unwrap().is_empty());
 
@@ -364,8 +353,6 @@ mod tests {
             outcome,
             when,
             system: None,
-            duration_s: None,
-            machine: None,
         };
 
         // a: only local failures -> failing.

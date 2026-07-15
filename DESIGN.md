@@ -154,8 +154,8 @@ and surface only its tail if the eval aborts fatally.
 
 ## 5. The observation log and the build-policy predicate
 
-Every local build appends an `Observation` (source, outcome, when, duration,
-machine). The ergonomics the workflow needs are then a **pure predicate**
+Every local build appends an `Observation` (source, outcome, when, system). The
+ergonomics the workflow needs are then a **pure predicate**
 over that log plus substituter presence:
 
 - marked broken/unsupported/insecure, `--build-broken` off → **skip (broken)**
@@ -184,7 +184,7 @@ heavyweights, and co-scheduling them with eval workers risks an OOM-killed
 build being recorded as a false `Failed` fact.)
 The actual build is a single batched `nix build` piped through
 `nom` for the live tree, from which we recover, per drv, its outcome (built /
-direct failure / dependency cascade) and duration.
+direct failure / dependency cascade).
 
 **Surviving ^C.** Each outcome is recorded (and committed — every observation is
 its own SQLite autocommit) the moment that drv's build activity stops, not after
@@ -513,7 +513,7 @@ The spine is implemented (✓).
    `master`, or from a PR's GitHub test-merge commit under `--pr`; §6).
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,
-   `DepFailed`/cascade detection, and per-drv duration.
+   `DepFailed`/cascade detection.
 4. ✓ `Cache` facts (narinfo), recorded as observations.
 5. ✓ Markdown report classifying the changed set, building both sides first so
    there are no `?`.
