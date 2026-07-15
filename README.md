@@ -4,11 +4,15 @@ A persistent **fact store** for iterating on nixpkgs changes across a set of
 long-lived build machines, keyed on the identity of build *recipes*
 (derivation paths).
 
-`npd` is **not** a re-implementation of [`nixpkgs-review`](https://github.com/Mic92/nixpkgs-review).
-nixpkgs-review reviews one PR, one-shot, and throws the workspace away. `npd`
-optimizes for the opposite: a durable loop where you evaluate, build, and
-re-build the same and related derivations many times over days, and never want
-to repeat work you already know the answer to.
+`npd` reviews a nixpkgs PR — evaluate a `base → head` change, build the changed
+set, render a report — the same core job as
+[`nixpkgs-review`](https://github.com/Mic92/nixpkgs-review). What sets it apart
+is what it *keeps*: nixpkgs-review reviews one PR, one-shot, and throws the
+workspace away, whereas `npd` is built around a durable, `drvpath`-keyed **fact
+store**, so across a loop of related reviews over days it never repeats work
+whose answer it already knows. (And even on a single *cold* review — nothing
+cached — it holds its own with nixpkgs-review on the pre-build eval/diff path,
+often beating it once it can use the machine's cores.)
 
 The Nix store + substituters already remember **successful** builds. What Nix
 throws away is everything else `npd` cares about:
@@ -20,8 +24,7 @@ throws away is everything else `npd` cares about:
 
 The one remote fact `npd` consults is `cache.nixos.org` (is this exact drv already
 built and substitutable?). So `npd` is a thin **fact store + policy layer over
-`nix-eval-jobs` and `nix build`**, not a fork of a review tool. See
-[`DESIGN.md`](DESIGN.md).
+`nix-eval-jobs` and `nix build`**. See [`DESIGN.md`](DESIGN.md).
 
 ## Status
 
