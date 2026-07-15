@@ -370,7 +370,7 @@ pub fn eval_tests_many(
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let slots = eval_slots(cores, total_mem_mb(), DEFAULT_WORKER_MEM_MB, None);
+    let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, None);
     // Slice every request's packages into ~2×`slots` shards total, so the pool
     // stays full and balances across requests (a nixosTest ≈ a whole NixOS
     // system, so the AIMD backoff earns its keep). ~2×slots keeps the nixpkgs
@@ -427,20 +427,32 @@ pub fn eval_tests_many(
 
 // --- scheduling: one queue of shards (DESIGN §6) ------------------------------
 
-/// Default per-worker heap cap (matches nix-eval-jobs' own 4 GiB default).
+/// Default per-worker heap *cap* — the `--max-memory-size` a worker may reach
+/// before nix-eval-jobs restarts it. Kept at nix-eval-jobs' 4 GiB default so a
+/// giant subtree (haskellPackages ≈ 3–4 GiB) doesn't trip a restart mid-shard
+/// and thrash on re-imports. Distinct from the slot-count budget below.
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
+
+/// RAM budget per slot, used only to *count* the starting slots (see
+/// [`eval_slots`]) — not a memory cap. A typical shard's worker holds only
+/// ~1–1.5 GiB; just the few giant subtrees spike toward the 4 GiB cap. So
+/// counting slots at the cap badly under-parallelizes (a 31 GiB box got 7
+/// workers when it had 18 cores); ~2 GiB matches the measured best worker counts
+/// across 62/31/16 GiB machines, and AIMD backs off if a run overshoots RAM.
+const SLOT_MEM_MB: u64 = 2048;
 
 /// Top-level attr names per shard. Larger shards amortize the per-job nixpkgs
 /// import (a few seconds each); smaller ones requeue more cheaply and balance
-/// better. At ~400 names a typical shard runs tens of seconds at one worker,
-/// putting the import tax in the single-digit percent range (measured).
-const NAMES_PER_SHARD: usize = 400;
+/// better. Measured across all three RAM sizes, ~800–1600 is a flat best (fewer
+/// redundant imports, peak still bounded by the RAM ceiling); the old 400 left
+/// 20–30% on the table. Overridable per run with `--shard-size`.
+const NAMES_PER_SHARD: usize = 1024;
 
 /// Optional overrides for the eval scheduler; `None` = auto from the machine's
 /// invariants (see [`eval_slots`]).
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub struct EvalOpts {
-    /// Concurrent shard evaluations (default: min(cores, total RAM / worker cap)).
+    /// Concurrent shard evaluations (default: min(cores, total RAM / ~2 GiB)).
     #[arg(long = "eval-slots")]
     pub slots: Option<u64>,
     /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
@@ -536,13 +548,15 @@ fn physical_mem_mb() -> u64 {
 
 /// The number of concurrent shard jobs to start with: the user's
 /// `--eval-slots` if given, else bounded by the machine's *invariants* — one
-/// worker per slot, so cores, and total RAM divided by the per-worker heap
-/// cap. The dynamic part of RAM is handled by feedback, not planning: the
-/// queue sheds slots when a shard is OOM-killed ([`eval_pairs`]).
-fn eval_slots(cores: usize, mem_mb: u64, per_worker_mb: u64, user: Option<u64>) -> usize {
+/// worker per slot, so cores, and total RAM divided by a per-slot budget
+/// ([`SLOT_MEM_MB`], ~2 GiB — the *typical* worker footprint, deliberately below
+/// the 4 GiB restart cap since only the few giant subtrees approach it). The
+/// dynamic part of RAM is handled by feedback, not planning: the queue sheds
+/// slots when a shard is OOM-killed ([`eval_pairs`]).
+fn eval_slots(cores: usize, mem_mb: u64, per_slot_mb: u64, user: Option<u64>) -> usize {
     match user {
         Some(s) => (s as usize).max(1),
-        None => cores.min((mem_mb / per_worker_mb.max(1)).max(1) as usize),
+        None => cores.min((mem_mb / per_slot_mb.max(1)).max(1) as usize),
     }
 }
 
@@ -953,7 +967,9 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let slots = eval_slots(cores, total_mem_mb(), per_worker_mb, opts.slots);
+    // Count slots at the ~2 GiB typical footprint, but each worker keeps the
+    // 4 GiB restart cap (`per_worker_mb`) — the two are deliberately decoupled.
+    let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, opts.slots);
 
     // One shard group per `(commit, system)`; its items are the top-level attr
     // names. `meta` keeps the identifying pair per group for the closures.
@@ -1182,13 +1198,16 @@ mod tests {
     #[test]
     fn eval_slots_from_invariants() {
         const G: u64 = 1024;
-        // Core-bound when RAM is plentiful; RAM-bound (total / worker cap)
+        // Core-bound when RAM is plentiful; RAM-bound (total / per-slot budget)
         // when it isn't; never zero; --eval-slots wins verbatim (floored at 1).
-        assert_eq!(eval_slots(18, 256 * G, 4 * G, None), 18);
-        assert_eq!(eval_slots(18, 31 * G, 4 * G, None), 7);
-        assert_eq!(eval_slots(4, 2 * G, 4 * G, None), 1);
-        assert_eq!(eval_slots(18, 31 * G, 4 * G, Some(3)), 3);
-        assert_eq!(eval_slots(18, 31 * G, 4 * G, Some(0)), 1);
+        // At the default SLOT_MEM_MB (~2 GiB) the three benchmark boxes get:
+        assert_eq!(eval_slots(32, 62 * G, SLOT_MEM_MB, None), 31); // amd64 (core-bound near 32)
+        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB, None), 15); // aarch64-linux
+        assert_eq!(eval_slots(18, 16 * G, SLOT_MEM_MB, None), 8); //  darwin
+        assert_eq!(eval_slots(18, 256 * G, SLOT_MEM_MB, None), 18); // core-bound
+        assert_eq!(eval_slots(4, 2 * G, SLOT_MEM_MB, None), 1); //    never zero
+        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB, Some(3)), 3); // --eval-slots wins
+        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB, Some(0)), 1);
     }
 
     #[test]

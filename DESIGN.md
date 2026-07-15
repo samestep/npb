@@ -233,14 +233,21 @@ fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, on
 `npd` owns the config.
 
 **Scheduling — one queue of shards.** The scheduling and failure atom is not a
-whole-set eval but a **shard**: a ~400-name slice of one eval's top-level attr
-names (enumerated by one cheap `builtins.attrNames` call), evaluated by its
-own one-worker `nix-eval-jobs` over the same import narrowed via `listToAttrs`
-— validated byte-for-byte to reproduce the monolithic walk (thunks force
-per-attr in the worker, so error isolation is identical). All shards of all
-pending evals share **one global queue** and one knob: the number of slots
-(concurrent shard jobs), started at `min(cores, total RAM / worker cap)` —
-invariants only (total RAM further capped by any cgroup memory limit the
+whole-set eval but a **shard**: a ~1024-name slice of one eval's top-level attr
+names (enumerated by one cheap `builtins.attrNames` call; overridable with
+`--shard-size`), evaluated by its own one-worker `nix-eval-jobs` over the same
+import narrowed via `listToAttrs` — validated byte-for-byte to reproduce the
+monolithic walk (thunks force per-attr in the worker, so error isolation is
+identical). Bigger shards amortize the per-shard nixpkgs re-import; ~800–1600 is
+a flat measured best across 62/31/16 GiB machines (400 left 20–30% on the
+table), with peak memory bounded by the RAM ceiling since it scales as
+shard-size × slots. All shards of all pending evals share **one global queue**
+and one knob: the number of slots (concurrent shard jobs), started at
+`min(cores, total RAM / ~2 GiB)` — where the ~2 GiB per-slot budget is the
+*typical* worker footprint, kept distinct from the 4 GiB per-worker restart cap
+(only the few giant subtrees approach the cap, so counting slots at it
+under-parallelizes). Invariants only (total RAM further capped by any cgroup
+memory limit the
 process runs under: a container's ceiling is as much a configured promise as
 the DIMMs). The dynamic part of RAM is handled by feedback, TCP-style
 (AIMD), instead of measurement: a shard that aborts (in practice a worker
