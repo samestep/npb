@@ -701,30 +701,6 @@ pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> R
     )
 }
 
-/// The directory holding one eval's shard partials (deleted once the eval is
-/// assembled).
-fn partial_dir(commit: &str, system: &str) -> Result<PathBuf> {
-    Ok(crate::paths::cache_root()?
-        .join("evals")
-        .join("partial")
-        .join(format!(
-            "{commit}-{system}-v{}",
-            crate::evalfile::EVAL_VERSION
-        )))
-}
-
-/// Where one shard's completed rows persist until its whole eval is assembled
-/// (then the eval's `partial/` dir is deleted). Content-addressed by the
-/// shard's names, so a change in sharding layout simply misses rather than
-/// resuming from the wrong rows. This is what makes an interrupted (^C, OOM,
-/// crash) eval resumable: only unfinished shards re-run.
-fn partial_path(commit: &str, system: &str, names: &[String]) -> Result<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    names.hash(&mut h);
-    Ok(partial_dir(commit, system)?.join(format!("{:016x}.tsv", h.finish())))
-}
-
 // --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
 
 /// The words the shard display uses for a run: `unit` is the item noun (e.g.
@@ -1000,9 +976,10 @@ fn run_shards<T: Send>(
 /// one-worker `nix-eval-jobs` job. [`eval_slots`] jobs run at once; a shard
 /// that aborts (in practice a worker OOM-kill) is simply requeued while the
 /// slot count backs off multiplicatively — and creeps back up on sustained
-/// success (AIMD). Completed shards persist immediately ([`partial_path`]),
-/// so any interruption resumes at shard granularity; when an eval's last
-/// shard lands, its rows are assembled and written as the one cached file.
+/// success (AIMD). An aborted shard requeues in memory (completed shards' rows
+/// are held there too), so an interrupted eval re-runs from scratch rather than
+/// resuming; when an eval's last shard lands, its rows are assembled and
+/// written as the one cached file.
 pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     // Dedupe: `npd X X` (or repeated --system) would otherwise run the same
@@ -1090,19 +1067,11 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
             active: "evaluating",
             done: "evaluated",
         },
-        // Evaluate one shard — resuming from a persisted partial if present,
-        // else streaming it and persisting the partial for a later resume.
+        // Evaluate one shard by streaming its own one-worker `nix-eval-jobs`.
         |gi, label, names, on_item| {
             let (commit, system) = meta[gi];
-            let ppath = partial_path(commit, system, names)?;
-            if let Some(rows) = crate::evalfile::read_partial(&ppath)? {
-                // Resumed: the streamer's per-attr callback never fires, so
-                // credit the attrs here or a resumed eval's count trails.
-                on_item(rows.len());
-                return Ok(rows);
-            }
             let expr = shard_expr(repo, commit, system, names);
-            let rows = stream_jobs(
+            stream_jobs(
                 &expr,
                 1,
                 per_worker_mb,
@@ -1110,17 +1079,12 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                 label,
                 raw_to_attr_eval,
                 || on_item(1),
-            )?;
-            // Best-effort: a failed persist only costs the ability to resume.
-            let _ = crate::evalfile::write_partial(&ppath, &rows);
-            Ok(rows)
+            )
         },
-        // Assemble the eval into its one cached file and drop its partials.
+        // Assemble the eval into its one cached file.
         |gi, rows| {
             let (commit, system) = meta[gi];
-            write_eval(&eval_path(commit, system)?, &rows)?;
-            let _ = fs::remove_dir_all(partial_dir(commit, system)?);
-            Ok(())
+            write_eval(&eval_path(commit, system)?, &rows)
         },
     )
 }

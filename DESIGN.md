@@ -146,8 +146,6 @@ commit, and full drv paths are stored as-is like the observation log.
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log + --tests cache (tiny)
   evals/<commit>-<sys>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
-  evals/partial/<eval>/<hash>.tsv    # in-flight shard results (§6); deleted
-                                     # once the eval file is assembled
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -278,11 +276,18 @@ process runs under: a container's ceiling is as much a configured promise as
 the DIMMs). The dynamic part of RAM is handled by feedback, TCP-style
 (AIMD), instead of measurement: a shard that aborts (in practice a worker
 OOM-kill, caught by the integrity gate) is simply **requeued** while the slot
-count halves; sustained success creeps it back up. Completed shards persist
-immediately under `evals/partial/`, so any interruption — ^C, OOM, crash —
-resumes at shard granularity; when an eval's last shard lands, its rows are
-assembled into the one cached file and the partials are deleted. Small atoms
-are what make everything cheap: an abort re-pays seconds (not a whole eval),
+count halves; sustained success creeps it back up. The requeue is in-memory —
+the aborted shard goes back on the queue and completed shards' rows are held in
+memory until assembly — so an in-run worker OOM is transparent, but a
+whole-process interruption (^C, crash) discards the in-flight eval, which
+re-runs from scratch next time rather than resuming. (Nothing transient is
+written to disk: an eval is either fully cached as its one file or not at all.
+Shard partials were persisted for cross-run resume once, but the resilience
+that matters — the OOM requeue above — never needed them, and they left
+uncompressed files to garbage-collect for a resume that only helped the narrow
+case of re-running an interrupted *first* eval of the same commit.) When an
+eval's last shard lands, its rows are assembled into the one cached file. Small
+atoms are what make everything cheap: an abort re-pays seconds (not a whole eval),
 idle slots drain any eval's remaining shards (no straggler eval), and the
 degenerate case — a machine that fits only one worker — is just the queue at
 one slot, not a special phase. The costs: each shard job re-imports the

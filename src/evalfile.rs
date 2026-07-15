@@ -88,51 +88,6 @@ pub fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     Ok(())
 }
 
-/// Write one *shard's* rows as an uncompressed, unsorted TSV partial —
-/// same row format as the eval file, atomic like [`write_eval`]. Partials are
-/// what make an interrupted eval resumable at shard granularity: they live
-/// under `evals/partial/<eval>/` keyed by a hash of the shard's names, and the
-/// whole directory is deleted once the assembled eval file lands.
-pub fn write_partial(path: &Path, attrs: &[AttrEval]) -> Result<()> {
-    let mut buf = String::new();
-    for a in attrs {
-        buf.push_str(&a.attr);
-        buf.push('\t');
-        buf.push_str(a.drv_path.as_deref().map(strip_drv).unwrap_or(""));
-        if a.broken {
-            buf.push_str("\tb");
-        }
-        buf.push('\n');
-    }
-    let dir = path.parent().expect("partial path has a parent");
-    fs::create_dir_all(dir).context("creating partial dir")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).context("creating temp partial")?;
-    tmp.write_all(buf.as_bytes()).context("writing partial")?;
-    tmp.persist(path).context("renaming partial into place")?;
-    Ok(())
-}
-
-/// Load a shard partial written by [`write_partial`]; `None` if absent.
-pub fn read_partial(path: &Path) -> Result<Option<Vec<AttrEval>>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let attrs = text
-        .lines()
-        .map(|l| {
-            let (attr, drv, broken) = parse_line(l);
-            AttrEval {
-                attr: attr.to_string(),
-                drv_path: restore_drv(drv),
-                broken,
-            }
-        })
-        .collect();
-    Ok(Some(attrs))
-}
-
 /// Read and decompress an eval file into its TSV text — [`write_eval`]'s
 /// mirror for the format-round-trip tests; the production diff streams the
 /// file instead (see [`changed_set`]).
@@ -635,26 +590,6 @@ mod tests {
         assert_eq!(got, want);
         // A missing file must error (through the in-band producer error).
         assert!(changed_set_files(&dir.join("nope.tsv.zst"), &hpath).is_err());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn partial_round_trips() {
-        let ae = |attr: &str, drv: Option<&str>, broken: bool| AttrEval {
-            attr: attr.into(),
-            drv_path: drv.map(str::to_string),
-            broken,
-        };
-        let attrs = vec![
-            ae("z.first", Some("/nix/store/a-x.drv"), false), // order preserved, not sorted
-            ae("br", Some("/nix/store/b-y.drv"), true),
-            ae("errored", None, false),
-        ];
-        let dir = std::env::temp_dir().join(format!("npd-partial-test-{}", std::process::id()));
-        let path = dir.join("shard.tsv");
-        assert_eq!(read_partial(&path).unwrap(), None); // absent is None, not an error
-        write_partial(&path, &attrs).unwrap();
-        assert_eq!(read_partial(&path).unwrap(), Some(attrs));
         let _ = fs::remove_dir_all(&dir);
     }
 
