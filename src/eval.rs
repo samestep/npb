@@ -590,6 +590,13 @@ fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> Stri
 /// attr path, possibly dotted/nested (`python3Packages.foo`, or a test path like
 /// `grafana.tests.grafana.basic`). One job per path, forced per-attr in the
 /// worker, so a path that no longer resolves errors only itself.
+///
+/// TODO(nix-eval-jobs#412): this hand-rolled selector — and the identical
+/// `splitString "."` trick in [`build_tests_expr`] — is the wrapper-expr
+/// workaround that a native `--select <attrpath>` (emitting the literal selector
+/// as `attr`) would replace. `splitString "."` also mis-splits a quoted path
+/// element like `haskell.compiler."ghc94"`, which `--select` would handle
+/// correctly. Adopt it (in both spots) once it lands upstream.
 fn select_expr(repo: &Path, commit: &str, system: &str, paths: &[String]) -> String {
     let list: String = paths
         .iter()
