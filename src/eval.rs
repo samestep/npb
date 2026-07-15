@@ -446,6 +446,11 @@ pub struct EvalOpts {
     /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
     #[arg(long)]
     pub worker_mem_mb: Option<u64>,
+    /// Top-level attr names per full-eval shard (default: 400). Larger = fewer
+    /// redundant nixpkgs imports but coarser load-balancing; the sweet spot
+    /// scales with the worker count.
+    #[arg(long)]
+    pub shard_size: Option<usize>,
 }
 
 /// A fatal `nix-eval-jobs` abort (non-zero exit): the streamed output was
@@ -1056,7 +1061,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     run_shards(
         labels,
         items,
-        NAMES_PER_SHARD,
+        opts.shard_size.unwrap_or(NAMES_PER_SHARD),
         slots,
         "attrs",
         // Evaluate one shard — resuming from a persisted partial if present,
