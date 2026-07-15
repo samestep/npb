@@ -154,7 +154,7 @@ and surface only its tail if the eval aborts fatally.
 
 ## 5. The observation log and the build-policy predicate
 
-Every local build appends an `Observation` (source, outcome, when, system). The
+Every local build appends an `Observation` (source, outcome, when). The
 ergonomics the workflow needs are then a **pure predicate**
 over that log plus substituter presence:
 

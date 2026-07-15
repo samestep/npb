@@ -278,7 +278,6 @@ mod tests {
             source,
             outcome,
             when: 0,
-            system: None,
         }
     }
 

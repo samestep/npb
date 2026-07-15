@@ -274,7 +274,8 @@ fn resolve_base_head(
 }
 
 /// Flatten the per-system changed sets into build targets: every side's drv,
-/// deduped per `(system, drv)`.
+/// deduped by drv. A drv path is system-specific (the system is part of its
+/// input hash), so deduping on the drv alone already keeps systems apart.
 ///
 /// Several `(attr, side)` rows can share one drv with *different* meta-blocked
 /// bits — aliases where only some variants are marked (on darwin `ollama-cuda`
@@ -287,13 +288,13 @@ fn assemble_targets(
     per_system_changed: &[(String, Vec<evalfile::ChangedAttr>)],
 ) -> Vec<build::Target> {
     let mut targets: Vec<build::Target> = Vec::new();
-    let mut index: HashMap<(String, String), usize> = HashMap::new();
-    for (sys, changed) in per_system_changed {
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (_sys, changed) in per_system_changed {
         for c in changed {
             let sides = [(&c.base_drv, c.base_broken), (&c.head_drv, c.head_broken)];
             for (drv, broken) in sides {
                 let Some(drv) = drv else { continue };
-                match index.entry((sys.clone(), drv.clone())) {
+                match index.entry(drv.clone()) {
                     Entry::Occupied(e) => {
                         let t = &mut targets[*e.get()];
                         t.broken = t.broken && broken;
@@ -301,7 +302,6 @@ fn assemble_targets(
                     Entry::Vacant(e) => {
                         e.insert(targets.len());
                         targets.push(build::Target {
-                            system: sys.clone(),
                             drv_path: drv.clone(),
                             broken,
                         });
@@ -646,14 +646,15 @@ mod tests {
     }
 
     #[test]
-    fn assemble_targets_keeps_systems_apart() {
-        // The same drv on two systems is two targets, each with its own bit.
+    fn assemble_targets_dedups_a_shared_drv_across_systems() {
+        // A drv path is system-specific, so a real drv never recurs across
+        // systems; but were the same drv to appear on both, it's one recipe and
+        // dedups to a single target with the meta-blocked bit AND-merged (any
+        // unmarked side is a legitimate request to build it).
         let a = vec![ca("x", None, Some("/d/x"), false, true)];
         let b = vec![ca("x", None, Some("/d/x"), false, false)];
         let targets = assemble_targets(&[("sysA".into(), a), ("sysB".into(), b)]);
-        assert_eq!(targets.len(), 2);
-        let of = |sys: &str| targets.iter().find(|t| t.system == sys).unwrap();
-        assert!(of("sysA").broken);
-        assert!(!of("sysB").broken);
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].broken);
     }
 }

@@ -77,7 +77,6 @@ pub struct Observation {
     pub source: Source,
     pub outcome: Outcome,
     pub when: i64,
-    pub system: Option<String>,
 }
 
 /// What the build policy says to do about a derivation.
@@ -170,7 +169,6 @@ mod tests {
             source,
             outcome,
             when: 0,
-            system: None,
         }
     }
 

@@ -27,10 +27,9 @@ use crate::live::{human_elapsed, spinner, with_live};
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
-/// One derivation to consider building, with the system it came from. Produced
-/// from either an explicit eval or a diff's changed set.
+/// One derivation to consider building. Produced from either an explicit eval
+/// or a diff's changed set.
 pub struct Target {
-    pub system: String,
     pub drv_path: String,
     /// Marked broken/unsupported/insecure in meta — skipped by the default
     /// policy (`BuildPolicy::build_broken` overrides).
@@ -309,12 +308,10 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
     // A broken target the policy will skip anyway isn't worth an HTTP probe.
     let skipped_broken = |t: &Target| t.broken && !policy.build_broken;
     let mut to_probe: Vec<String> = Vec::new();
-    let mut system_of: HashMap<&str, &str> = HashMap::new();
     let mut seen = HashSet::new();
     for t in targets {
         if !has_fact(&t.drv_path) && !skipped_broken(t) && seen.insert(t.drv_path.clone()) {
             to_probe.push(t.drv_path.clone());
-            system_of.insert(t.drv_path.as_str(), t.system.as_str());
         }
     }
     // The probe is HTTP-bound and, on a first run over a big changed set, can
@@ -354,7 +351,6 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
                 source: Source::Cache,
                 outcome: Outcome::Built,
                 when: now,
-                system: system_of.get(drv.as_str()).map(|s| s.to_string()),
             })?;
         }
     }
@@ -432,7 +428,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                         source: Source::Local,
                         outcome: Outcome::DepFailed,
                         when: now,
-                        system: Some(targets[i].system.clone()),
                     })?;
                 }
             }
@@ -455,10 +450,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .map(|&i| targets[i].drv_path.as_str())
             .collect();
         // Several targets can share a drv (aliased attrs); record it once.
-        let system_of: HashMap<&str, &str> = to_build
-            .iter()
-            .map(|&i| (targets[i].drv_path.as_str(), targets[i].system.as_str()))
-            .collect();
         let requested: HashSet<&str> = drvs.iter().copied().collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
         let (attempted, status) = batch_build(&drvs, force, |drv| {
@@ -475,7 +466,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     source: Source::Local,
                     outcome,
                     when: unix_now(),
-                    system: system_of.get(drv).copied().map(str::to_string),
                 })?;
                 recorded.insert(drv.to_string(), outcome);
             } else if !built {
@@ -484,14 +474,12 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 // propagates the failure forward — skipping any target that would
                 // re-pull it (pass 1b) — and so ^C keeps it. A dependency
                 // *success* needs no row: nix's own store validity already
-                // remembers it, and only failures drive the forward-skip. No
-                // system: a dep isn't tied to one target's platform here.
+                // remembers it, and only failures drive the forward-skip.
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
                     source: Source::Local,
                     outcome: Outcome::Failed,
                     when: unix_now(),
-                    system: None,
                 })?;
             }
             Ok(())
@@ -539,7 +527,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 source: Source::Local,
                 outcome,
                 when: now,
-                system: system_of.get(drv).copied().map(str::to_string),
             })?;
         }
     }
@@ -555,7 +542,6 @@ mod tests {
 
     fn target(drv: &str, broken: bool) -> Target {
         Target {
-            system: "sys".into(),
             drv_path: drv.into(),
             broken,
         }
@@ -567,7 +553,6 @@ mod tests {
             source,
             outcome,
             when: 1,
-            system: None,
         }
     }
 
@@ -704,7 +689,6 @@ mod tests {
         let targets: Vec<Target> = [&fail, &slow, &blocked]
             .into_iter()
             .map(|drv| Target {
-                system: "testsys".to_string(),
                 drv_path: drv.clone(),
                 broken: false,
             })
@@ -749,10 +733,9 @@ mod tests {
         assert_eq!(obs_of(&slow).outcome, Outcome::Built);
         assert_eq!(obs_of(&blocked).outcome, Outcome::DepFailed);
 
-        // The incrementally-recorded facts carry the system.
+        // The incrementally-recorded fact is a genuine local build observation.
         let fail_obs = obs_of(&fail);
         assert_eq!(fail_obs.source, Source::Local);
-        assert_eq!(fail_obs.system.as_deref(), Some("testsys"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -786,7 +769,6 @@ mod tests {
         let top = instantiate(&expr, "top");
 
         let targets = [Target {
-            system: "testsys".to_string(),
             drv_path: top.clone(),
             broken: false,
         }];
@@ -845,13 +827,11 @@ mod tests {
                 source: Source::Local,
                 outcome: Outcome::Failed,
                 when: 1,
-                system: None,
             })
             .unwrap();
         }
 
         let targets = [Target {
-            system: "testsys".to_string(),
             drv_path: top.clone(),
             broken: false,
         }];
@@ -862,7 +842,6 @@ mod tests {
         let top_obs = s.load_observations(&top).unwrap();
         assert_eq!(top_obs.len(), 1);
         assert_eq!(top_obs[0].outcome, Outcome::DepFailed);
-        assert_eq!(top_obs[0].system.as_deref(), Some("testsys"));
         // The failing dependency was NOT re-attempted: still exactly the one
         // planted observation (a rebuild would have appended a second).
         assert_eq!(
