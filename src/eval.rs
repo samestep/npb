@@ -102,10 +102,20 @@ fn nix_escape(s: &str) -> String {
         .replace("${", "\\${")
 }
 
+/// A space-separated Nix string-list body — `"a" "b" ` — each element escaped
+/// for a Nix `"..."` literal. Shared by every expression builder that
+/// interpolates a list of attr names/paths ([`shard_expr`], [`select_expr`],
+/// [`build_tests_expr`]), so the escaping lives in one place.
+fn nix_string_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| format!("\"{}\" ", nix_escape(s)))
+        .collect()
+}
+
 /// Build the whole-package-set Nix expression `nix-eval-jobs` walks. The
-/// revision's source is fetched by `builtins.fetchGit`. Interpolants are
-/// escaped exactly as in [`build_tests_expr`] — the repo path in particular is
-/// user input (`--nixpkgs`).
+/// revision's source is fetched by `builtins.fetchGit`; interpolants are escaped
+/// via [`nix_escape`] (the repo path in particular is user input, `--nixpkgs`).
 fn build_expr(repo: &Path, commit: &str, system: &str) -> String {
     format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
@@ -306,13 +316,10 @@ fn stream_jobs<T>(
 /// leaf is wrapped in `tryEval` so one throwing test errors only itself — the
 /// per-leaf isolation nix-eval-jobs would otherwise give the untransformed tree.
 fn build_tests_expr(repo: &Path, commit: &str, system: &str, attrs: &[String]) -> String {
-    let list: String = attrs
-        .iter()
-        .map(|a| format!("\"{}\" ", nix_escape(a)))
-        .collect();
+    let list = nix_string_list(attrs);
     const TEMPLATE: &str = r#"
 let
-  pkgs = import (builtins.fetchGit { url = "@REPO@"; rev = "@COMMIT@"; }) { system = "@SYSTEM@"; config = @CFG@; };
+  pkgs = @PKGS@;
   lib = pkgs.lib;
   host = pkgs.stdenv.hostPlatform;
   attrs = [ @ATTRS@];
@@ -349,10 +356,7 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 // { recurseForDerivations = true; }
 "#;
     TEMPLATE
-        .replace("@REPO@", &nix_escape(&repo.display().to_string()))
-        .replace("@COMMIT@", &nix_escape(commit))
-        .replace("@SYSTEM@", &nix_escape(system))
-        .replace("@CFG@", EVAL_CONFIG)
+        .replace("@PKGS@", &build_expr(repo, commit, system))
         .replace("@ATTRS@", &list)
 }
 
@@ -367,10 +371,7 @@ pub fn eval_tests_many(
     repo: &Path,
     requests: &[(String, String, Vec<String>)],
 ) -> Result<Vec<Vec<TestJob>>> {
-    let cores = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, None);
+    let slots = default_slots(None);
     // Slice every request's packages into ~2×`slots` shards total, so the pool
     // stays full and balances across requests (a nixosTest ≈ a whole NixOS
     // system, so the AIMD backoff earns its keep). ~2×slots keeps the nixpkgs
@@ -380,10 +381,7 @@ pub fn eval_tests_many(
 
     let labels: Vec<String> = requests
         .iter()
-        .map(|(commit, system, _)| {
-            let short: String = commit.chars().take(12).collect();
-            format!("tests {short} ({system})")
-        })
+        .map(|(commit, system, _)| format!("tests {} ({system})", short_commit(commit)))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
     let meta: Vec<(&str, &str)> = requests
@@ -564,6 +562,21 @@ fn eval_slots(cores: usize, mem_mb: u64, per_slot_mb: u64, user: Option<u64>) ->
     }
 }
 
+/// [`eval_slots`] wired to this machine's invariants — the starting slot count
+/// every scheduler run uses (the user's `--eval-slots` when set, else auto).
+/// `eval_slots` stays a standalone pure fn so its unit test can pin the arithmetic.
+fn default_slots(user: Option<u64>) -> usize {
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, user)
+}
+
+/// A commit's short display form (first 12 chars), for progress-line labels.
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(12).collect()
+}
+
 /// The top-level attr names of the package set at `(commit, system)` — the
 /// space the shards partition. Cheap (well under a second warm): forcing
 /// `attrNames` touches no derivations. The literal `recurseForDerivations`
@@ -593,10 +606,7 @@ fn enumerate_names(repo: &Path, commit: &str, system: &str) -> Result<Vec<String
 /// monolithic root exactly — validated byte-for-byte against a whole-set eval
 /// (DESIGN §6).
 fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> String {
-    let list: String = names
-        .iter()
-        .map(|n| format!("\"{}\" ", nix_escape(n)))
-        .collect();
+    let list = nix_string_list(names);
     format!(
         "let pkgs = {}; in builtins.listToAttrs \
          (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
@@ -616,10 +626,7 @@ fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> Stri
 /// element like `haskell.compiler."ghc94"`, which `--select` would handle
 /// correctly. Adopt it (in both spots) once it lands upstream.
 fn select_expr(repo: &Path, commit: &str, system: &str, paths: &[String]) -> String {
-    let list: String = paths
-        .iter()
-        .map(|p| format!("\"{}\" ", nix_escape(p)))
-        .collect();
+    let list = nix_string_list(paths);
     format!(
         "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
          (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
@@ -651,17 +658,11 @@ pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> R
     if requests.is_empty() {
         return Ok(());
     }
-    let cores = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, None);
+    let slots = default_slots(None);
 
     let labels: Vec<String> = requests
         .iter()
-        .map(|(commit, system, _)| {
-            let short: String = commit.chars().take(12).collect();
-            format!("{short} {system}")
-        })
+        .map(|(commit, system, _)| format!("{} {system}", short_commit(commit)))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
     let meta: Vec<(&str, &str)> = requests
@@ -737,7 +738,7 @@ struct Shard {
 /// with a live `done + running / total` display, shared by the full-set, tests,
 /// and instantiate paths (DESIGN §6). `words` supplies the item noun and the
 /// active/done verbs the display labels each group with.
-/// Persistence and resume are the caller's job (via the closures),
+/// Persistence is the caller's job (via the closures),
 /// since the full eval assembles a flat file while `--tests` returns rows for
 /// SQLite (DESIGN §4); this owns only the scheduling and the display.
 ///
@@ -911,7 +912,7 @@ fn run_shards<T: Send>(
                                 if done == g.shards_total {
                                     let rows = std::mem::take(&mut *g.rows.lock().unwrap());
                                     // Pin the count to the assembled rows in case the
-                                    // streamed/resumed tallies drifted.
+                                    // streamed tallies drifted.
                                     g.items_done.store(rows.len(), Ordering::Relaxed);
                                     on_group_complete(shard.group, rows)?;
                                 }
@@ -995,12 +996,9 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     }
 
     let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
-    let cores = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     // Count slots at the ~2 GiB typical footprint, but each worker keeps the
     // 4 GiB restart cap (`per_worker_mb`) — the two are deliberately decoupled.
-    let slots = eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, opts.slots);
+    let slots = default_slots(opts.slots);
 
     // One shard group per `(commit, system)` for both phases below; `meta` keeps
     // the identifying pair per group, `labels` the display name.
@@ -1010,9 +1008,7 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         .collect();
     let labels: Vec<String> = meta
         .iter()
-        .map(|(commit, _)| commit.chars().take(12).collect::<String>())
-        .zip(&meta)
-        .map(|(short, (_, system))| format!("{short} {system}"))
+        .map(|(commit, system)| format!("{} {system}", short_commit(commit)))
         .collect();
 
     // Phase 1: enumerate each pair's top-level attr names — the space phase 2

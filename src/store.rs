@@ -88,6 +88,11 @@ fn outcome_from(s: &str) -> Result<Outcome> {
     })
 }
 
+/// A comma-joined run of `n` SQL bind placeholders (`?,?,…`) for an `IN (…)` clause.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -151,9 +156,7 @@ impl Store {
             return Ok(out);
         }
         // `WHERE drv_path IN (?,?,…)` with one placeholder per drv.
-        let placeholders = std::iter::repeat_n("?", drv_paths.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = placeholders(drv_paths.len());
         let sql = format!(
             "SELECT drv_path, source, outcome, when_, system, duration_s, machine \
              FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
@@ -223,9 +226,7 @@ impl Store {
         if pkgs.is_empty() {
             return Ok(out);
         }
-        let placeholders = std::iter::repeat_n("?", pkgs.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = placeholders(pkgs.len());
         let sql = format!(
             "SELECT pkg_attr FROM test_pkg \
              WHERE commit_ = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
@@ -290,9 +291,7 @@ impl Store {
         if pkgs.is_empty() {
             return Ok(out);
         }
-        let placeholders = std::iter::repeat_n("?", pkgs.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = placeholders(pkgs.len());
         let sql = format!(
             "SELECT test_attr, drv_path, broken FROM test_drv \
              WHERE commit_ = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",

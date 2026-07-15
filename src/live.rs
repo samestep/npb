@@ -22,6 +22,13 @@
 //! mid-run just leaves the last (short, unpadded) block on screen, which reflows
 //! like ordinary command output rather than the old full-width mess — no signal
 //! handler required to keep resize sane.
+//!
+//! ratatui's inline viewport was the other renderer considered: it re-queries the
+//! width and re-lays out a diffed frame each draw, so resize is free — but it must
+//! hide the cursor and restore it on *every* exit path including ^C (a missed
+//! teardown leaks a hidden cursor into the shell), and it anchors itself with a DSR
+//! cursor-position query the terminal must answer, so it errors under a pipe or a
+//! non-interactive pty. This relative-move renderer needs neither.
 
 use std::fmt::Write as _;
 use std::sync::Mutex;

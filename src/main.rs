@@ -125,14 +125,21 @@ fn resolve_systems(system: Vec<String>) -> Vec<String> {
 /// never rely on a configured remote.
 const UPSTREAM: &str = "https://github.com/NixOS/nixpkgs";
 
-/// Run `git -C repo ARGS`; return trimmed stdout, or an error carrying stderr.
-fn git(repo: &std::path::Path, args: &[&str]) -> Result<String> {
-    let out = Proc::new("git")
+/// Spawn `git -C repo ARGS` and return its completed output — the shared spawn
+/// behind [`git`], [`fetch_ref`], and [`resolve_commit`], each of which applies
+/// its own exit-code handling to the result.
+fn git_output(repo: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    Proc::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+        .with_context(|| format!("running git {}", args.join(" ")))
+}
+
+/// Run `git -C repo ARGS`; return trimmed stdout, or an error carrying stderr.
+fn git(repo: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = git_output(repo, args)?;
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -158,12 +165,7 @@ fn have_commit(repo: &std::path::Path, rev: &str) -> bool {
 /// conflicted PR publishes no `merge` ref), and `Err` on any other failure.
 fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<bool> {
     let refspec = format!("+{ref_name}:{ref_name}");
-    let out = Proc::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["fetch", upstream, &refspec])
-        .output()
-        .context("running git fetch")?;
+    let out = git_output(repo, &["fetch", upstream, &refspec])?;
     if out.status.success() {
         return Ok(true);
     }
@@ -244,13 +246,11 @@ fn resolve_pr(
 /// Resolve a revision (ref, short/full sha, tag, `HEAD~1`, …) to a full commit
 /// sha, so callers can use friendly names even though `fetchGit` needs a rev.
 fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
-    let out = Proc::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--verify", "--quiet"])
-        .arg(format!("{rev}^{{commit}}"))
-        .output()
-        .context("running git rev-parse")?;
+    let rev_arg = format!("{rev}^{{commit}}");
+    let out = git_output(
+        repo,
+        &["rev-parse", "--verify", "--quiet", rev_arg.as_str()],
+    )?;
     if !out.status.success() {
         bail!("cannot resolve revision {rev:?} in {}", repo.display());
     }

@@ -15,10 +15,3 @@ serde_json = "1"
 tempfile = "3"
 ureq = "2"
 zstd = "0.13"
-
-# Only for `examples/ratatui_eval.rs`, the alternative-renderer prototype — the
-# npd binary itself does not depend on any of these. The example uses crossterm
-# via `ratatui::crossterm` rather than a separate dependency.
-[dev-dependencies]
-ratatui = "0.29"
-ctrlc = "3"
