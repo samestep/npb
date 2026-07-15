@@ -349,7 +349,17 @@ silently re-importing nixpkgs once per pair in series. Each pair is *one* shard
 — the cost here is the per-run nixpkgs import, so sub-slicing a pair's handful
 of changed attrs would only re-pay that import — so this trims the phase's
 wall-time from the *sum* of the imports toward the *slowest single* one at no
-extra total work. It is skipped under `--no-build`, which needs neither. On a RAM-constrained machine
+extra total work. It is skipped under `--no-build`, which needs neither — and,
+crucially, it instantiates *only the drvs the build phase will actually touch*.
+A drv already known built / substitutable / failing is decided from the
+observation log alone (§5), so writing its `.drv` buys nothing; the driver asks
+the log which drvs still need probing or building (`build::drvs_to_materialize`,
+the pre-probe form of the build-policy predicate — one SQLite query, no `.drv`
+required) and instantiates just those. In the warm-cache iterative loop npd is
+built for, *every* changed drv is already known, that set is empty, and the
+instantiation eval is skipped entirely — without this, a fully-cached run still
+paid a couple of seconds re-importing nixpkgs to write `.drv` files nothing
+would read. On a RAM-constrained machine
 the lean `--no-instantiate` workers are also what let npd parallelize at all —
 instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
 

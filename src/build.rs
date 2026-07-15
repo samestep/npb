@@ -243,6 +243,51 @@ pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
     build_targets_at(&crate::paths::db_path()?, targets, policy)
 }
 
+/// The subset of `targets` whose `.drv` the build phase will actually need in
+/// the store — the ones it will probe or build — decided from the observation
+/// log alone (one query, no `.drv` required). Everything else is already
+/// resolved from facts, so materializing it is pure waste; when this is empty (a
+/// fully-cached changed set) the caller skips the instantiation eval entirely,
+/// which is what keeps a warm re-run instant (DESIGN.md §5–§6).
+///
+/// This is the *pre-probe* build set: a drv with no fact is a probe candidate,
+/// and probing (`nix derivation show`) needs the `.drv` present just as a build
+/// does — and a never-observed drv already decides `Build` — so both fold into
+/// one predicate here. A drv already known built / substitutable / failing
+/// decides `Skip*` and is omitted. Kept in lockstep with `build_targets_at`'s
+/// pass 1 by going through the same [`BuildPolicy::decide`].
+pub fn drvs_to_materialize(targets: &[Target], policy: BuildPolicy) -> Result<HashSet<String>> {
+    drvs_to_materialize_at(&crate::paths::db_path()?, targets, policy)
+}
+
+fn drvs_to_materialize_at(
+    db: &std::path::Path,
+    targets: &[Target],
+    policy: BuildPolicy,
+) -> Result<HashSet<String>> {
+    let store = Store::open(db)?;
+    let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
+    let obs_by_drv = store.load_observations_many(&drv_refs)?;
+    // --recheck / --prefer-local force a genuine local build, so a substitutable
+    // fact no longer excuses instantiation — mirror `build_targets_at`'s `force`.
+    let force = policy.recheck || policy.prefer_local;
+    let mut need = HashSet::new();
+    for t in targets {
+        let obs = obs_by_drv
+            .get(&t.drv_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let cache_built = obs
+            .iter()
+            .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
+        let substitutable = !force && cache_built;
+        if policy.decide(obs, substitutable, t.broken) == Decision::Build {
+            need.insert(t.drv_path.clone());
+        }
+    }
+    Ok(need)
+}
+
 /// [`build_targets`] against an explicit observation DB (separable for tests).
 /// Probe the substituter for every target the log knows nothing about and
 /// record a `Cache`/`Built` observation per hit — the fact-gathering half of
@@ -528,6 +573,106 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn target(drv: &str, broken: bool) -> Target {
+        Target {
+            system: "sys".into(),
+            drv_path: drv.into(),
+            broken,
+        }
+    }
+
+    fn planted(drv: &str, source: Source, outcome: Outcome) -> Observation {
+        Observation {
+            drv_path: drv.into(),
+            source,
+            outcome,
+            when: 1,
+            system: None,
+            duration_s: None,
+            machine: None,
+        }
+    }
+
+    /// `drvs_to_materialize` must mirror pass 1's `Decision::Build`, from the log
+    /// alone: only drvs the build phase will still probe or build get a `.drv`.
+    /// This is what lets a fully-cached run skip instantiation (DESIGN §5–§6).
+    #[test]
+    fn drvs_to_materialize_matches_the_build_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("npd.sqlite");
+        {
+            let mut s = Store::open(&db).unwrap();
+            // Known-built locally, substitutable, and failing-only: all decided.
+            s.add_observation(&planted("/d/built", Source::Local, Outcome::Built))
+                .unwrap();
+            s.add_observation(&planted("/d/cached", Source::Cache, Outcome::Built))
+                .unwrap();
+            s.add_observation(&planted("/d/failed", Source::Local, Outcome::Failed))
+                .unwrap();
+        }
+        // "/d/new" has no fact; "/d/broken" is meta-blocked.
+        let targets = vec![
+            target("/d/built", false),
+            target("/d/cached", false),
+            target("/d/failed", false),
+            target("/d/broken", true),
+            target("/d/new", false),
+        ];
+
+        // Default policy: only the never-observed, non-broken drv needs a `.drv`.
+        let need = drvs_to_materialize_at(&db, &targets, BuildPolicy::default()).unwrap();
+        assert_eq!(need, HashSet::from(["/d/new".to_string()]));
+
+        // A fully-cached set (drop the new/broken outliers) needs nothing — the
+        // instantiation eval is skipped entirely.
+        let cached_only = &targets[..3];
+        assert!(
+            drvs_to_materialize_at(&db, cached_only, BuildPolicy::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        // The cache-bypass knobs re-open their targets: --recheck a success,
+        // --retry a failure, --prefer-local a substitutable, --build-broken a
+        // marked one — each then needs its `.drv` again.
+        let recheck = BuildPolicy {
+            recheck: true,
+            ..Default::default()
+        };
+        assert!(
+            drvs_to_materialize_at(&db, &targets, recheck)
+                .unwrap()
+                .contains("/d/built")
+        );
+        let retry = BuildPolicy {
+            retry: true,
+            ..Default::default()
+        };
+        assert!(
+            drvs_to_materialize_at(&db, &targets, retry)
+                .unwrap()
+                .contains("/d/failed")
+        );
+        let prefer_local = BuildPolicy {
+            prefer_local: true,
+            ..Default::default()
+        };
+        assert!(
+            drvs_to_materialize_at(&db, &targets, prefer_local)
+                .unwrap()
+                .contains("/d/cached")
+        );
+        let build_broken = BuildPolicy {
+            build_broken: true,
+            ..Default::default()
+        };
+        assert!(
+            drvs_to_materialize_at(&db, &targets, build_broken)
+                .unwrap()
+                .contains("/d/broken")
+        );
+    }
 
     /// Instantiate a nix expression, returning its .drv path.
     fn instantiate(expr: &str, attr: &str) -> String {

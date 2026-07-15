@@ -414,18 +414,31 @@ fn run(cli: Cli) -> Result<()> {
     // substitutable, or marked broken) so the report has a real state for every
     // row, not a `❓`.
     if !cli.no_build {
+        let targets = assemble_targets(&per_system_changed);
+
         // The evals ran with --no-instantiate (no `.drv` writes for the ~114k
-        // attrs npd never builds), so materialize just the changed set's `.drv`s
-        // now — the narinfo probe and the build both read them from the store.
+        // attrs npd never builds), so materialize the changed set's `.drv`s now —
+        // the narinfo probe and the build both read them from the store. But only
+        // for drvs the build phase will actually touch: a drv already known
+        // built/substitutable/failing is decided from the log alone, so writing
+        // its `.drv` is pure waste. When *every* changed drv is already known (the
+        // warm-cache iterative loop npd is built for), this set is empty and the
+        // whole instantiation eval is skipped — the couple of seconds that
+        // otherwise made a fully-cached run non-instant (DESIGN.md §5–§6).
+        let need = build::drvs_to_materialize(&targets, policy)?;
         let mut inst: Vec<(String, String, Vec<String>)> = Vec::new();
         for (sys, changed) in &per_system_changed {
             let mut base_attrs = Vec::new();
             let mut head_attrs = Vec::new();
             for c in changed {
-                if c.base_drv.is_some() && (build_broken || !c.base_broken) {
+                let wants = |drv: &Option<String>, broken: bool| {
+                    drv.as_ref()
+                        .is_some_and(|d| (build_broken || !broken) && need.contains(d))
+                };
+                if wants(&c.base_drv, c.base_broken) {
                     base_attrs.push(c.attr.clone());
                 }
-                if c.head_drv.is_some() && (build_broken || !c.head_broken) {
+                if wants(&c.head_drv, c.head_broken) {
                     head_attrs.push(c.attr.clone());
                 }
             }
@@ -434,7 +447,6 @@ fn run(cli: Cli) -> Result<()> {
         }
         eval::instantiate(&repo, &inst)?;
 
-        let targets = assemble_targets(&per_system_changed);
         if !targets.is_empty() {
             build::build_targets(&targets, policy)?;
         }
