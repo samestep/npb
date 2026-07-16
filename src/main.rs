@@ -31,6 +31,9 @@ use crate::model::{BuildPolicy, Rev};
     about = "A persistent fact store for iterating on nixpkgs changes"
 )]
 struct Cli {
+    /// nixpkgs clone to resolve the commits in (default: current directory).
+    #[arg(short = 'C')]
+    path: Option<PathBuf>,
     /// Base-branch tip to review the head against (default: `master`). The
     /// report compares this against the head merged onto it (see `--no-merge`).
     #[arg(long, conflicts_with = "pr")]
@@ -57,9 +60,6 @@ struct Cli {
     /// base (what a merge would actually produce), like a PR's test-merge.
     #[arg(long)]
     no_merge: bool,
-    /// nixpkgs clone to resolve the commits in (default: current directory).
-    #[arg(long)]
-    nixpkgs: Option<PathBuf>,
     /// Systems to report on (repeatable); defaults to the host system.
     #[arg(long)]
     system: Vec<String>,
@@ -564,7 +564,7 @@ fn run(cli: Cli) -> Result<()> {
         no_skip,
     };
     let opts = cli.eval;
-    let repo = resolve_repo(cli.nixpkgs)?;
+    let repo = resolve_repo(cli.path)?;
     let (base, head) = match cli.pr {
         Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.refetch, cli.no_merge)?,
         None => resolve_local(&repo, cli.base, cli.head, cli.no_merge)?,
