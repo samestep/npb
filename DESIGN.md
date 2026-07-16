@@ -39,8 +39,8 @@ or an "old format" to support:
   older version wrote, no readers for previous file formats, no "this column
   may linger" tolerance. Change the current format in place.
 - If a format change would make existing cached data wrong to read, the remedy
-  is invalidation, not compatibility: bump `EVAL_VERSION` (eval files under a
-  different version are simply never read) or delete `~/.cache/nix-npd`.
+  is invalidation, not compatibility: delete `~/.cache/nix-npd` (it is all
+  re-derivable) and let the next run regenerate it.
 - When a feature is removed, remove **all** of it in the same change: enum
   variants, struct fields, table columns, parsing, and doc references. Dead
   "maybe useful later" fields are cruft; re-add them when they're actually used.
@@ -145,7 +145,7 @@ commit, and full drv paths are stored as-is like the observation log.
 ```
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log + --tests cache (tiny)
-  evals/<commit>-<sys>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
+  evals/<commit>-<sys>.tsv.zst       # attr→drv maps (zstd), one file per eval
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -241,12 +241,14 @@ nixpkgs revision, the platform, and the nixpkgs *config* (allowlists like
 overlays, `config.allowAliases`, …). The trap is letting a user pass arbitrary
 Nix as config — that isn't cleanly hashable. `npd` avoids it by **defining the
 eval config itself**: one fixed allow-everything config (`EVAL_CONFIG` in
-`src/eval.rs`), so the key is just `(commit, system)` plus the `npd`
-eval-version tag, which is bumped whenever anything that could alter the
-stored map changes — the file format, *how* `nix-eval-jobs` is invoked, or the
-config itself. (An earlier design threaded a named "profile" label through the
-key to leave room for several configs; with exactly one config ever defined,
-the label was redundant with the version tag and was dropped.)
+`src/eval.rs`), so the key is just `(commit, system)`. There is no extra tag in
+the key: a change to the file format, *how* `nix-eval-jobs` is invoked, or the
+config itself alters the stored map, and the remedy is to delete
+`~/.cache/nix-npd` and regenerate (§1), not to coexist with old files. (An
+earlier design threaded a named "profile" label through the key to leave room
+for several configs, and a later one an eval-version tag baked into each
+filename; with exactly one config ever defined and a delete-to-invalidate cache,
+both were redundant and dropped.)
 
 Caching is sound because nixpkgs evaluation is deterministic given those inputs
 (drv paths are content-addressed by their inputs, stable across time and
@@ -579,8 +581,9 @@ macOS (see `stream_jobs` in `src/eval.rs`); drop that once the fix reaches the
 
 Recorded for context:
 
-- *Eval cache key* → `(commit, system)` with an eval-version tag standing in
-  for the fixed config; not a can of worms because `npd` owns the config (§6).
+- *Eval cache key* → `(commit, system)`; not a can of worms because `npd` owns
+  the fixed config (§6). No version tag — a format change invalidates by
+  deleting `~/.cache/nix-npd` (§1).
 - *Concurrency* → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.

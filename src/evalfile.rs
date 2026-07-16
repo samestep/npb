@@ -15,8 +15,8 @@
 //! one concat per changed row, so it costs nothing on the unchanged majority the
 //! merge skips. The format is strict — every drv is a `/nix/store` `.drv` or
 //! absent, matching the rest of npd (e.g. `cache::store_hash`) — with no fallback
-//! for other shapes: changing it is an EVAL_VERSION bump, so old files are
-//! ignored and regenerated, never mis-parsed as if they were stripped.
+//! for other shapes: on a format change, delete `~/.cache/nix-npd` so old files
+//! are regenerated rather than mis-parsed as if they were stripped.
 //!
 //! The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller at the
 //! default level; higher levels and a two-file split bought little). The diff
@@ -34,18 +34,15 @@ use anyhow::{Context, Result};
 use crate::model::AttrEval;
 use crate::paths::cache_root;
 
-/// Bumped when the eval file format, the eval config (`EVAL_CONFIG` in
-/// `eval.rs`), or *how* we invoke `nix-eval-jobs` changes in a way that could
-/// alter the stored attr->drv map; cache entries under a different version are
-/// ignored (and regenerated), never parsed by newer code — this version tag is
-/// the *only* format-change mechanism (no migration code, see CLAUDE.md).
-pub const EVAL_VERSION: u32 = 6;
-
-/// The cache file for one `(commit, system)` eval.
+/// The cache file for one `(commit, system)` eval. The eval format carries no
+/// version tag: everything under `~/.cache/nix-npd` is re-derivable, so a change
+/// to the file format, the eval config (`EVAL_CONFIG` in `eval.rs`), or *how*
+/// `nix-eval-jobs` is invoked is invalidated by deleting the cache, not by
+/// coexisting versions (no migration code — see CLAUDE.md).
 pub fn eval_path(commit: &str, system: &str) -> Result<PathBuf> {
     Ok(cache_root()?
         .join("evals")
-        .join(format!("{commit}-{system}-v{EVAL_VERSION}.tsv.zst")))
+        .join(format!("{commit}-{system}.tsv.zst")))
 }
 
 /// Write an eval to its file, sorted by attr, zstd-compressed, atomically: a

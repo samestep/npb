@@ -27,8 +27,8 @@ use crate::model::{AttrEval, TestJob};
 
 /// The one nixpkgs config every eval runs under. npd owns the config
 /// (DESIGN.md §6), which is what makes the eval cache key just
-/// `(commit, system)` — changing this line changes the attr→drv map, so it is
-/// by definition an [`crate::evalfile::EVAL_VERSION`] bump. The allow-flags are
+/// `(commit, system)` — changing this line changes the attr→drv map, so cached
+/// evals must be discarded (delete `~/.cache/nix-npd`). The allow-flags are
 /// on so meta-blocked packages still yield a drv + meta rather than throwing —
 /// we want their drvpath and the option to build them anyway.
 const EVAL_CONFIG: &str = "{ allowBroken = true; allowUnfree = true; \
@@ -181,8 +181,8 @@ fn stream_jobs<T>(
     // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn);
     // writing it to a temp file and passing the path works for any size (and the
     // small shard/full-set exprs don't care). The evaluated expression is
-    // byte-identical either way — same drvs — so this is not an EVAL_VERSION
-    // change. Kept alive until the child exits (nix-eval-jobs reads it at start).
+    // byte-identical either way — same drvs — so this doesn't affect the cached
+    // evals. Kept alive until the child exits (nix-eval-jobs reads it at start).
     let mut expr_file = tempfile::Builder::new()
         .prefix("npd-eval-")
         .suffix(".nix")
