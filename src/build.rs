@@ -694,25 +694,37 @@ mod tests {
         {
             let mut s = Store::open(&db).unwrap();
             // Known-built locally, substitutable, and failing-only: all decided.
-            s.add_observation(&planted("/d/built", Source::Local, Outcome::Built))
-                .unwrap();
-            s.add_observation(&planted("/d/cached", Source::Cache, Outcome::Built))
-                .unwrap();
-            s.add_observation(&planted("/d/failed", Source::Local, Outcome::Failed))
-                .unwrap();
+            s.add_observation(&planted(
+                "/nix/store/built.drv",
+                Source::Local,
+                Outcome::Built,
+            ))
+            .unwrap();
+            s.add_observation(&planted(
+                "/nix/store/cached.drv",
+                Source::Cache,
+                Outcome::Built,
+            ))
+            .unwrap();
+            s.add_observation(&planted(
+                "/nix/store/failed.drv",
+                Source::Local,
+                Outcome::Failed,
+            ))
+            .unwrap();
         }
-        // "/d/new" has no fact; "/d/skipped" is meta-blocked.
+        // "/nix/store/new.drv" has no fact; "/nix/store/skipped.drv" is meta-blocked.
         let targets = vec![
-            target("/d/built", false),
-            target("/d/cached", false),
-            target("/d/failed", false),
-            target("/d/skipped", true),
-            target("/d/new", false),
+            target("/nix/store/built.drv", false),
+            target("/nix/store/cached.drv", false),
+            target("/nix/store/failed.drv", false),
+            target("/nix/store/skipped.drv", true),
+            target("/nix/store/new.drv", false),
         ];
 
         // Default policy: only the never-observed, non-skipped drv needs a `.drv`.
         let need = drvs_to_materialize_at(&db, &targets, BuildPolicy::default()).unwrap();
-        assert_eq!(need, HashSet::from(["/d/new".to_string()]));
+        assert_eq!(need, HashSet::from(["/nix/store/new.drv".to_string()]));
 
         // A fully-cached set (drop the new/skipped outliers) needs nothing — the
         // instantiation eval is skipped entirely.
@@ -732,7 +744,7 @@ mod tests {
         assert!(
             drvs_to_materialize_at(&db, &targets, retry)
                 .unwrap()
-                .contains("/d/failed")
+                .contains("/nix/store/failed.drv")
         );
         let no_skip = BuildPolicy {
             no_skip: true,
@@ -741,7 +753,7 @@ mod tests {
         assert!(
             drvs_to_materialize_at(&db, &targets, no_skip)
                 .unwrap()
-                .contains("/d/skipped")
+                .contains("/nix/store/skipped.drv")
         );
     }
 

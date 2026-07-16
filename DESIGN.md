@@ -160,9 +160,12 @@ files (`evalfile::strip_drv`), restored on read. Every query is already scoped t
 one constant `(tree, system)`, so interning adds no per-row join — just one
 indexed point-lookup per operation to resolve the id. It's evictable by
 `(tree, system)` in lockstep with the eval files (`Store::purge_tests`, driven by
-`--clean`), then `VACUUM`ed to return the pages. Only the observation log keeps
-full drv paths (it's tiny, and its `blocker` column stores output paths, not
-drv paths, so stripping wouldn't be uniform there).
+`--clean`), then `VACUUM`ed to return the pages. The observation log strips its
+paths the same way — `drv_path` of the `/nix/store/`+`.drv` affixes, and each
+`blocker` output path of the `/nix/store/` prefix (an output has no `.drv`, so
+it uses a prefix-only `strip_out` rather than `strip_drv`) — which matters more
+there than anywhere else: it's the one append-only, never-evicted table, so its
+per-row bytes are what compound over time (~15% off it, measured).
 
 ```
 ~/.cache/nix-npd/

@@ -17,7 +17,12 @@ use crate::model::{Observation, Outcome, Source, TestJob};
 // change is deleting `~/.cache/nix-npd`, never a compat shim.
 const SCHEMA: &str = "
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
--- `local`/`cache` fact here per drv.
+-- `local`/`cache` fact here per drv. `drv_path` is stored stripped of its
+-- constant `/nix/store/` prefix and `.drv` suffix (`evalfile::strip_drv`), and
+-- `blocker`'s output paths of their `/nix/store/` prefix (`strip_out` — an
+-- output path has no `.drv`); both restored on read. This is the one
+-- append-only, never-evicted table, so trimming its per-row bytes is what
+-- compounds over time.
 CREATE TABLE IF NOT EXISTS observation (
     id         INTEGER PRIMARY KEY,
     drv_path   TEXT    NOT NULL,
@@ -107,6 +112,24 @@ fn outcome_from(s: &str) -> Result<Outcome> {
     })
 }
 
+/// Strip the constant `/nix/store/` prefix from a store *output* path — a
+/// `blocker` culprit path (DESIGN.md §5). Unlike a drv it has no `.drv` suffix,
+/// so `evalfile::strip_drv` (prefix *and* suffix) doesn't fit; [`restore_out`]
+/// re-adds the prefix. Every blocker is a real store path, so this is only ever
+/// called on one (the `debug_assert` catches a stray non-store path in dev).
+fn strip_out(p: &str) -> &str {
+    debug_assert!(
+        p.starts_with("/nix/store/"),
+        "blocker output path not under /nix/store: {p}"
+    );
+    p.strip_prefix("/nix/store/").unwrap_or(p)
+}
+
+/// Reconstruct a full output path from its stored (prefix-stripped) form — [`strip_out`]'s inverse.
+fn restore_out(p: &str) -> String {
+    format!("/nix/store/{p}")
+}
+
 /// A comma-joined run of `n` SQL bind placeholders (`?,?,…`) for an `IN (…)` clause.
 fn placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
@@ -136,19 +159,28 @@ impl Store {
 
     /// Append one observation to the log (never overwrites; DESIGN.md §3).
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
-        // Store paths never contain a newline, so a newline join round-trips
-        // losslessly; an empty blocker is NULL (only `dep-failed` carries one).
+        // Drv path and blocker outputs are stored with their `/nix/store/…`
+        // affixes stripped (like the eval files and the `--tests` cache),
+        // restored on read. Store paths never contain a newline, so the blocker's
+        // newline join round-trips losslessly; an empty blocker is NULL (only
+        // `dep-failed` carries one).
         let blocker: Option<String> = if o.blocker.is_empty() {
             None
         } else {
-            Some(o.blocker.join("\n"))
+            Some(
+                o.blocker
+                    .iter()
+                    .map(|p| strip_out(p))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         };
         self.conn.execute(
             "INSERT INTO observation \
              (drv_path, source, outcome, when_, blocker) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                o.drv_path,
+                strip_drv(&o.drv_path),
                 source_str(o.source),
                 outcome_str(o.outcome),
                 o.when,
@@ -186,7 +218,8 @@ impl Store {
              FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let params = rusqlite::params_from_iter(drv_paths.iter());
+        // The column is stored stripped, so match against the stripped query keys.
+        let params = rusqlite::params_from_iter(drv_paths.iter().map(|d| strip_drv(d)));
         let rows = stmt.query_map(params, |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -197,7 +230,8 @@ impl Store {
             ))
         })?;
         for row in rows {
-            let (drv_path, source, outcome, when, blocker) = row?;
+            let (stored_drv, source, outcome, when, blocker) = row?;
+            let drv_path = restore_drv(Some(&stored_drv)).expect("Some maps to Some");
             out.entry(drv_path.clone()).or_default().push(Observation {
                 drv_path,
                 source: source_from(&source)?,
@@ -205,7 +239,7 @@ impl Store {
                 when,
                 blocker: blocker
                     .filter(|s| !s.is_empty())
-                    .map(|s| s.split('\n').map(str::to_string).collect())
+                    .map(|s| s.split('\n').map(restore_out).collect())
                     .unwrap_or_default(),
             });
         }
@@ -229,7 +263,8 @@ impl Store {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
-            out.insert(row?);
+            // Stored stripped; callers compare against full `/nix/store` drv paths.
+            out.insert(restore_drv(Some(&row?)).expect("Some maps to Some"));
         }
         Ok(out)
     }
@@ -460,33 +495,46 @@ mod tests {
         };
 
         // a: only local failures -> failing.
-        s.add_observation(&obs("/a.drv", Source::Local, Outcome::Failed, 1))
+        s.add_observation(&obs("/nix/store/a.drv", Source::Local, Outcome::Failed, 1))
             .unwrap();
-        s.add_observation(&obs("/a.drv", Source::Local, Outcome::DepFailed, 2))
-            .unwrap();
+        s.add_observation(&obs(
+            "/nix/store/a.drv",
+            Source::Local,
+            Outcome::DepFailed,
+            2,
+        ))
+        .unwrap();
         // b: failed then built (flaky success) -> NOT failing.
-        s.add_observation(&obs("/b.drv", Source::Local, Outcome::Failed, 1))
+        s.add_observation(&obs("/nix/store/b.drv", Source::Local, Outcome::Failed, 1))
             .unwrap();
-        s.add_observation(&obs("/b.drv", Source::Local, Outcome::Built, 2))
+        s.add_observation(&obs("/nix/store/b.drv", Source::Local, Outcome::Built, 2))
             .unwrap();
         // c: local failure but substitutable (Cache/Built) -> NOT failing.
-        s.add_observation(&obs("/c.drv", Source::Local, Outcome::Failed, 1))
+        s.add_observation(&obs("/nix/store/c.drv", Source::Local, Outcome::Failed, 1))
             .unwrap();
-        s.add_observation(&obs("/c.drv", Source::Cache, Outcome::Built, 2))
+        s.add_observation(&obs("/nix/store/c.drv", Source::Cache, Outcome::Built, 2))
             .unwrap();
         // d: only a cache hit (never failed locally) -> NOT failing.
-        s.add_observation(&obs("/d.drv", Source::Cache, Outcome::Built, 1))
+        s.add_observation(&obs("/nix/store/d.drv", Source::Cache, Outcome::Built, 1))
             .unwrap();
         // e: dep-failed only -> failing.
-        s.add_observation(&obs("/e.drv", Source::Local, Outcome::DepFailed, 1))
-            .unwrap();
+        s.add_observation(&obs(
+            "/nix/store/e.drv",
+            Source::Local,
+            Outcome::DepFailed,
+            1,
+        ))
+        .unwrap();
 
         let failing = s.failing_drvs().unwrap();
         assert_eq!(
             failing,
-            ["/a.drv".to_string(), "/e.drv".to_string()]
-                .into_iter()
-                .collect()
+            [
+                "/nix/store/a.drv".to_string(),
+                "/nix/store/e.drv".to_string()
+            ]
+            .into_iter()
+            .collect()
         );
 
         let _ = fs::remove_dir_all(&dir);
