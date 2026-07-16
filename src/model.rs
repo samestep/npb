@@ -103,12 +103,23 @@ pub enum Outcome {
 /// We never overwrite an observation; flakiness is simply multiple observations
 /// of the same `drv_path` with differing outcomes. `when` is unix seconds,
 /// passed in by the caller (the model never reads the clock).
+///
+/// `blocker` is populated only for a [`Outcome::DepFailed`]: it is the output
+/// paths of the *specific* still-failing dependency that blocked this drv (the
+/// "culprit", DESIGN.md §5). It is what makes a dependency-block *self-healing*
+/// without re-evaluation: a later run re-checks those paths' store validity
+/// offline — no `.drv`, no closure walk — and re-attempts the dependent the
+/// moment the culprit has built or been substituted. Empty for every other
+/// outcome (and for a `DepFailed` whose culprit wasn't recorded, which is then
+/// treated conservatively as still-blocking).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     pub drv_path: String,
     pub source: Source,
     pub outcome: Outcome,
     pub when: i64,
+    /// Output paths of the culprit dependency for a `DepFailed`; else empty.
+    pub blocker: Vec<String>,
 }
 
 /// What the build policy says to do about a derivation.
@@ -150,21 +161,30 @@ impl BuildPolicy {
     /// (Nix could fetch it without building) — a *success* signal that says
     /// nothing about local reproducibility. `broken` is the attr's
     /// meta-broken/unsupported/insecure bit from the eval.
+    ///
+    /// `dep_block_stale` distinguishes the two kinds of recorded failure
+    /// (DESIGN.md §5). A **direct** failure (the drv's own build failed) is
+    /// sticky: presumed to keep failing, `--retry` to re-attempt. A
+    /// **dependency block** (`DepFailed`) is only trusted while the blocking
+    /// dependency is *still* failing; once that culprit has built or been
+    /// substituted, the block is stale and the caller passes
+    /// `dep_block_stale = true` so we re-attempt — no `--retry` needed. The
+    /// caller computes staleness by re-checking the culprit's store validity
+    /// (`Observation::blocker`), which the pure predicate can't do itself.
     pub fn decide(
         &self,
         observations: &[Observation],
         substitutable: bool,
         broken: bool,
+        dep_block_stale: bool,
     ) -> Decision {
         let local: Vec<&Observation> = observations
             .iter()
             .filter(|o| o.source == Source::Local)
             .collect();
         let local_built = local.iter().any(|o| o.outcome == Outcome::Built);
-        let local_failed_only = !local.is_empty()
-            && local
-                .iter()
-                .all(|o| matches!(o.outcome, Outcome::Failed | Outcome::DepFailed));
+        let direct_failed = local.iter().any(|o| o.outcome == Outcome::Failed);
+        let dep_failed = local.iter().any(|o| o.outcome == Outcome::DepFailed);
 
         // Marked broken and not overridden: never attempt (checked before the
         // other knobs, so e.g. `--retry` alone still doesn't build it). A real
@@ -183,9 +203,16 @@ impl BuildPolicy {
         if substitutable && !self.prefer_local && !self.recheck {
             return Decision::SkipOk;
         }
-        // A known-failing derivation is not worth re-running unless asked.
-        if local_failed_only && !self.retry {
-            return Decision::SkipFail;
+        // A known-failing derivation is not worth re-running unless asked. A
+        // direct failure is sticky; a dependency block only holds while its
+        // culprit is still failing (`!dep_block_stale`).
+        if !self.retry {
+            if direct_failed {
+                return Decision::SkipFail;
+            }
+            if dep_failed && !dep_block_stale {
+                return Decision::SkipFail;
+            }
         }
         Decision::Build
     }
@@ -201,13 +228,14 @@ mod tests {
             source,
             outcome,
             when: 0,
+            blocker: Vec::new(),
         }
     }
 
     #[test]
     fn never_observed_builds() {
         assert_eq!(
-            BuildPolicy::default().decide(&[], false, false),
+            BuildPolicy::default().decide(&[], false, false, false),
             Decision::Build
         );
     }
@@ -215,42 +243,42 @@ mod tests {
     #[test]
     fn substitutable_skips_unless_prefer_local() {
         assert_eq!(
-            BuildPolicy::default().decide(&[], true, false),
+            BuildPolicy::default().decide(&[], true, false, false),
             Decision::SkipOk
         );
         let p = BuildPolicy {
             prefer_local: true,
             ..Default::default()
         };
-        assert_eq!(p.decide(&[], true, false), Decision::Build);
+        assert_eq!(p.decide(&[], true, false, false), Decision::Build);
     }
 
     #[test]
     fn local_success_skips_unless_recheck() {
         let o = [obs(Source::Local, Outcome::Built)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
+            BuildPolicy::default().decide(&o, false, false, false),
             Decision::SkipOk
         );
         let p = BuildPolicy {
             recheck: true,
             ..Default::default()
         };
-        assert_eq!(p.decide(&o, false, false), Decision::Build);
+        assert_eq!(p.decide(&o, false, false, false), Decision::Build);
     }
 
     #[test]
     fn only_failures_skip_unless_retry() {
         let o = [obs(Source::Local, Outcome::Failed)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
+            BuildPolicy::default().decide(&o, false, false, false),
             Decision::SkipFail
         );
         let p = BuildPolicy {
             retry: true,
             ..Default::default()
         };
-        assert_eq!(p.decide(&o, false, false), Decision::Build);
+        assert_eq!(p.decide(&o, false, false, false), Decision::Build);
     }
 
     #[test]
@@ -260,9 +288,45 @@ mod tests {
             obs(Source::Local, Outcome::Built),
         ];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
+            BuildPolicy::default().decide(&o, false, false, false),
             Decision::SkipOk
         );
+    }
+
+    #[test]
+    fn dep_block_holds_until_culprit_heals() {
+        // A dependency block (DepFailed, no direct failure) is skipped while its
+        // culprit still fails, but re-attempted the moment the block goes stale —
+        // no --retry needed. This is the self-healing property (DESIGN.md §5).
+        let o = [obs(Source::Local, Outcome::DepFailed)];
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false, false),
+            Decision::SkipFail
+        );
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false, true),
+            Decision::Build
+        );
+    }
+
+    #[test]
+    fn direct_failure_stays_sticky_even_when_a_dep_block_is_stale() {
+        // A drv that failed *directly* is sticky regardless of dep staleness: a
+        // stale sibling dep-block must not resurrect a real direct failure.
+        // --retry is the only escape.
+        let o = [
+            obs(Source::Local, Outcome::Failed),
+            obs(Source::Local, Outcome::DepFailed),
+        ];
+        assert_eq!(
+            BuildPolicy::default().decide(&o, false, false, true),
+            Decision::SkipFail
+        );
+        let retry = BuildPolicy {
+            retry: true,
+            ..Default::default()
+        };
+        assert_eq!(retry.decide(&o, false, false, true), Decision::Build);
     }
 
     #[test]
@@ -271,7 +335,7 @@ mod tests {
         // still build (the caller folds a prior Cache-built obs into substitutable).
         let o = [obs(Source::Cache, Outcome::Built)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
+            BuildPolicy::default().decide(&o, false, false, false),
             Decision::Build
         );
     }
@@ -281,32 +345,35 @@ mod tests {
         // Marked broken: never attempted by default — not even when
         // substitutable, and not under --retry/--recheck alone.
         let p = BuildPolicy::default();
-        assert_eq!(p.decide(&[], false, true), Decision::SkipBroken);
-        assert_eq!(p.decide(&[], true, true), Decision::SkipBroken);
+        assert_eq!(p.decide(&[], false, true, false), Decision::SkipBroken);
+        assert_eq!(p.decide(&[], true, true, false), Decision::SkipBroken);
         let retry = BuildPolicy {
             retry: true,
             ..Default::default()
         };
         assert_eq!(
-            retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true),
+            retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true, false),
             Decision::SkipBroken
         );
         let recheck = BuildPolicy {
             recheck: true,
             ..Default::default()
         };
-        assert_eq!(recheck.decide(&[], false, true), Decision::SkipBroken);
+        assert_eq!(
+            recheck.decide(&[], false, true, false),
+            Decision::SkipBroken
+        );
 
         // A prior forced build's success is still a trusted fact.
         let o = [obs(Source::Local, Outcome::Built)];
-        assert_eq!(p.decide(&o, false, true), Decision::SkipOk);
+        assert_eq!(p.decide(&o, false, true, false), Decision::SkipOk);
 
         // --build-broken restores the normal policy.
         let bb = BuildPolicy {
             build_broken: true,
             ..Default::default()
         };
-        assert_eq!(bb.decide(&[], false, true), Decision::Build);
-        assert_eq!(bb.decide(&o, false, true), Decision::SkipOk);
+        assert_eq!(bb.decide(&[], false, true, false), Decision::Build);
+        assert_eq!(bb.decide(&o, false, true, false), Decision::SkipOk);
     }
 }

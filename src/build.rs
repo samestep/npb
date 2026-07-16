@@ -3,15 +3,21 @@
 //! whole build set in ONE `nom build` invocation. Each drv's outcome is
 //! recorded the moment its build activity stops — so an interrupted (^C) batch
 //! keeps every fact observed so far — and drvs nix never attempted are
-//! attributed from a post-build output-validity check.
+//! attributed from a post-batch output-validity check that records only
+//! ground-truth outcomes (`Built`, or a `DepFailed` naming a verified culprit),
+//! never an inference gated on nix's ambiguous exit status.
 //!
 //! The observation log exists because Nix remembers successful builds (the
 //! store) but *forgets failures* — without it, a known-failing derivation
 //! gets retried on every run. We record a failure for *any* drv we watch fail,
 //! a transitive dependency included; a target whose build closure contains a
-//! known-failing drv is then skipped before building (it would only cascade to
-//! `DepFailed`), which is how a re-run recovers a dependency failure that a ^C
-//! dropped before the post-build sweep could attribute its dependents.
+//! *still-failing* dependency is then skipped before building (it would only
+//! cascade to `DepFailed`), which is how a re-run recovers a dependency failure
+//! that a ^C dropped before the post-batch step could attribute its dependents.
+//! A recorded failure is never trusted blindly, though: it is re-verified
+//! against the store before it can block anything (`verify_failing`), and a
+//! `DepFailed` carries its culprit's outputs (`Observation::blocker`) so a
+//! since-healed dependency un-blocks its dependents automatically, no `--retry`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -61,9 +67,7 @@ const ACT_BUILD: i64 = 105;
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
 /// together with its own parallelism — while acting as a middleman: nix emits
 /// `--log-format internal-json`, we forward it to `nom --json` for the live
-/// tree and simultaneously parse build (`type:105`) start/stop events. That
-/// gives us, per drv, whether it was *attempted* (start seen ⇒ a later failure
-/// is its own, not a dependency's) — which a plain batch build doesn't expose.
+/// tree and simultaneously parse build (`type:105`) start/stop events.
 /// `--keep-going` so every drv is attempted.
 ///
 /// `on_finish(drv)` fires as *every* build activity stops — the requested
@@ -72,18 +76,20 @@ const ACT_BUILD: i64 = 105;
 /// build's outputs *before* emitting the stop event (both the local and
 /// build-hook goals `registerValidPaths` before destroying the `actBuild`
 /// Activity — nix 2.34 `derivation-building-goal.cc`), so the callback can
-/// attribute the outcome from output validity right away.
+/// attribute the outcome from output validity right away. (Nix keeps the build
+/// log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves it, so
+/// npd doesn't duplicate it.)
 ///
-/// Returns every drv nix attempted (build started), dependencies included,
-/// plus nix's own exit status — the caller gates its no-activity *inferences*
-/// on it (see the pass-3 comment in [`build_targets_at`]). (Nix keeps the
-/// build log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves
-/// it, so npd doesn't duplicate it.)
+/// nix's exit status is deliberately *not* returned: npd records only outcomes
+/// it can ground in store validity — a drv's own stop event (here) or, for the
+/// drvs that got no build activity, the post-batch output-validity check in
+/// [`build_targets_at`] — never an inference gated on the ambiguous exit code
+/// (DESIGN.md §5).
 fn batch_build(
     drvs: &[&str],
     force: bool,
     mut on_finish: impl FnMut(&str) -> Result<()>,
-) -> Result<(HashSet<String>, std::process::ExitStatus)> {
+) -> Result<()> {
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
     nix.arg("build").args(&installables).args([
@@ -114,7 +120,6 @@ fn batch_build(
 
     let log = BufReader::new(nix.stderr.take().expect("stderr is piped"));
     let mut nom_in = nom.stdin.take().expect("stdin is piped");
-    let mut attempted = HashSet::new();
     let mut starts: HashMap<u64, String> = HashMap::new();
 
     let streamed = (|| -> Result<()> {
@@ -133,7 +138,6 @@ fn batch_build(
                     if let (Some(id), Some(drv)) =
                         (ev.id, ev.fields.first().and_then(|v| v.as_str()))
                     {
-                        attempted.insert(drv.to_string());
                         starts.insert(id, drv.to_string());
                     }
                 }
@@ -156,10 +160,12 @@ fn batch_build(
         // pipe until its next stderr write EPIPEs it — potentially minutes.
         let _ = nix.kill();
     }
-    let status = nix.wait().context("waiting for nix build")?;
+    // Reap nix (and nom) regardless. A build failing is normal (npd records the
+    // per-drv outcome above), so the exit status is intentionally discarded.
+    let _ = nix.wait().context("waiting for nix build")?;
     let _ = nom.wait();
     streamed?;
-    Ok((attempted, status))
+    Ok(())
 }
 
 /// Which of `paths` are NOT valid in the local store (i.e. weren't built).
@@ -226,6 +232,81 @@ fn build_outcomes(drvs: &[&str]) -> Result<HashMap<String, bool>> {
         .collect())
 }
 
+/// For each target with a `DepFailed`-only history, whether its recorded block is
+/// now **stale** — the culprit dependency's outputs (`Observation::blocker`) are
+/// all valid in the store, so it has built or been substituted since (DESIGN.md
+/// §5). This is the self-healing check, and it is deliberately **offline**: one
+/// `nix-store --check-validity` over the stored blocker paths, needing no `.drv`
+/// and no closure walk, so a fully-cached run stays instant. A `DepFailed` with
+/// no recorded blocker (its culprit unknown) is treated conservatively as *not*
+/// stale — it keeps blocking until `--retry`. The store-validity signal mirrors,
+/// for a dependency, what a recorded `Built` already does for a target
+/// (`flaky_success_wins`): a later success outranks an earlier failure.
+fn stale_dep_blocks(
+    targets: &[Target],
+    obs_by_drv: &HashMap<String, Vec<Observation>>,
+) -> Result<HashMap<String, bool>> {
+    let mut all_paths: Vec<String> = Vec::new();
+    let mut per_target: Vec<(String, Vec<String>)> = Vec::new();
+    for t in targets {
+        let obs = obs_by_drv
+            .get(&t.drv_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        // The most recent dep-block that recorded a culprit is the one in force.
+        if let Some(blocker) = obs
+            .iter()
+            .rev()
+            .find(|o| {
+                o.source == Source::Local
+                    && o.outcome == Outcome::DepFailed
+                    && !o.blocker.is_empty()
+            })
+            .map(|o| o.blocker.clone())
+        {
+            all_paths.extend(blocker.iter().cloned());
+            per_target.push((t.drv_path.clone(), blocker));
+        }
+    }
+    if all_paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let invalid = invalid_paths(&all_paths)?;
+    Ok(per_target
+        .into_iter()
+        .map(|(drv, blocker)| {
+            let stale = blocker.iter().all(|p| !invalid.contains(p));
+            (drv, stale)
+        })
+        .collect())
+}
+
+/// From a set of candidate failing drvs (drawn from the observation log), the
+/// subset that is **actually still failing** — some output is invalid in the
+/// store — mapped to that drv's output paths (its `blocker` if it culprits a
+/// dependent). A candidate whose outputs are now all valid has healed since (a
+/// rebuild, or an unrelated build substituted it) and is dropped, so a stale
+/// failure fact can never re-block. Callers pass candidates drawn from an
+/// instantiated target's closure, so each candidate's `.drv` is present and
+/// `drv_outputs` resolves.
+fn verify_failing(candidates: &HashSet<String>) -> Result<HashMap<String, Vec<String>>> {
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut per_drv: Vec<(String, Vec<String>)> = Vec::new();
+    let mut all = Vec::new();
+    for d in candidates {
+        let outs = cache::drv_outputs(d)?;
+        all.extend(outs.iter().cloned());
+        per_drv.push((d.clone(), outs));
+    }
+    let invalid = invalid_paths(&all)?;
+    Ok(per_drv
+        .into_iter()
+        .filter(|(_, outs)| outs.is_empty() || outs.iter().any(|o| invalid.contains(o)))
+        .collect())
+}
+
 /// For each target, consult `policy` against the observation log; then build the
 /// whole build set at once.
 pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
@@ -260,6 +341,10 @@ fn drvs_to_materialize_at(
     // --recheck / --prefer-local force a genuine local build, so a substitutable
     // fact no longer excuses instantiation — mirror `build_targets_at`'s `force`.
     let force = policy.recheck || policy.prefer_local;
+    // A stale dep-block re-opens its target (it will be re-attempted), so its
+    // `.drv` is needed again — compute staleness the same offline way the build
+    // driver does, keeping the two decisions in lockstep.
+    let stale = stale_dep_blocks(targets, &obs_by_drv)?;
     let mut need = HashSet::new();
     for t in targets {
         let obs = obs_by_drv
@@ -270,7 +355,8 @@ fn drvs_to_materialize_at(
             .iter()
             .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
         let substitutable = !force && cache_built;
-        if policy.decide(obs, substitutable, t.broken) == Decision::Build {
+        let dep_stale = stale.get(&t.drv_path).copied().unwrap_or(false);
+        if policy.decide(obs, substitutable, t.broken, dep_stale) == Decision::Build {
             need.insert(t.drv_path.clone());
         }
     }
@@ -351,6 +437,7 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
                 source: Source::Cache,
                 outcome: Outcome::Built,
                 when: now,
+                blocker: Vec::new(),
             })?;
         }
     }
@@ -377,58 +464,84 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     };
     let substitutable = |drv: &str| !force && cache_built(drv);
 
-    // Pass 1: decide per target, purely from the (just-refreshed) log. Skips
-    // are silent — a fully-cached run must print nothing.
+    // Pass 1: decide per target, purely from the (just-refreshed) log, plus the
+    // one store-backed input the pure predicate can't compute — whether a
+    // recorded dependency-block has gone stale (its culprit built or was
+    // substituted since; `stale_dep_blocks`, offline). Skips are silent — a
+    // fully-cached run must print nothing.
+    let stale = stale_dep_blocks(targets, &obs_by_drv)?;
+    let dep_stale = |drv: &str| stale.get(drv).copied().unwrap_or(false);
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
-        if policy.decide(observations, substitutable(&t.drv_path), t.broken) == Decision::Build {
+        let decision = policy.decide(
+            observations,
+            substitutable(&t.drv_path),
+            t.broken,
+            dep_stale(&t.drv_path),
+        );
+        if decision == Decision::Build {
             to_build.push(i);
         }
     }
 
-    // Pass 1b: forward-propagate known failures (DESIGN.md §5). A target whose
-    // build closure contains a drv that only-fails locally would just cascade to
-    // `DepFailed`, so drop it from the build set and record that inferred outcome
-    // now (committed immediately, so ^C-safe; and the next run then skips it
-    // straight from its own history). This is what lets a re-run recover a
-    // dependency failure a ^C dropped before the post-batch sweep could attribute
-    // its dependents: the *dependency's* own `Failed` fact (recorded incrementally
-    // in pass 2 below) survives, and pass 1b re-derives the block. `--retry`
-    // re-attempts failures, so it disables the propagation.
+    // Pass 1b: forward-propagate *still-failing* dependencies (DESIGN.md §5). A
+    // target whose build closure contains a dependency that only-fails locally
+    // would just cascade to `DepFailed`, so drop it from the build set and record
+    // that block now (committed immediately, so ^C-safe; the next run then skips
+    // it from its own history). Two guards keep it sound and self-healing: the
+    // log's failing candidates are re-verified against the store
+    // (`verify_failing`), so a since-rebuilt/substituted dependency no longer
+    // blocks; and the recorded `DepFailed` carries the culprit's output paths as
+    // its `blocker`, so a later run can re-check the block offline and re-attempt
+    // the dependent the moment the culprit heals. `--retry` disables propagation.
     let failing = if policy.retry {
         HashSet::new()
     } else {
         store.failing_drvs()?
     };
-    let touches_failing = |drv: &str| -> Result<bool> {
-        Ok(drv_closure(&[drv])?.iter().any(|d| failing.contains(d)))
-    };
     if !failing.is_empty() && !to_build.is_empty() {
-        // One union query first: if no candidate's closure reaches the failing
-        // set at all, there is nothing to skip and we avoid the per-target walk.
+        // One union query first: only the drvs whose closure actually reaches the
+        // log's failing set are worth the per-drv verification (drv_outputs + a
+        // validity probe), and a since-healed candidate drops out here.
         let cand: Vec<&str> = to_build
             .iter()
             .map(|&i| targets[i].drv_path.as_str())
             .collect();
-        if drv_closure(&cand)?.iter().any(|d| failing.contains(d)) {
+        let reachable: HashSet<String> = drv_closure(&cand)?
+            .into_iter()
+            .filter(|d| failing.contains(d))
+            .collect();
+        let verified = verify_failing(&reachable)?;
+        if !verified.is_empty() {
             let now = unix_now();
             let mut still_build = Vec::new();
             let mut blocked_seen: HashSet<&str> = HashSet::new();
             for &i in &to_build {
                 let drv = targets[i].drv_path.as_str();
-                if !touches_failing(drv)? {
-                    still_build.push(i);
-                    continue;
-                }
-                // Aliased attrs share a drv — record the inferred block once.
-                if blocked_seen.insert(drv) {
-                    store.add_observation(&Observation {
-                        drv_path: drv.to_string(),
-                        source: Source::Local,
-                        outcome: Outcome::DepFailed,
-                        when: now,
-                    })?;
+                // A still-failing dependency in this target's closure is the
+                // culprit; its outputs become the block's `blocker`. Exclude the
+                // target itself: `--requisites` lists a drv among its own inputs,
+                // and a re-opened target still carries its own failure in the log,
+                // so without this a target would block *itself* forever.
+                let culprit = drv_closure(&[drv])?
+                    .into_iter()
+                    .filter(|d| d != drv)
+                    .find_map(|d| verified.get(&d).cloned());
+                match culprit {
+                    None => still_build.push(i),
+                    // Aliased attrs share a drv — record the block once.
+                    Some(blocker) => {
+                        if blocked_seen.insert(drv) {
+                            store.add_observation(&Observation {
+                                drv_path: drv.to_string(),
+                                source: Source::Local,
+                                outcome: Outcome::DepFailed,
+                                when: now,
+                                blocker,
+                            })?;
+                        }
+                    }
                 }
             }
             to_build = still_build;
@@ -452,7 +565,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         // Several targets can share a drv (aliased attrs); record it once.
         let requested: HashSet<&str> = drvs.iter().copied().collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
-        let (attempted, status) = batch_build(&drvs, force, |drv| {
+        batch_build(&drvs, force, |drv| {
             let built = drv_built(drv)?;
             if requested.contains(drv) {
                 // A requested target: record its own outcome, success or failure.
@@ -466,6 +579,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     source: Source::Local,
                     outcome,
                     when: unix_now(),
+                    blocker: Vec::new(),
                 })?;
                 recorded.insert(drv.to_string(), outcome);
             } else if !built {
@@ -474,33 +588,32 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 // propagates the failure forward — skipping any target that would
                 // re-pull it (pass 1b) — and so ^C keeps it. A dependency
                 // *success* needs no row: nix's own store validity already
-                // remembers it, and only failures drive the forward-skip.
+                // remembers it, and `verify_failing` consults exactly that so a
+                // healed dependency stops blocking.
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
                     source: Source::Local,
                     outcome: Outcome::Failed,
                     when: unix_now(),
+                    blocker: Vec::new(),
                 })?;
             }
             Ok(())
         })?;
 
-        // Pass 3: attribute the drvs that had no build activity — a drv nix
-        // *attempted* failed on its own; one it never attempted either had valid
-        // outputs already (substituted, or a prior interrupted run built it) or
-        // was blocked by a failed dependency. No per-target result lines: nom's
-        // tree already showed each build's fate, and the report has the rest.
-        //
-        // Output validity is ground truth, so `Built` is always safe to record.
-        // The Failed/DepFailed branches are *inferences* whose premise is that
-        // nix finished the batch under --keep-going; if nix was killed by a
-        // signal (`code()` is None: OOM kill, daemon-restart kill) the batch
-        // never finished scheduling and "no build activity" implies nothing —
-        // recording it would plant false failure facts the policy then trusts
-        // forever. (A batch that *aborts* with a normal error exit — e.g. the
-        // daemon connection dropping — is indistinguishable by status from one
-        // that completed with failures and can still mis-attribute; DESIGN §5.)
-        let finished = status.code().is_some();
+        // Post-batch attribution of requested targets that got *no* build
+        // activity (blocked by a failed dependency, or already valid). Only two
+        // outcomes are recorded here, and both are ground truth — never an
+        // inference gated on nix's ambiguous exit status (the old "Pass 3", which
+        // could mis-attribute never-started drvs as failures when a batch aborted
+        // with a normal error code; DESIGN §5):
+        //   - outputs valid -> `Built` (another target realized it as a
+        //     dependency, or it was already valid);
+        //   - a still-failing dependency in its closure -> `DepFailed`, tagged
+        //     with that culprit's outputs so the block self-heals next run.
+        // A leftover with neither (nix never reached it, and nothing in its
+        // closure is actually failing) is left unrecorded and re-attempted next
+        // run — sound, since we never assert a failure we didn't observe.
         let leftover: Vec<&str> = drvs
             .iter()
             .copied()
@@ -508,26 +621,46 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .collect::<HashSet<&str>>()
             .into_iter()
             .collect();
-        let built_map = build_outcomes(&leftover)?;
-        let now = unix_now();
-        for &drv in &leftover {
-            let built = built_map.get(drv).copied().unwrap_or(false);
-            if !built && !finished {
-                continue;
-            }
-            let outcome = if built {
-                Outcome::Built
-            } else if attempted.contains(drv) {
-                Outcome::Failed
+        if !leftover.is_empty() {
+            let built_map = build_outcomes(&leftover)?;
+            // Pass 2 may have just added this batch's own dependency failures.
+            let failing_now = if policy.retry {
+                HashSet::new()
             } else {
-                Outcome::DepFailed
+                store.failing_drvs()?
             };
-            store.add_observation(&Observation {
-                drv_path: drv.to_string(),
-                source: Source::Local,
-                outcome,
-                when: now,
-            })?;
+            let now = unix_now();
+            for &drv in &leftover {
+                if built_map.get(drv).copied().unwrap_or(false) {
+                    store.add_observation(&Observation {
+                        drv_path: drv.to_string(),
+                        source: Source::Local,
+                        outcome: Outcome::Built,
+                        when: now,
+                        blocker: Vec::new(),
+                    })?;
+                    continue;
+                }
+                if failing_now.is_empty() {
+                    continue;
+                }
+                // Exclude the target itself (see pass 1b): a leftover target that
+                // failed to build isn't blocked *by itself*, and its own drv is in
+                // its `--requisites`.
+                let reachable: HashSet<String> = drv_closure(&[drv])?
+                    .into_iter()
+                    .filter(|d| d != drv && failing_now.contains(d))
+                    .collect();
+                if let Some(blocker) = verify_failing(&reachable)?.into_values().next() {
+                    store.add_observation(&Observation {
+                        drv_path: drv.to_string(),
+                        source: Source::Local,
+                        outcome: Outcome::DepFailed,
+                        when: now,
+                        blocker,
+                    })?;
+                }
+            }
         }
     }
 
@@ -553,6 +686,19 @@ mod tests {
             source,
             outcome,
             when: 1,
+            blocker: Vec::new(),
+        }
+    }
+
+    /// Like `planted`, but for a `DepFailed` whose culprit outputs are recorded —
+    /// used to exercise the offline staleness re-check (`stale_dep_blocks`).
+    fn planted_block(drv: &str, when: i64, blocker: &[&str]) -> Observation {
+        Observation {
+            drv_path: drv.into(),
+            source: Source::Local,
+            outcome: Outcome::DepFailed,
+            when,
+            blocker: blocker.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -827,6 +973,7 @@ mod tests {
                 source: Source::Local,
                 outcome: Outcome::Failed,
                 when: 1,
+                blocker: Vec::new(),
             })
             .unwrap();
         }
@@ -838,16 +985,93 @@ mod tests {
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
 
         let s = Store::open(&db).unwrap();
-        // The dependent was skipped without building and recorded blocked.
+        // The dependent was skipped without building and recorded blocked, tagged
+        // with the culprit dependency's outputs (the self-healing `blocker`).
         let top_obs = s.load_observations(&top).unwrap();
         assert_eq!(top_obs.len(), 1);
         assert_eq!(top_obs[0].outcome, Outcome::DepFailed);
+        assert!(
+            !top_obs[0].blocker.is_empty(),
+            "a propagated block records its culprit's outputs"
+        );
         // The failing dependency was NOT re-attempted: still exactly the one
         // planted observation (a rebuild would have appended a second).
         assert_eq!(
             s.load_observations(&dep).unwrap().len(),
             1,
             "the known-failing dependency must not be rebuilt"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The self-healing path (DESIGN.md §5): a dependent recorded `DepFailed`,
+    /// whose culprit dependency has since built, is re-attempted on the next run
+    /// *without* `--retry` — because the block's recorded `blocker` outputs are
+    /// now valid in the store, so `stale_dep_blocks` reports it stale. The
+    /// dependent then builds and its success outranks the stale block.
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn stale_dependency_block_reattempts_dependent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npd-heal-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npd.sqlite");
+
+        // `dep` *succeeds* here (a flaky dependency that has since been fixed);
+        // `top` depends on it. Only `top` is a requested target.
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npd-heal-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
+                 # `: ${{dep}}` references dep (making it a build input) without
+                 # any external command — the sandbox PATH is empty, so `cat` &c.
+                 # aren't available; only shell builtins (`:`, `echo`, `>`) are.
+                 top = mk "npd-heal-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+        let dep_outs = cache::drv_outputs(&dep).unwrap();
+
+        // Realize `dep` so its outputs are valid in the store — the culprit has
+        // healed. (Build it directly; it isn't a requested target of this run.)
+        let ok = Command::new("nix")
+            .args(["build", "--no-link", &format!("{dep}^*")])
+            .args(["--extra-experimental-features", "nix-command"])
+            .status()
+            .expect("building the dependency");
+        assert!(ok.success(), "the healed dependency should build");
+
+        // Plant the state a prior run left: `dep` failed once, and `top` was
+        // blocked by it — tagged with `dep`'s (now-valid) outputs.
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&planted(&dep, Source::Local, Outcome::Failed))
+                .unwrap();
+            let blocker: Vec<&str> = dep_outs.iter().map(String::as_str).collect();
+            s.add_observation(&planted_block(&top, 2, &blocker))
+                .unwrap();
+        }
+
+        let targets = [Target {
+            drv_path: top.clone(),
+            broken: false,
+        }];
+        // Default policy — no --retry. The stale block alone must re-open `top`.
+        build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        let top_obs = s.load_observations(&top).unwrap();
+        assert!(
+            top_obs.iter().any(|o| o.outcome == Outcome::Built),
+            "a stale dep-block must re-attempt the dependent, which then builds: {top_obs:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);

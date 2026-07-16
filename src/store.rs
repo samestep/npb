@@ -22,7 +22,11 @@ CREATE TABLE IF NOT EXISTS observation (
     drv_path   TEXT    NOT NULL,
     source     TEXT    NOT NULL,
     outcome    TEXT    NOT NULL,
-    when_      INTEGER NOT NULL
+    when_      INTEGER NOT NULL,
+    -- For a `dep-failed`: newline-joined output paths of the culprit dependency
+    -- (DESIGN.md §5), so a later run can re-check the block's validity offline.
+    -- NULL for every other outcome.
+    blocker    TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 
@@ -116,15 +120,23 @@ impl Store {
 
     /// Append one observation to the log (never overwrites; DESIGN.md §3).
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
+        // Store paths never contain a newline, so a newline join round-trips
+        // losslessly; an empty blocker is NULL (only `dep-failed` carries one).
+        let blocker: Option<String> = if o.blocker.is_empty() {
+            None
+        } else {
+            Some(o.blocker.join("\n"))
+        };
         self.conn.execute(
             "INSERT INTO observation \
-             (drv_path, source, outcome, when_) \
-             VALUES (?1, ?2, ?3, ?4)",
+             (drv_path, source, outcome, when_, blocker) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 o.drv_path,
                 source_str(o.source),
                 outcome_str(o.outcome),
                 o.when,
+                blocker,
             ],
         )?;
         Ok(())
@@ -154,7 +166,7 @@ impl Store {
         // `WHERE drv_path IN (?,?,…)` with one placeholder per drv.
         let placeholders = placeholders(drv_paths.len());
         let sql = format!(
-            "SELECT drv_path, source, outcome, when_ \
+            "SELECT drv_path, source, outcome, when_, blocker \
              FROM observation WHERE drv_path IN ({placeholders}) ORDER BY when_, id",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -165,15 +177,20 @@ impl Store {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         for row in rows {
-            let (drv_path, source, outcome, when) = row?;
+            let (drv_path, source, outcome, when, blocker) = row?;
             out.entry(drv_path.clone()).or_default().push(Observation {
                 drv_path,
                 source: source_from(&source)?,
                 outcome: outcome_from(&outcome)?,
                 when,
+                blocker: blocker
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.split('\n').map(str::to_string).collect())
+                    .unwrap_or_default(),
             });
         }
         Ok(out)
@@ -324,6 +341,7 @@ mod tests {
             source: Source::Local,
             outcome,
             when,
+            blocker: Vec::new(),
         };
         s.add_observation(&mk(Outcome::Failed, 100)).unwrap();
         s.add_observation(&mk(Outcome::Built, 200)).unwrap();
@@ -335,6 +353,20 @@ mod tests {
         assert_eq!(got[1].source, Source::Local);
         // a different drv is independent
         assert!(s.load_observations("/nix/store/y.drv").unwrap().is_empty());
+
+        // A dep-failed's culprit output paths round-trip through the blocker
+        // column (newline-joined); a non-dep-failed carries none.
+        let mut dep = mk(Outcome::DepFailed, 300);
+        dep.drv_path = "/nix/store/z.drv".into();
+        dep.blocker = vec!["/nix/store/o1".into(), "/nix/store/o2".into()];
+        s.add_observation(&dep).unwrap();
+        let got = s.load_observations("/nix/store/z.drv").unwrap();
+        assert_eq!(got[0].blocker, vec!["/nix/store/o1", "/nix/store/o2"]);
+        assert!(
+            s.load_observations("/nix/store/x.drv").unwrap()[0]
+                .blocker
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -349,6 +381,7 @@ mod tests {
             source,
             outcome,
             when,
+            blocker: Vec::new(),
         };
 
         // a: only local failures -> failing.

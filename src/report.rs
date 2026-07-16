@@ -278,6 +278,7 @@ mod tests {
             source,
             outcome,
             when: 0,
+            blocker: Vec::new(),
         }
     }
 

@@ -193,47 +193,67 @@ direct failure / dependency cascade).
 its own SQLite autocommit) the moment that drv's build activity stops, not after
 the batch: nix registers a successful build's outputs *before* emitting the
 activity's stop event, so output validity at stop time is the build's own
-result. This fires for **every** drv nix builds, not just the requested set — a
-transitive **dependency** that fails is recorded too (keyed on its own drvpath;
-a dependency *success* needs no row, since nix's store validity already
-remembers it). Interrupting the batch therefore keeps every fact observed so far
-— including the failures nix itself forgets — and a re-run only re-pays for the
-in-flight and never-started builds. Drvs with no build activity (blocked by a
-failed dep, or valid without a build) are attributed in a post-batch sweep.
+result — **ground truth, never an exit-status guess**. This fires for **every**
+drv nix builds, not just the requested set — a transitive **dependency** that
+fails is recorded too (keyed on its own drvpath; a dependency *success* needs no
+row, since nix's store validity already remembers it — and the propagation below
+re-checks exactly that validity). Interrupting the batch therefore keeps every
+fact observed so far — including the failures nix itself forgets — and a re-run
+only re-pays for the in-flight and never-started builds. Requested targets with
+no build activity (blocked by a failed dep, or already valid) are attributed in
+a post-batch step that records only what it can ground in the store: `Built`
+(outputs valid) or a `DepFailed` naming a *verified still-failing* culprit —
+never a bare failure inferred from nix's ambiguous exit code.
 
-**Forward-propagating failures.** Recording a dependency's failure is only
-half the recovery. The changed-set *target* that a failed dependency blocks
-never gets its own build activity, so it is attributed only in the post-batch
-sweep — which a ^C skips, leaving the target unrecorded and thus rebuilt next
-run, re-pulling (and re-failing) the very dependency the interrupt was meant to
-remember. So before building, the driver drops any target whose **build
-closure** (`nix-store --query --requisites` on its `.drv`) contains a drv the
-log knows to be failures-only (`Store::failing_drvs`, the set form of the
-policy's `local_failed_only`), recording the inferred `DepFailed` immediately.
-The dependency's own `Failed` fact — committed incrementally above, so it
-survives the ^C — is what this re-derives the block from: the *second* run skips
-the dependent without building, so the failing dependency is never re-attempted,
-even though the ^C tore through before the sweep could attribute anything.
-`--retry` (re-attempt failures) disables the propagation; the check itself is
-gated behind a non-empty failing set and a single union-closure query, so a run
-with nothing failing pays nothing.
+**Forward-propagating failures, and self-healing them.** Recording a
+dependency's failure is only half the recovery. The changed-set *target* a
+failed dependency blocks never gets its own build activity, so before building,
+the driver drops any target whose **build closure** (`nix-store --query
+--requisites` on its `.drv`) contains a still-failing dependency, recording a
+`DepFailed` immediately (committed, so a ^C keeps it and the next run skips the
+dependent without re-pulling the failing dependency). Two properties make this
+both sound and *self-correcting*:
 
-**Soundness caveats (known, accepted).** `Built` facts come from output
-validity — ground truth. `Failed`/`DepFailed` facts from the post-batch sweep
-are *inferences* premised on nix having finished the batch under
-`--keep-going`, so the sweep skips them when nix died by a signal (exit code
-absent — OOM kill, daemon restart). Residual gap: a batch that *aborts* with a
-normal error exit (e.g. the daemon connection drops mid-run) is
-indistinguishable by exit status from one that completed with failures, and
-can then mis-attribute never-started drvs as `DepFailed`; `--retry` re-attempts
-any recorded failure, so the damage is bounded and user-repairable. The
-forward-propagated `DepFailed` above is the same kind of inference — it presumes
-the recorded dependency failure would recur, which a flaky or since-fixed
-dependency wouldn't; `--retry` is again the escape hatch, and the check already
-excludes any dependency that has since built or become substitutable. Also in
-this class: a `Cache` fact records substitutability *at probe time* — the
-remote cache deleting a path later doesn't invalidate the fact (by design,
-§3), it just means nix substitutes from source instead.
+- **Verified, not assumed.** `Store::failing_drvs` (drvs with a local failure
+  and no success *in the log*) is only a **candidate** set; each candidate
+  reachable from a target's closure is re-checked against the store
+  (`verify_failing`: are its outputs actually still invalid?) before it may
+  block anything. A dependency that has since built or been substituted — a
+  flaky failure, a since-fixed one — drops out, and never blocks a dependent on
+  stale news. (A target's own drv is excluded from its culprit search:
+  `--requisites` lists a drv among its own inputs, and a re-opened target still
+  carries its old failure, so without this a target would block *itself*.)
+- **Self-healing via the culprit `blocker`.** A recorded `DepFailed` stores the
+  culprit dependency's output paths (`Observation::blocker`). A later run
+  re-checks those paths' validity **offline** — one `nix-store
+  --check-validity`, no `.drv`, no closure walk, so a fully-cached run stays
+  instant (§6) — and the moment the culprit is valid, the block is *stale*: the
+  dependent is re-attempted with **no `--retry` needed**, and its success (or a
+  fresh block on whatever is still broken) supersedes the stale row. This is the
+  dependency-side of `flaky_success_wins`: a later success outranks an earlier
+  failure, read from the store rather than from a recorded `Built`.
+
+A **direct** failure (a drv's own build failed) stays sticky by contrast —
+presumed to recur, `--retry` to re-attempt — because it *is* a fact about that
+drv, not a second-order inference about a dependency. `--retry` disables
+propagation entirely; the check is gated behind a non-empty failing set and a
+union-closure query, so a run with nothing failing pays nothing.
+
+**Soundness caveats (known, accepted).** Every recorded fact is now grounded in
+store validity: `Built` from valid outputs, `Failed` from a drv's own stop event
+with invalid outputs, `DepFailed` only when a culprit dependency is *verified*
+still-invalid. Nothing is inferred from nix's exit status, so the old gap — a
+batch aborting with a normal error code mis-attributing never-started drvs as
+`DepFailed` — is closed: a target nix simply never reached, with nothing
+verifiably failing in its closure, is left unrecorded and re-attempted next run.
+What remains, deliberately: a `Failed`/`DepFailed` row is only re-examined
+against the store *lazily*, when the policy is about to act on it (skip a build,
+propagate a block), so a since-healed failure lingers in the log until then —
+harmlessly, since it is overridden at use (a direct failure by `--retry` or a
+later `Built`; a dependency block automatically, via the `blocker` re-check).
+And a `Cache` fact records substitutability *at probe time* — the remote cache
+deleting a path later doesn't invalidate the fact (by design, §3), it just means
+nix substitutes from source instead.
 
 ## 6. Evaluation, its cache key, and the diff
 
