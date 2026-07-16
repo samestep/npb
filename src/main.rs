@@ -61,7 +61,7 @@ struct Cli {
     #[arg(long)]
     no_merge: bool,
     /// Systems to report on (repeatable); defaults to the host system.
-    #[arg(long)]
+    #[arg(short, long)]
     system: Vec<String>,
     /// Don't build; render only from facts already in the log (may show `❓`).
     #[arg(long)]
