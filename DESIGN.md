@@ -377,7 +377,7 @@ drv but is still a review event and gets a row. (An earlier design also
 sketched a *three-way* diff against the merge base, classifying each changed
 attr as changed-by-this-side / by-the-other / by-both; it turned out not to
 matter in practice and was dropped. The merge base survives only as the
-*default base* of a report.)
+`--no-merge` base of a report.)
 
 **Eval does not instantiate; the changed set is materialized before building.**
 `nix-eval-jobs` runs with `--no-instantiate`: npd needs only the `drvPath` and
@@ -410,38 +410,56 @@ would read. On a RAM-constrained machine
 the lean `--no-instantiate` workers are also what let npd parallelize at all —
 instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
 
-**Choosing `base` and `head`.** Three ways, in `resolve_base_head`/`resolve_pr`
-(`src/main.rs`):
+**Choosing `base` and `head`.** Every input mode resolves to one shape: a
+*base-branch tip* and a *head* to review against it (`resolve_local`/`resolve_pr`
+in `src/main.rs`), onto which a single merge rule (`apply_merge`) then applies.
+The pair comes from one of three modes:
 
-- *Explicit* — `npd <base> <head>` resolves each revision (ref, sha, tag,
-  `HEAD~1`, …) with `git rev-parse`.
-- *Default* — no arguments: `head = HEAD`, `base = git merge-base master HEAD`,
-  the fork point of the current branch. Cheap and offline, but it has two known
-  gaps — a change branched off a *non-`master`* base (`staging`,
-  `haskell-updates`, a release branch) is compared against the wrong branch, and
-  the base is frozen at the fork point, so drift on the base since then is
-  invisible. When the working tree has uncommitted edits to tracked files, `head`
-  becomes the working tree itself (a synthetic tree-keyed revision, §6) so
-  in-progress work is reviewable; `base` is unaffected (merge-base still lands on
-  the same fork point). An explicit `head` opts out.
-- *PR* — `npd --pr N` closes both gaps by deferring to GitHub's own test-merge
-  commit. GitHub publishes, on the **base repo** (so cross-fork PRs need no fork
-  URL), `refs/pull/N/head` (the PR tip) and — when the PR merges cleanly —
-  `refs/pull/N/merge`, a merge commit whose **first parent is the base-branch
-  tip** and second parent is the PR head. So `base = merge^1`, `head = merge`
-  is exactly the PR's patch applied on the *current* base branch, whatever that
-  branch is — the same delta ofborg/Hydra and `nixpkgs-review pr` evaluate. This
-  needs **no GitHub API and no token**: the refs come over anonymous git, unlike
+- *Default* — no arguments: base-branch tip = `master`, head = `HEAD`. When the
+  working tree has uncommitted edits to tracked files, `head` becomes the working
+  tree itself (a synthetic tree-keyed revision, §6) so in-progress work is
+  reviewable. An explicit `--head` opts out.
+- *Explicit* — `--base <rev>` / `--head <rev>` override either end with any
+  revision (ref, sha, tag, `HEAD~1`, …), resolved with `git rev-parse`.
+- *PR* — `npd --pr N` is shorthand for a `(base, head)` pair drawn from GitHub's
+  published refs. GitHub publishes, on the **base repo** (so cross-fork PRs need
+  no fork URL), `refs/pull/N/head` (the PR tip) and — when the PR merges cleanly
+  — `refs/pull/N/merge`, a merge commit whose **first parent is the base-branch
+  tip** and second parent is the PR head. So `--pr` sets base-branch tip =
+  `merge^1` (the PR's *actual* target branch — `staging`, `haskell-updates`, a
+  release branch — whatever it is) and head = `merge^2` (the PR tip). This needs
+  **no GitHub API and no token**: the refs come over anonymous git, unlike
   `nixpkgs-review`, which calls the REST API to learn the merge sha (and nags for
   `GITHUB_TOKEN`/`gh`). The refs are fetched into the local clone once and then
-  resolved with a `rev-parse` (~0 ms), so a repeat run touches no network — which
-  also *removes* the `git merge-base` walk (~0.2 s on a ~1M-commit nixpkgs) that
-  otherwise dominates a fully-cached run. `--refetch` re-fetches to pick up a
-  rebased PR or a moved base; a conflicted PR has no `merge` ref, and rather than
-  guess a base we fail with a message pointing at `--fork-point` (PR head vs its
-  merge-base with `master`, the *Default* shape). A bonus of `base = merge^1`:
-  every PR reviewed in the same window shares one base commit, so their base
-  evals are reused — where per-PR fork points never are.
+  resolved with a `rev-parse` (~0 ms), so a repeat run touches no network.
+  `--refetch` re-fetches to pick up a rebased PR or a moved base.
+
+**The merge rule (`apply_merge`), and `--no-merge`.** Given the `(base-branch
+tip, head)` pair, npd reports one of two deltas:
+
+- *Merge (default)* — a **synthetic merge** of the head onto the base (base as
+  first parent), reported as `base → merge`. This reflects the head applied on
+  the *current* base — base drift included — exactly what a merge would produce,
+  the same shape ofborg/Hydra and `nixpkgs-review pr` evaluate. For a mergeable
+  PR the merge is already computed: `merge(merge^1, merge^2)` **is**
+  `refs/pull/N/merge`, so npd reuses GitHub's commit verbatim (no local merge,
+  byte-identical to what CI built). Otherwise (default/explicit) npd mints it
+  locally with `git merge-tree --write-tree` + `commit-tree` — a deterministic,
+  content-addressed commit (pinned identity + epoch dates, pinned under
+  `refs/npd/merge` against `git gc`), exactly like the working-tree capture
+  (§6). When the head already descends from the base the merge is a
+  fast-forward, so its tree equals the head's and this collapses to a plain
+  `base → head` at no extra eval; a distinct merged tree appears only under
+  genuine base drift — precisely when you want to see it. A bonus: every review
+  against the same base-branch tip shares its base eval (per-PR fork points never
+  did). A conflicted PR (no `merge` ref) or a conflicting local merge can't take
+  this path, so it fails with a message pointing at `--no-merge`.
+- *`--no-merge`* — the older, cheaper shape: `merge-base(base, head) → head`,
+  the fork point. Offline and instant (no merge to build), but blind to base
+  drift since the fork point, and — in the default mode — it assumes `master`
+  even for a change branched off a non-`master` base. For a PR it lands on the
+  fork point with the PR's real target branch (`merge-base(merge^1, head)`), or,
+  if the PR is conflicted (no `merge` ref), the fork point with `master`.
 
 **`--tests` — the changed set's `passthru.tests`.** Ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397): for each
@@ -543,11 +561,12 @@ better). Attrs that share a derivation
 are collapsed onto one line (`a = b = c`, shortest attr first), like
 `nixpkgs-review`'s aliases — npd gets this for free from its drvpath keying.
 
-An `npd` run is not merely read-only: with defaults (`head` = `HEAD`, `base` =
-merge-base with `master`; or the PR-derived pair under `--pr`, §6) it first
-**builds both sides of the changed set** (skipping anything already known or
-substitutable), so a fresh report has a real state for every row rather than a
-wall of `❓`. `--no-build` opts back into pure read-only rendering.
+An `npd` run is not merely read-only: with defaults (`head` = `HEAD` merged onto
+the `master` tip; or the PR merged onto its base branch under `--pr`; or the
+merge-base under `--no-merge` — §6) it first **builds both sides of the changed
+set** (skipping anything already known or substitutable), so a fresh report has
+a real state for every row rather than a wall of `❓`. `--no-build` opts back
+into pure read-only rendering.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
@@ -555,8 +574,9 @@ The spine is implemented (✓).
 
 1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`), evals run
    in parallel with an OOM-recovery ladder (§6).
-2. ✓ the two-way diff (base/head chosen explicitly, from the merge-base with
-   `master`, or from a PR's GitHub test-merge commit under `--pr`; §6).
+2. ✓ the two-way diff: a base-branch tip vs the head merged onto it (a synthetic
+   merge — GitHub's test-merge commit under `--pr`, else minted locally), or the
+   merge-base under `--no-merge` (§6).
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,
    `DepFailed`/cascade detection.

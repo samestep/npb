@@ -31,26 +31,32 @@ use crate::model::{BuildPolicy, Rev};
     about = "A persistent fact store for iterating on nixpkgs changes"
 )]
 struct Cli {
-    /// Base revision (default: merge-base of head and `master`).
-    #[arg(conflicts_with = "pr")]
+    /// Base-branch tip to review the head against (default: `master`). The
+    /// report compares this against the head merged onto it (see `--no-merge`).
+    #[arg(long, conflicts_with = "pr")]
     base: Option<String>,
-    /// Head revision (default: `HEAD`).
-    #[arg(conflicts_with = "pr")]
+    /// Head revision to review (default: `HEAD`, or the uncommitted working
+    /// tree if it has changes).
+    #[arg(long, conflicts_with = "pr")]
     head: Option<String>,
-    /// Review NixOS/nixpkgs PR #N: compare its base branch against the PR
-    /// merged into that branch (GitHub's test-merge commit) — the same delta
-    /// ofborg/Hydra and nixpkgs-review evaluate. The PR's refs are fetched
-    /// into the local clone once, so a repeat run resolves them offline.
+    /// Review NixOS/nixpkgs PR #N: shorthand for `--head` = the PR's head,
+    /// `--base` = its base-branch tip (GitHub's test-merge commit's first
+    /// parent) — the same delta ofborg/Hydra and nixpkgs-review evaluate. The
+    /// PR's refs are fetched into the local clone once, so a repeat run
+    /// resolves them offline.
     #[arg(long, value_name = "N")]
     pr: Option<u64>,
     /// With --pr: re-fetch the PR's refs even if already cached locally (to
     /// pick up a rebased PR or a base branch that has moved since last run).
     #[arg(long, requires = "pr")]
     refetch: bool,
-    /// With --pr on a non-mergeable PR (no test-merge commit): compare the PR
-    /// head against its fork point with `master` instead.
-    #[arg(long, requires = "pr")]
-    fork_point: bool,
+    /// Diff from the merge-base of base and head, instead of the default —
+    /// building a synthetic merge of the head onto the base and diffing the
+    /// base against that. The merge-base shape ignores drift on the base since
+    /// the fork point; the merge shape reflects the head applied on the current
+    /// base (what a merge would actually produce), like a PR's test-merge.
+    #[arg(long)]
+    no_merge: bool,
     /// nixpkgs clone to resolve the commits in (default: current directory).
     #[arg(long)]
     nixpkgs: Option<PathBuf>,
@@ -193,38 +199,58 @@ fn ensure_pr_ref(
     fetch_ref(repo, upstream, ref_name)
 }
 
-/// Resolve `(base, head)` for a PR review. GitHub publishes `refs/pull/N/head`
-/// (the PR tip) and, when the PR merges cleanly, `refs/pull/N/merge` — a
-/// test-merge commit whose first parent is the base-branch tip and whose second
-/// parent is the PR head. So `merge^1 → merge` is exactly the PR's patch applied
-/// on the *current* base branch (whatever branch that is), which sidesteps both
-/// merge-base downsides at once: the correct base branch, up to date. A repeat
-/// run reuses the cached refs and touches no network (a rev-parse, not the
-/// ~0.2 s merge-base walk).
+/// Resolve the report's `(base, head)` for a PR review. GitHub publishes
+/// `refs/pull/N/head` (the PR tip) and, when the PR merges cleanly,
+/// `refs/pull/N/merge` — a test-merge commit whose first parent is the
+/// base-branch tip and whose second parent is the PR head. So `--pr` is just
+/// shorthand for a `(base, head)` pair — base = the base-branch tip
+/// (`merge^1`), head = the PR tip (`merge^2`) — onto which the shared
+/// merge/`--no-merge` rule (see [`apply_merge`]) then applies, exactly as for a
+/// local review. A repeat run reuses the cached refs and touches no network (a
+/// rev-parse, not the ~0.2 s merge-base walk).
 ///
-/// `--fork-point` opts back into the old shape (PR head vs its merge-base with
-/// `master`) for the one case the merge commit can't cover: a PR that doesn't
-/// merge cleanly, so GitHub publishes no `merge` ref.
+/// The default (merge) shape reuses GitHub's `merge` commit verbatim — it *is*
+/// the head merged onto the base — so there's no local merge, and the diff is
+/// exactly what ofborg/Hydra evaluate. `--no-merge` diffs from the merge-base of
+/// `merge^1` and the PR head (the PR's fork point on its real base branch). A
+/// conflicted PR has no `merge` ref: the merge shape then fails with a message
+/// pointing at `--no-merge`, and `--no-merge` falls back to the fork point with
+/// `master` (the only base we can name without the merge commit).
 fn resolve_pr(
     repo: &std::path::Path,
     upstream: &str,
     pr: u64,
     refetch: bool,
-    fork_point: bool,
+    no_merge: bool,
 ) -> Result<(Rev, Rev)> {
     let head_ref = format!("refs/pull/{pr}/head");
-    if fork_point {
-        if !ensure_pr_ref(repo, upstream, &head_ref, refetch)? {
-            bail!("PR #{pr} not found on {upstream}");
-        }
-        let head = resolve_commit(repo, &head_ref)?;
-        let base = git_merge_base(repo, "master", &head)
-            .context("computing the PR's fork point with master")?;
-        return Ok((commit_source(repo, base)?, commit_source(repo, head)?));
+    let merge_ref = format!("refs/pull/{pr}/merge");
+    let have_merge = ensure_pr_ref(repo, upstream, &merge_ref, refetch)?;
+
+    if no_merge {
+        // Fork-point shape: merge-base(base-branch tip, PR head) → PR head. With
+        // the merge commit we know the real base-branch tip (`merge^1`) and the
+        // PR head (`merge^2`); without it (a conflicted PR) we fall back to the
+        // PR head ref and `master`.
+        let (base_tip, head) = if have_merge {
+            (
+                resolve_commit(repo, &format!("{merge_ref}^1"))?,
+                resolve_commit(repo, &format!("{merge_ref}^2"))?,
+            )
+        } else {
+            if !ensure_pr_ref(repo, upstream, &head_ref, refetch)? {
+                bail!("PR #{pr} not found on {upstream}");
+            }
+            (
+                resolve_commit(repo, "master")?,
+                resolve_commit(repo, &head_ref)?,
+            )
+        };
+        let mb = git_merge_base(repo, &base_tip, &head).context("computing the PR's fork point")?;
+        return Ok((commit_source(repo, mb)?, commit_source(repo, head)?));
     }
 
-    let merge_ref = format!("refs/pull/{pr}/merge");
-    if !ensure_pr_ref(repo, upstream, &merge_ref, refetch)? {
+    if !have_merge {
         // No test-merge commit. Distinguish a conflicted PR from a missing one
         // by whether the (always-published) head ref exists.
         let exists = have_commit(repo, &head_ref) || fetch_ref(repo, upstream, &head_ref)?;
@@ -232,15 +258,26 @@ fn resolve_pr(
             bail!(
                 "PR #{pr} is not mergeable (it conflicts with its base branch), \
                  so GitHub publishes no test-merge commit.\n\
-                 Re-run with `--pr {pr} --fork-point` to compare the PR head \
+                 Re-run with `--pr {pr} --no-merge` to compare the PR head \
                  against its fork point with master instead."
             );
         }
         bail!("PR #{pr} not found on {upstream}");
     }
-    let head = resolve_commit(repo, &merge_ref)?;
+    // Merge shape: reuse GitHub's test-merge commit. base = `merge^1` (the real
+    // base-branch tip), head = the merge itself; its label is the PR tip
+    // (`merge^2`), the commit a human reviews.
+    let merge = resolve_commit(repo, &merge_ref)?;
     let base = resolve_commit(repo, &format!("{merge_ref}^1"))?;
-    Ok((commit_source(repo, base)?, commit_source(repo, head)?))
+    let head_tip = resolve_commit(repo, &format!("{merge_ref}^2"))?;
+    Ok((
+        commit_source(repo, base)?,
+        Rev {
+            tree: tree_of(repo, &merge)?,
+            commit: merge,
+            label: head_tip,
+        },
+    ))
 }
 
 /// `git -C repo ARGS` with extra environment set — the spawn behind the
@@ -368,33 +405,110 @@ fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-/// Resolve report revisions with ergonomic defaults: head defaults to `HEAD`
-/// (or the uncommitted working tree, if dirty — see [`head_source`]), base to
-/// the merge-base of head and `master` (the fork point of this branch). An
-/// explicit head is always taken literally — the working tree is only ever used
-/// on the default path.
-fn resolve_base_head(
+/// Resolve the report's `(base, head)` for a local review, with ergonomic
+/// defaults: the base-branch tip defaults to `master`, the head to `HEAD` (or
+/// the uncommitted working tree, if dirty — see [`head_source`]). An explicit
+/// head is always taken literally — the working tree is only ever used on the
+/// default path. The shared merge/`--no-merge` rule ([`apply_merge`]) then
+/// derives the final pair.
+fn resolve_local(
     repo: &std::path::Path,
     base: Option<String>,
     head: Option<String>,
+    no_merge: bool,
 ) -> Result<(Rev, Rev)> {
     let head = match head {
         Some(h) => commit_source(repo, resolve_commit(repo, &h)?)?,
         None => head_source(repo)?,
     };
-    let base = match base {
+    let base_tip = match base {
         Some(b) => commit_source(repo, resolve_commit(repo, &b)?)?,
-        // merge-base against head's commit: for the working tree that's the
-        // synthetic commit whose parent is HEAD, so this still finds HEAD's fork
-        // point with `master`.
-        None => {
-            let mb = git_merge_base(repo, "master", &head.commit).context(
-                "no base given and could not merge-base with `master`; pass one explicitly",
-            )?;
-            commit_source(repo, mb)?
-        }
+        None => commit_source(repo, resolve_commit(repo, "master")?)
+            .context("no base given and no `master` branch to default to; pass --base")?,
     };
-    Ok((base, head))
+    apply_merge(repo, base_tip, head, no_merge)
+}
+
+/// Turn a `(base-branch tip, head)` pair into the report's `(base, head)`.
+///
+/// Default (merge) shape: build a synthetic merge of `head` onto `base` (base
+/// as first parent) and report `base → merge`, so the report reflects the head
+/// applied on the *current* base — base drift included — exactly what a merge
+/// would produce (the same shape a PR's test-merge gives). When the head
+/// already descends from the base the merge is a fast-forward, so its tree
+/// equals the head's and this collapses to a plain `base → head` at no extra
+/// cost; a distinct merged tree (and eval) appears only when the base has
+/// genuinely drifted.
+///
+/// `--no-merge` shape: report `merge-base(base, head) → head`, the fork point —
+/// cheap and offline, but blind to base drift since then.
+fn apply_merge(
+    repo: &std::path::Path,
+    base_tip: Rev,
+    head: Rev,
+    no_merge: bool,
+) -> Result<(Rev, Rev)> {
+    if no_merge {
+        let mb = git_merge_base(repo, &base_tip.commit, &head.commit)
+            .context("could not merge-base base and head; pass --base explicitly")?;
+        return Ok((commit_source(repo, mb)?, head));
+    }
+    let merge = merge_source(repo, &base_tip, &head)?;
+    Ok((base_tip, merge))
+}
+
+/// Mint a deterministic synthetic merge of `head` onto `base` (base as first
+/// parent), mirroring [`worktree_source`]: `git merge-tree` produces the merged
+/// tree without touching the working tree, and over it we `commit-tree` with a
+/// pinned identity + epoch dates so the commit sha is a pure function of
+/// `(tree, base, head)` (a repeat run is a cache hit). The commit is pinned
+/// under `refs/npd/merge` so `git gc` can't drop it before the eval fetches it.
+/// The merge Rev's label is the head's — the report shows `base → the head`,
+/// the change under review, with the merge itself implicit. A merge conflict is
+/// a hard error pointing at `--no-merge` (a conflicted tree would only miseval).
+fn merge_source(repo: &std::path::Path, base: &Rev, head: &Rev) -> Result<Rev> {
+    let out = git_output(
+        repo,
+        &["merge-tree", "--write-tree", &base.commit, &head.commit],
+    )?;
+    if !out.status.success() {
+        bail!(
+            "cannot merge {} onto {}: they conflict.\n\
+             Re-run with --no-merge to diff from their merge-base instead.",
+            &head.label,
+            &base.label,
+        );
+    }
+    let tree = String::from_utf8(out.stdout)?.trim().to_string();
+    const EPOCH: &str = "1970-01-01T00:00:00Z";
+    let ident = [
+        ("GIT_AUTHOR_NAME", "npd"),
+        ("GIT_AUTHOR_EMAIL", "npd@localhost"),
+        ("GIT_AUTHOR_DATE", EPOCH),
+        ("GIT_COMMITTER_NAME", "npd"),
+        ("GIT_COMMITTER_EMAIL", "npd@localhost"),
+        ("GIT_COMMITTER_DATE", EPOCH),
+    ];
+    let commit = git_env(
+        repo,
+        &ident,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base.commit,
+            "-p",
+            &head.commit,
+            "-m",
+            "npd: synthetic merge",
+        ],
+    )?;
+    git(repo, &["update-ref", "refs/npd/merge", &commit])?;
+    Ok(Rev {
+        tree,
+        commit,
+        label: head.label.clone(),
+    })
 }
 
 /// Flatten the per-system changed sets into build targets: every side's drv,
@@ -450,8 +564,8 @@ fn run(cli: Cli) -> Result<()> {
     let opts = cli.eval;
     let repo = resolve_repo(cli.nixpkgs)?;
     let (base, head) = match cli.pr {
-        Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.refetch, cli.fork_point)?,
-        None => resolve_base_head(&repo, cli.base, cli.head)?,
+        Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.refetch, cli.no_merge)?,
+        None => resolve_local(&repo, cli.base, cli.head, cli.no_merge)?,
     };
     let systems = resolve_systems(cli.system);
 
@@ -723,10 +837,17 @@ mod tests {
                 .success()
         );
         let upstream = up.path().to_str().unwrap();
-        // Fetches the merge ref; base = merge^1 (master tip B), head = merge (M).
+        // Merge shape (default): reuse GitHub's merge. base = merge^1 (master
+        // tip B), head = merge (M), whose label is the PR tip merge^2 (C).
         let (base, head) = resolve_pr(local.path(), upstream, 1, false, false).unwrap();
         assert_eq!(base.commit, s["b"]);
         assert_eq!(head.commit, s["m"]);
+        assert_eq!(head.label, s["c"]);
+        // --no-merge shape: fork point on the PR's real base branch —
+        // merge-base(merge^1 = B, PR tip = C) = A, and head = the PR tip C.
+        let (nb, nh) = resolve_pr(local.path(), upstream, 1, false, true).unwrap();
+        assert_eq!(nb.commit, s["a"]);
+        assert_eq!(nh.commit, s["c"]);
         // Second call is offline (ref now cached) and resolves identically.
         let (base2, head2) = resolve_pr(local.path(), "file:///does/not/exist", 1, false, false)
             .expect("cached ref should resolve without touching upstream");
@@ -737,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pr_non_mergeable_errors_and_suggests_fork_point() {
+    fn resolve_pr_non_mergeable_errors_and_suggests_no_merge() {
         let (up, s) = pr_fixture();
         let local = tempfile::tempdir().unwrap();
         Proc::new("git")
@@ -747,15 +868,90 @@ mod tests {
             .status()
             .unwrap();
         let upstream = up.path().to_str().unwrap();
-        // No merge ref → a clear error pointing at --fork-point.
+        // No merge ref → the merge shape can't apply; a clear error → --no-merge.
         let err = resolve_pr(local.path(), upstream, 2, false, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not mergeable"), "{msg}");
-        assert!(msg.contains("--fork-point"), "{msg}");
-        // --fork-point: head = PR head (D), base = merge-base(master, D) = A.
+        assert!(msg.contains("--no-merge"), "{msg}");
+        // --no-merge falls back to the fork point with master: head = PR head
+        // (D), base = merge-base(master = B, D) = A.
         let (base, head) = resolve_pr(local.path(), upstream, 2, false, true).unwrap();
         assert_eq!(head.commit, s["d"]);
         assert_eq!(base.commit, s["a"]);
+    }
+
+    #[test]
+    fn merge_source_fast_forwards_when_head_descends_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("base.txt"), "base\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "A"]);
+        let a = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        // A feature commit descending from A.
+        std::fs::write(d.join("feat.txt"), "feat\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "F"]);
+        let f = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+
+        // F already descends A, so the merge fast-forwards: its tree equals F's
+        // (base → merge collapses to A → F, no extra eval). Deterministic sha,
+        // pinned for GC-safety, and labelled with the head under review.
+        let m = merge_source(d, &a, &f).unwrap();
+        let m2 = merge_source(d, &a, &f).unwrap();
+        assert_eq!(m.tree, f.tree);
+        assert_eq!(m.commit, m2.commit);
+        assert_eq!(m.label, f.label);
+        assert_eq!(resolve_commit(d, "refs/npd/merge").unwrap(), m.commit);
+    }
+
+    #[test]
+    fn merge_source_diverges_on_base_drift_and_errors_on_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("shared.txt"), "base\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "A"]);
+        let a = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+
+        // Head: add a new file (no overlap with the base's drift).
+        g(d, &["checkout", "-b", "head", &a.commit]);
+        std::fs::write(d.join("head.txt"), "head\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "H"]);
+        let head = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+
+        // Base drifts on a *different* file: a real 3-way merge, whose tree
+        // carries both changes and so differs from either side.
+        g(d, &["checkout", "-b", "drift", &a.commit]);
+        std::fs::write(d.join("drift.txt"), "drift\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "B"]);
+        let base = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let m = merge_source(d, &base, &head).unwrap();
+        assert_ne!(m.tree, base.tree);
+        assert_ne!(m.tree, head.tree);
+
+        // A base that edits the *same* file the head does conflicts → hard error
+        // pointing at --no-merge (a conflicted tree would only miseval).
+        g(d, &["checkout", "-b", "clash", &a.commit]);
+        std::fs::write(d.join("shared.txt"), "clash\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "C"]);
+        let clash = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        // Head must also touch shared.txt to actually conflict.
+        g(d, &["checkout", "head"]);
+        std::fs::write(d.join("shared.txt"), "head\n").unwrap();
+        g(d, &["commit", "-am", "H2"]);
+        let head2 = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let err = merge_source(d, &clash, &head2).unwrap_err();
+        assert!(format!("{err}").contains("--no-merge"), "{err}");
     }
 
     #[test]

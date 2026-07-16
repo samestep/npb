@@ -33,10 +33,16 @@ single command: evaluate a `base → head` change, build whatever the changed se
 needs, and render the report — **instant when the result is already known**.
 
 ```
-npd [BASE] [HEAD]
+npd [--base <rev>] [--head <rev>]
+npd --pr <N>
 ```
 
-With no arguments, `head` = `HEAD` and `base` = merge-base of `HEAD` and `master`.
+With no arguments, `head` = `HEAD` and the base is the `master` tip; the report
+compares that base against the head **merged onto it** (a synthetic merge — the
+same shape a PR's test-merge gives), so base drift is visible. `--pr <N>` is
+shorthand for the PR's head merged onto its base branch (reusing GitHub's
+test-merge commit; no API/token). `--no-merge` opts back into the older
+`merge-base → head` fork-point diff (offline, but blind to base drift).
 It **builds whatever the states need** first (both sides of the changed set,
 skipping anything already known, substitutable, or marked
 broken/unsupported/insecure — the latter reported as 🚧, like nixpkgs-review),
