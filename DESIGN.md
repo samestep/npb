@@ -313,8 +313,10 @@ cherry-pick landing identical content, and — the payoff — committing an as-i
 working tree all become cache *hits*. npd resolves each requested revision to a
 `Rev { tree, commit, label }` (`src/model.rs`): `tree` is the eval/`--tests`
 cache key, `commit` is what `fetchGit` fetches (a commit is still needed — there
-is no fetch-a-bare-tree), and `label` is the human display (a sha, or
-`worktree`). The soundness rests on npd never forwarding `rev`/`lastModified`
+is no fetch-a-bare-tree), and `label` identifies the side (a sha, or `worktree`
+for a synthetic working-tree/patch head — the report heading shows the latter as
+its anchor commit + `\*`, §8). The soundness rests on npd never forwarding
+`rev`/`lastModified`
 into the eval; if it ever did (to stamp `lib.version`/`config.revision`,
 flake-style), the eval would regain a commit dependency and tree-keying would
 serve a stale eval — so `build_expr` (`src/eval.rs`) deliberately interpolates

@@ -25,8 +25,10 @@
 /// [`commit`] is a commit that realizes that tree, for `builtins.fetchGit`
 /// (which fetches by commit, not by a bare tree). For a committed state it is
 /// the real commit; for the uncommitted working tree it is a synthetic,
-/// content-addressed commit minted over the tree. [`label`] is how the side is
-/// shown to a human: the commit sha for a real revision, or `worktree`.
+/// content-addressed commit minted over the tree. [`label`] identifies the
+/// side: the commit sha for a real revision, or `worktree` for a synthetic
+/// working-tree/patch head — the report renders the latter as its anchor commit
+/// with a trailing `\*` ("this commit, plus a diff"), not the bare word.
 ///
 /// [`tree`]: Rev::tree
 /// [`commit`]: Rev::commit
@@ -37,7 +39,8 @@ pub struct Rev {
     pub tree: String,
     /// A commit realizing `tree`, used as `builtins.fetchGit`'s `rev`.
     pub commit: String,
-    /// Human-facing label (a commit sha, or `worktree`).
+    /// Identity label: a commit sha, or `worktree` for a synthetic
+    /// working-tree/patch head (rendered as its anchor commit + `\*`).
     pub label: String,
 }
 

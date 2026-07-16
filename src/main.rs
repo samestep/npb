@@ -339,10 +339,7 @@ fn commit_source(repo: &std::path::Path, commit: String) -> Result<Rev> {
 fn head_source(repo: &std::path::Path) -> Result<Rev> {
     let head = resolve_commit(repo, "HEAD")?;
     match worktree_source(repo, &head)? {
-        Some(rev) => {
-            eprintln!("head: uncommitted working tree (tree {})", &rev.tree[..12]);
-            Ok(rev)
-        }
+        Some(rev) => Ok(rev),
         None => commit_source(repo, head),
     }
 }
@@ -884,23 +881,32 @@ fn run(cli: Cli) -> Result<()> {
         }
         per_system.push((sys.clone(), entries));
     }
-    // How the reproduction command recovers this head elsewhere (DESIGN §8).
-    let head_repro = if cli.pr.is_some() {
+    // The head's heading label, and how the reproduction command recovers it
+    // elsewhere (DESIGN §8). A head built by applying a diff on top of a commit
+    // (a working tree, or `--patch`) is shown as that anchor commit with a
+    // trailing `\*` — "this commit, plus a diff" — rather than a bare sha that
+    // would read as a plain review of it; a real commit (committed head, or a
+    // PR's tip) is shown as-is.
+    let (head_display, head_repro) = if cli.pr.is_some() {
         // A PR: rebuild the head from GitHub's fork-point compare diff — durable
         // past the force-pushes PRs rebase through. npd re-mints the merge from
         // `--base merge^1` and the rebuilt head, so base drift is still shown.
         let fork = git_merge_base(&repo, &base.commit, &head.label)
             .context("computing the PR's fork point for the reproduction command")?;
-        HeadRepro::Compare {
-            expr: format!("{fork}...{}", head.label),
-            anchor: fork,
-        }
+        (
+            head.label.clone(),
+            HeadRepro::Compare {
+                expr: format!("{fork}...{}", head.label),
+                anchor: fork,
+            },
+        )
     } else if let Some(value) = &cli.patch {
         // Reproducing a --patch run: echo a compare expression, or re-embed a
         // local diff (whose file won't exist elsewhere). Applied onto the same
         // anchor (`--head`, else HEAD).
         let anchor = resolve_commit(&repo, cli.head.as_deref().unwrap_or("HEAD"))?;
-        if value.contains('/') {
+        let display = format!("{anchor}\\*");
+        let repro = if value.contains('/') {
             HeadRepro::Embed {
                 anchor,
                 diff: patch_diff.unwrap_or_default(),
@@ -910,14 +916,16 @@ fn run(cli: Cli) -> Result<()> {
                 anchor,
                 expr: value.clone(),
             }
-        }
+        };
+        (display, repro)
     } else if head.label == "worktree" {
-        // A live uncommitted working tree: embed its captured diff.
+        // A live uncommitted working tree: embed its captured diff, shown as
+        // HEAD with the `\*` diff marker.
         let anchor = resolve_commit(&repo, "HEAD")?;
         let diff = git_diff_binary(&repo, &anchor, "refs/npd/worktree")?;
-        HeadRepro::Embed { anchor, diff }
+        (format!("{anchor}\\*"), HeadRepro::Embed { anchor, diff })
     } else {
-        HeadRepro::Commit(head.label.clone())
+        (head.label.clone(), HeadRepro::Commit(head.label.clone()))
     };
     let command = repro_command(
         &base.commit,
@@ -929,7 +937,7 @@ fn run(cli: Cli) -> Result<()> {
     );
     print!(
         "{}",
-        report::render(&base.label, &head.label, &command, &per_system)
+        report::render(&base.label, &head_display, &command, &per_system)
     );
     Ok(())
 }
