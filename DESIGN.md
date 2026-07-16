@@ -108,7 +108,7 @@ again, Nix rebuilds or substitutes it.
 
 The two fact kinds have opposite access patterns, so they get different backends.
 
-**Evals → one flat file per `(tree, system)`** under `evals/`, sorted
+**Evals → one flat file per `(tree, system)`** under `<system>/`, sorted
 `attr\tdrv` lines (empty drv = no derivation; a third field `b` marks the few
 attrs whose meta says broken/unsupported/insecure; `src/eval.rs`). The drv is stored
 stripped of its constant `/nix/store/…​.drv` prefix/suffix, and the whole file is
@@ -148,7 +148,7 @@ commit, and full drv paths are stored as-is like the observation log.
 ```
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log + --tests cache (tiny)
-  evals/<tree>-<sys>.tsv.zst         # attr→drv maps (zstd), one file per eval
+  <sys>/<tree>.tsv.zst          # attr→drv maps (zstd), one file per eval
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a

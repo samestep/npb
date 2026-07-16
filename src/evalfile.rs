@@ -1,6 +1,6 @@
 //! The eval cache files and their diff (DESIGN.md §4, §6).
 //!
-//! Each eval is a standalone file under `<cache>/evals/`, not SQLite rows. It's a
+//! Each eval is a standalone file under `<cache>/<system>/`, not SQLite rows. It's a
 //! bulk, write-once, read-as-a-whole artifact — the only thing we ever do with it
 //! is diff two of them — so a flat file is both smaller (no per-row / index
 //! overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file (drop
@@ -42,9 +42,7 @@ use crate::paths::cache_root;
 /// in `eval.rs`), or *how* `nix-eval-jobs` is invoked is invalidated by deleting
 /// the cache, not by coexisting versions (no migration code — see CLAUDE.md).
 pub fn eval_path(tree: &str, system: &str) -> Result<PathBuf> {
-    Ok(cache_root()?
-        .join("evals")
-        .join(format!("{tree}-{system}.tsv.zst")))
+    Ok(cache_root()?.join(system).join(format!("{tree}.tsv.zst")))
 }
 
 /// Write an eval to its file, sorted by attr, zstd-compressed, atomically: a
@@ -79,7 +77,7 @@ pub fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     // a number so we track the library's default rather than pinning it.
     let compressed = zstd::encode_all(buf.as_bytes(), 0).context("compressing eval")?;
     let dir = path.parent().expect("eval path has a parent");
-    fs::create_dir_all(dir).context("creating evals dir")?;
+    fs::create_dir_all(dir).context("creating eval dir")?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir).context("creating temp eval file")?;
     tmp.write_all(&compressed)
         .context("writing temp eval file")?;
