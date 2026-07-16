@@ -50,11 +50,11 @@ then groups the result by its `before → after` delta (regression /
 blocked-by-a-regression / newly-marked-broken / fixed / dropped / …), folded,
 with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
 (render from existing facts only), `--recheck` / `--retry` / `--prefer-local`
-(build-policy knobs), `--tests` (also build each changed package's
-`passthru.tests`, on both sides — ported from
+(build-policy knobs), `--no-tests` (skip each changed package's
+`passthru.tests`, built on both sides by default — ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),
 `--build-broken` (build meta-blocked packages too), `--max` (everything on:
-implies `--tests` and `--build-broken`),
+implies `--build-broken`; tests are on by default),
 `--system` (repeatable), `--nixpkgs`, and sizing knobs for the parallel
 evaluator (`--eval-slots`, `--worker-mem-mb`). Under the hood: evals cached
 as flat per-commit files (diffed by a streaming linear merge), a tiny SQLite

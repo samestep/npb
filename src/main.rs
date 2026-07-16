@@ -75,16 +75,17 @@ struct Cli {
     /// Ignore a substitutable (cached) success; require a genuine local build.
     #[arg(long)]
     prefer_local: bool,
-    /// For each changed package, also evaluate and build its `passthru.tests`
-    /// (on both sides), classifying each test's `base → head` delta like any
-    /// other attr. Ported from nixpkgs-review's `--tests` (#397).
+    /// Skip each changed package's `passthru.tests`. By default npd also
+    /// evaluates and builds those tests (on both sides), classifying each
+    /// test's `base → head` delta like any other attr — the behaviour ported
+    /// from nixpkgs-review's `--tests` (#397).
     #[arg(long)]
-    tests: bool,
+    no_tests: bool,
     /// Also build packages marked broken/unsupported/insecure (skipped and
     /// reported as 🚧 by default, like nixpkgs-review).
     #[arg(long)]
     build_broken: bool,
-    /// Everything on: implies --tests and --build-broken.
+    /// Everything on: implies --build-broken (tests are on by default).
     #[arg(long)]
     max: bool,
     /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
@@ -552,8 +553,8 @@ fn assemble_targets(
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // --max is simply "everything on".
-    let tests = cli.tests || cli.max;
+    // Tests run by default; --no-tests opts out. --max is "everything on".
+    let tests = !cli.no_tests;
     let build_broken = cli.build_broken || cli.max;
     let policy = BuildPolicy {
         recheck: cli.recheck,

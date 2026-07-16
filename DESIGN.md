@@ -175,7 +175,8 @@ So the cache-bypass knobs are just fields on the policy: `recheck` (rebuild a
 suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
 (don't trust a substituted success — build it here), `build_broken` (attempt
 meta-blocked packages too). See `BuildPolicy::decide` in `src/model.rs`.
-`--max` at the CLI is simply everything on: `--tests` + `--build-broken`.
+`--max` at the CLI is simply everything on: `--build-broken` (tests run by
+default; `--no-tests` opts out).
 
 **Staying instant when cached.** The driver loads every target's history in one
 SQLite query, and only *probes the cache* for drvs it doesn't already know are
@@ -481,13 +482,13 @@ tip, head)` pair, npd reports one of two deltas:
   fork point with the PR's real target branch (`merge-base(merge^1, head)`), or,
   if the PR is conflicted (no `merge` ref), the fork point with `master`.
 
-**`--tests` — the changed set's `passthru.tests`.** Ported from
+**Tests — the changed set's `passthru.tests`.** Ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397): for each
 changed package, also build its `passthru.tests` (building a test derivation *is*
-running it). The full-set eval never reaches these — a package's `tests` is a
-plain attrset without `recurseForDerivations`, so `nix-eval-jobs` doesn't descend
-into it — so `--tests` runs a **targeted second eval** over just the changed
-set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a thunk
+running it). On by default; `--no-tests` opts out. The full-set eval never
+reaches these — a package's `tests` is a plain attrset without
+`recurseForDerivations`, so `nix-eval-jobs` doesn't descend into it — so this
+runs a **targeted second eval** over just the changed set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a thunk
 `nix-eval-jobs` forces in a worker (so a package that fails to evaluate errors
 only its own subtree, never the whole run — the same per-attr isolation the
 full-set walk relies on). Each test carries its own meta-blocked bit
