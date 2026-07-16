@@ -245,11 +245,32 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     s
 }
 
+/// The longest run of consecutive backticks in `s`.
+fn longest_backtick_run(s: &str) -> usize {
+    let (mut max, mut cur) = (0, 0);
+    for c in s.chars() {
+        cur = if c == '`' { cur + 1 } else { 0 };
+        max = max.max(cur);
+    }
+    max
+}
+
 /// Render the per-system entries to Markdown, grouped into `before → after`
-/// sections ordered worst-delta-first.
-pub fn render(base: &str, head: &str, per_system: &[(String, Vec<Entry>)]) -> String {
+/// sections ordered worst-delta-first. `command` is the shell reproduction of
+/// this exact changeset (see `repro_command`), printed as a copy-pasteable code
+/// block right under the heading (DESIGN §8).
+pub fn render(
+    base: &str,
+    head: &str,
+    command: &str,
+    per_system: &[(String, Vec<Entry>)],
+) -> String {
+    // Fence with more backticks than any run inside the command, so a working-
+    // tree reproduction whose embedded diff touches a Markdown file (its own
+    // ``` fences and all) can't close the block early.
+    let fence = "`".repeat(longest_backtick_run(command).max(2) + 1);
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
-    let mut out = format!("## `npd` report: {base} → {head}\n");
+    let mut out = format!("## `npd` report: {base} → {head}\n\n{fence}sh\n{command}\n{fence}\n");
     for (system, entries) in per_system {
         out.push_str(&format!("\n### `{system}`\n"));
         if entries.is_empty() {
@@ -331,6 +352,20 @@ mod tests {
     }
 
     #[test]
+    fn reproduction_fence_outgrows_embedded_backticks() {
+        // A working-tree reproduction embeds its diff, which can contain a ```
+        // run (editing a Markdown file). The fence must be longer so the report
+        // block doesn't close early.
+        let cmd = "git apply --cached <<'PATCH'\n+```sh hi\nPATCH";
+        let out = render("b", "h", cmd, &[]);
+        assert!(out.contains("\n````sh\n"), "{out}");
+        assert!(out.ends_with("\n````\n"), "{out}");
+        // The common (no-backtick) command still gets a plain triple fence.
+        let out = render("b", "h", "npd --base a --head b", &[]);
+        assert!(out.contains("\n```sh\n"), "{out}");
+    }
+
+    #[test]
     fn cell_priorities_are_distinct() {
         // Every (base, head) pair has its own section slot; a duplicate
         // priority would silently merge two sections' ordering.
@@ -407,7 +442,18 @@ mod tests {
                 Some("/h/f"),
             ),
         ];
-        let out = render("base", "head", &[("aarch64-linux".into(), entries)]);
+        let out = render(
+            "base",
+            "head",
+            "npd --base base --head head",
+            &[("aarch64-linux".into(), entries)],
+        );
+
+        // The reproduction command sits in a code block right under the heading.
+        assert!(
+            out.contains("\n\n```sh\nnpd --base base --head head\n```\n"),
+            "{out}"
+        );
 
         // Composable tokens and the transitive distinction.
         assert!(out.contains("✅ → ❌ · <b>1 regression</b>"), "{out}");

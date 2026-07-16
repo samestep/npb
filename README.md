@@ -48,7 +48,11 @@ skipping anything already known, substitutable, or meta-blocked
 (broken/unsupported/insecure) — the last reported as ⏩ **skipped**, npd's name
 for what nixpkgs-review skips), then groups the result by its `before → after`
 delta (regression / blocked-by-a-regression / newly-skipped / fixed / dropped /
-…), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--retry`
+…), folded, with drv-sharing attrs collapsed (`a = b = c`). Each report opens
+with a copy-pasteable `sh` command that reproduces its **exact** changeset on
+any machine — pinned `--base`/`--head` commits (a PR prepends the `git fetch` of
+its head; an uncommitted working tree embeds its diff as a heredoc), so a shared
+report is always re-runnable, never the ambiguous invocation the author typed. Flags: `--retry`
 (re-attempt a known failure), `--no-tests` (skip each changed package's
 `passthru.tests`, built on both sides by default — ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),

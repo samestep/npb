@@ -601,6 +601,34 @@ merge-base under `--no-merge` — §6) it **builds both sides of the changed
 set** (skipping anything already known or substitutable), so a fresh report has
 a real state for every row rather than a wall of `❓`.
 
+**Every report opens with a copy-pasteable reproduction command** (a ```sh```
+block right under the heading, `repro_command` in `src/main.rs`) so anyone can
+re-run `npd` on the *exact same changeset* — not the ambiguous invocation the
+author happened to type (`npd` alone means a different changeset per machine and
+day), but the resolved identity. Every form reduces to `npd --base <sha> --head
+<sha>` on **pinned commits**: because the eval is tree-keyed and the synthetic
+merge is deterministic (§6), pinning the two input commits reproduces the review
+byte-for-byte, and npd re-mints the merge itself — the command never names a
+synthetic (local-only) commit. Only report-shaping flags are echoed
+(`--no-merge`, `--no-skip`, `--no-tests`, and an explicit `-s` per system, since
+the default system is host-specific); `--retry` and the eval-sizing knobs don't
+change the changeset, so they're omitted. What varies is only how the *head* is
+made resolvable on another machine:
+
+- a committed / explicit head is already a fetchable commit → nothing extra;
+- a `--pr` head lives only on `refs/pull/N/head`, which a plain clone omits, so
+  the command prepends `git fetch <upstream> refs/pull/N/head`, chained with
+  `&&` — conservative: if the fetch can't supply the pinned sha (the PR was
+  force-pushed), npd simply fails rather than reviewing the wrong commits;
+- an uncommitted working tree has no shareable commit, so the command embeds its
+  diff in a heredoc and rebuilds the identical synthetic commit with plain git
+  (a throwaway index → `git apply --cached` → `git commit-tree`, exactly what
+  the live working-tree capture does internally — §6), then reviews that. npd
+  grows **no** `--patch` flag for this: the whole reconstruction is emitted
+  shell, and since the eval keys on the content-addressed tree the rebuilt
+  commit needs no pinned identity. (Fully-untracked files are excluded, the same
+  `git stash create` limitation the live capture has — §6.)
+
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
 The spine is implemented (✓).

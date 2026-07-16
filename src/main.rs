@@ -276,6 +276,21 @@ fn git_env(repo: &std::path::Path, envs: &[(&str, &str)], args: &[&str]) -> Resu
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
+/// `git diff --binary A B` in `repo`, returned *untrimmed* — a patch's exact
+/// bytes (including any trailing newline) must survive for `git apply` to read
+/// it back. Used to reconstruct the diff a live working-tree review captured,
+/// for the report's reproduction command.
+fn git_diff_binary(repo: &std::path::Path, a: &str, b: &str) -> Result<String> {
+    let out = git_output(repo, &["diff", "--binary", a, b])?;
+    if !out.status.success() {
+        bail!(
+            "git diff {a} {b} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
+
 /// The tree object a commit points at — the eval cache key (see [`Rev`]).
 fn tree_of(repo: &std::path::Path, commit: &str) -> Result<String> {
     git(repo, &["rev-parse", &format!("{commit}^{{tree}}")])
@@ -524,6 +539,88 @@ fn assemble_targets(
     targets
 }
 
+/// The shell command a report prints (DESIGN §8) so anyone can reproduce its
+/// exact changeset. Every form ultimately runs `npd --base <sha> --head <sha>`
+/// on pinned commits — the eval is tree-keyed and the synthetic merge is
+/// deterministic (DESIGN §6), so pinning the two input commits reproduces the
+/// review byte-for-byte. What differs is how the *head* is made resolvable on
+/// another machine:
+///
+/// - a committed / explicit head is already a fetchable commit → nothing extra;
+/// - a `--pr` head lives only on `refs/pull/N/head`, which a plain clone omits,
+///   so the command fetches that ref first, chained with `&&` so npd never runs
+///   on the wrong commit if the fetch can't supply the pinned sha (e.g. the PR
+///   was force-pushed) — it just fails, conservatively;
+/// - an uncommitted working tree has no shareable commit, so the command embeds
+///   its diff in a heredoc and rebuilds the identical synthetic commit with
+///   plain git (a throwaway index → `git apply` → `git commit-tree`, exactly
+///   what the live capture does internally — DESIGN §6), then reviews that. npd
+///   needs no `--patch` flag: the reconstruction is all in the emitted script.
+///
+/// Only flags that change *what the report contains* are echoed (`--no-merge`,
+/// `--no-skip`, `--no-tests`, and the systems); `--retry` and the eval-sizing
+/// knobs don't change the changeset, so they are omitted.
+fn repro_command(
+    repo: &std::path::Path,
+    (base, head): (&Rev, &Rev),
+    pr: Option<u64>,
+    no_merge: bool,
+    no_skip: bool,
+    no_tests: bool,
+    systems: &[String],
+) -> Result<String> {
+    let mut flags = String::new();
+    if no_merge {
+        flags.push_str(" --no-merge");
+    }
+    if no_skip {
+        flags.push_str(" --no-skip");
+    }
+    if no_tests {
+        flags.push_str(" --no-tests");
+    }
+    for s in systems {
+        flags.push_str(&format!(" -s {s}"));
+    }
+    let base_sha = &base.commit;
+
+    // A working-tree head is the only one with no shareable commit (its content
+    // is uncommitted and local). Embed its diff and rebuild the synthetic
+    // commit the reproducer reviews; the tree is content-addressed, so the
+    // commit needs no pinned identity to reproduce the eval. The pinned `HEAD`
+    // sha (not the reproducer's live HEAD) is what the patch applies onto.
+    if head.label == "worktree" {
+        let head_sha = resolve_commit(repo, "HEAD")?;
+        let diff = git_diff_binary(repo, &head_sha, "refs/npd/worktree")?;
+        let diff = if diff.ends_with('\n') {
+            diff
+        } else {
+            format!("{diff}\n")
+        };
+        return Ok(format!(
+            "i=\"$(mktemp)\"\n\
+             GIT_INDEX_FILE=\"$i\" git read-tree {head_sha}\n\
+             GIT_INDEX_FILE=\"$i\" git apply --cached --binary <<'PATCH'\n\
+             {diff}\
+             PATCH\n\
+             h=\"$(GIT_INDEX_FILE=\"$i\" git write-tree)\"\n\
+             rm -f \"$i\"\n\
+             h=\"$(git commit-tree \"$h\" -p {head_sha} -m 'npd: uncommitted working tree')\"\n\
+             git update-ref refs/npd/worktree \"$h\"\n\
+             npd --base {base_sha} --head \"$h\"{flags}"
+        ));
+    }
+
+    let head_sha = &head.label;
+    if let Some(n) = pr {
+        return Ok(format!(
+            "git fetch {UPSTREAM} refs/pull/{n}/head \
+             && npd --base {base_sha} --head {head_sha}{flags}"
+        ));
+    }
+    Ok(format!("npd --base {base_sha} --head {head_sha}{flags}"))
+}
+
 fn run(cli: Cli) -> Result<()> {
     // Tests run by default; --no-tests opts out.
     let tests = !cli.no_tests;
@@ -684,7 +781,19 @@ fn run(cli: Cli) -> Result<()> {
         }
         per_system.push((sys.clone(), entries));
     }
-    print!("{}", report::render(&base.label, &head.label, &per_system));
+    let command = repro_command(
+        &repo,
+        (&base, &head),
+        cli.pr,
+        cli.no_merge,
+        no_skip,
+        !tests,
+        &systems,
+    )?;
+    print!(
+        "{}",
+        report::render(&base.label, &head.label, &command, &per_system)
+    );
     Ok(())
 }
 
@@ -992,5 +1101,124 @@ mod tests {
         let targets = assemble_targets(&[("sysA".into(), a), ("sysB".into(), b)]);
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].skipped);
+    }
+
+    fn rev(commit: &str, label: &str) -> Rev {
+        Rev {
+            tree: format!("tree-of-{commit}"),
+            commit: commit.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn repro_command_commit_and_pr_forms() {
+        let dummy = std::path::Path::new(".");
+        let base = rev("aaa", "aaa");
+        let head = rev("bbb", "bbb");
+
+        // Committed/explicit head: plain --base/--head on the pinned commits.
+        // --head is the head's label, which for a real commit *is* its sha.
+        let cmd = repro_command(
+            dummy,
+            (&base, &head),
+            None,
+            false,
+            false,
+            false,
+            &["x86_64-linux".into()],
+        )
+        .unwrap();
+        assert_eq!(cmd, "npd --base aaa --head bbb -s x86_64-linux");
+
+        // Only report-shaping flags are echoed, and every system repeats.
+        let cmd = repro_command(
+            dummy,
+            (&base, &head),
+            None,
+            true,
+            true,
+            true,
+            &["a".into(), "b".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            "npd --base aaa --head bbb --no-merge --no-skip --no-tests -s a -s b"
+        );
+
+        // PR: fetch the pull head first (a plain clone lacks it), chained with
+        // && so npd never runs if the pinned sha can't be supplied.
+        let cmd = repro_command(
+            dummy,
+            (&base, &head),
+            Some(42),
+            false,
+            false,
+            false,
+            &["s".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            format!("git fetch {UPSTREAM} refs/pull/42/head && npd --base aaa --head bbb -s s")
+        );
+    }
+
+    #[test]
+    fn repro_command_worktree_script_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("f.txt"), "one\n").unwrap();
+        std::fs::write(d.join("gone.txt"), "bye\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "init"]);
+        let head = resolve_commit(d, "HEAD").unwrap();
+
+        // A dirty tree: an edit, a staged-new file, and a deletion — the shapes
+        // `git stash create` (and so the emitted patch) captures.
+        std::fs::write(d.join("f.txt"), "two\n").unwrap();
+        std::fs::write(d.join("added.txt"), "new\n").unwrap();
+        g(d, &["add", "added.txt"]);
+        std::fs::remove_file(d.join("gone.txt")).unwrap();
+        let wt = worktree_source(d, &head)
+            .unwrap()
+            .expect("dirty tree captured");
+        let base = commit_source(d, head.clone()).unwrap();
+
+        // The head handed to the report is the worktree Rev (label "worktree").
+        let cmd = repro_command(d, (&base, &wt), None, true, false, true, &["sys".into()]).unwrap();
+        assert!(
+            cmd.contains("git apply --cached --binary <<'PATCH'"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.trim_end().ends_with("--no-merge --no-tests -s sys"),
+            "{cmd}"
+        );
+
+        // Run the emitted script in a pristine tree (working tree restored,
+        // refs/npd/worktree dropped) with the final npd call stubbed out — it
+        // must rebuild a commit whose tree is the captured working tree's,
+        // proving the reproduction depends on nothing but the embedded diff.
+        g(d, &["reset", "--hard", &head]);
+        g(d, &["update-ref", "-d", "refs/npd/worktree"]);
+        let script = cmd.replace("npd --base", "true npd --base");
+        let out = Proc::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(d)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "reproduction script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rebuilt = resolve_commit(d, "refs/npd/worktree").unwrap();
+        assert_eq!(tree_of(d, &rebuilt).unwrap(), wt.tree);
     }
 }
