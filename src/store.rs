@@ -27,30 +27,32 @@ CREATE TABLE IF NOT EXISTS observation (
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 
 -- The `--tests` passthru.tests eval cache (DESIGN.md §4, §6). A test's drv is a
--- pure function of (commit, system, package-attr), so we cache per package and
--- reuse across reviews at a commit. `test_pkg` marks a package fully
--- evaluated (present even when it has zero tests, so a no-test package isn't
--- re-evaluated every run); `test_drv` holds each resolved `<pkg>.tests.<name>`
--- drv (a package may contribute zero rows). Full drv paths, like `observation`.
--- `broken` is the test's own meta-blocked bit (a test can be unsupported on this
--- system even when its package builds — an x86-only NixOS test on aarch64), so
--- it's stored per test, not inferred from the package.
+-- pure function of (tree, system, package-attr) — the source *tree*, not the
+-- commit (see `model::Rev`) — so we cache per package and reuse across reviews at
+-- a tree (a rebase/amend, or committing an as-is working tree, all hit).
+-- `test_pkg` marks a package fully evaluated (present even when it has zero
+-- tests, so a no-test package isn't re-evaluated every run); `test_drv` holds
+-- each resolved `<pkg>.tests.<name>` drv (a package may contribute zero rows).
+-- Full drv paths, like `observation`. `broken` is the test's own meta-blocked bit
+-- (a test can be unsupported on this system even when its package builds — an
+-- x86-only NixOS test on aarch64), so it's stored per test, not inferred from the
+-- package.
 CREATE TABLE IF NOT EXISTS test_pkg (
-    commit_  TEXT NOT NULL,
+    tree     TEXT NOT NULL,
     system   TEXT NOT NULL,
     pkg_attr TEXT NOT NULL,
-    PRIMARY KEY (commit_, system, pkg_attr)
+    PRIMARY KEY (tree, system, pkg_attr)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS test_drv (
-    commit_   TEXT NOT NULL,
+    tree      TEXT NOT NULL,
     system    TEXT NOT NULL,
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
     broken    INTEGER NOT NULL,
-    PRIMARY KEY (commit_, system, test_attr)
+    PRIMARY KEY (tree, system, test_attr)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (commit_, system, pkg_attr);
+CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (tree, system, pkg_attr);
 ";
 
 fn source_str(s: Source) -> &'static str {
@@ -206,7 +208,7 @@ impl Store {
     /// distinct from "evaluated, has no tests" (present here, no `test_drv` rows).
     pub fn tests_cached_pkgs(
         &self,
-        commit: &str,
+        tree: &str,
         system: &str,
         pkgs: &[String],
     ) -> Result<std::collections::HashSet<String>> {
@@ -217,11 +219,11 @@ impl Store {
         let placeholders = placeholders(pkgs.len());
         let sql = format!(
             "SELECT pkg_attr FROM test_pkg \
-             WHERE commit_ = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
+             WHERE tree = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [commit, system]
+            [tree, system]
                 .into_iter()
                 .chain(pkgs.iter().map(String::as_str)),
         );
@@ -239,7 +241,7 @@ impl Store {
     /// re-run over the same key is harmless.
     pub fn cache_test_eval(
         &mut self,
-        commit: &str,
+        tree: &str,
         system: &str,
         pkgs: &[String],
         jobs: &[TestJob],
@@ -247,18 +249,18 @@ impl Store {
         let tx = self.conn.transaction()?;
         for pkg in pkgs {
             tx.execute(
-                "INSERT OR REPLACE INTO test_pkg (commit_, system, pkg_attr) \
+                "INSERT OR REPLACE INTO test_pkg (tree, system, pkg_attr) \
                  VALUES (?1, ?2, ?3)",
-                params![commit, system, pkg],
+                params![tree, system, pkg],
             )?;
         }
         for j in jobs {
             if let Some(drv) = &j.drv_path {
                 tx.execute(
                     "INSERT OR REPLACE INTO test_drv \
-                     (commit_, system, pkg_attr, test_attr, drv_path, broken) \
+                     (tree, system, pkg_attr, test_attr, drv_path, broken) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![commit, system, j.pkg_attr, j.test_attr, drv, j.broken],
+                    params![tree, system, j.pkg_attr, j.test_attr, drv, j.broken],
                 )?;
             }
         }
@@ -271,7 +273,7 @@ impl Store {
     /// whole set.
     pub fn tests_drvs_for(
         &self,
-        commit: &str,
+        tree: &str,
         system: &str,
         pkgs: &[String],
     ) -> Result<std::collections::HashMap<String, (String, bool)>> {
@@ -282,11 +284,11 @@ impl Store {
         let placeholders = placeholders(pkgs.len());
         let sql = format!(
             "SELECT test_attr, drv_path, broken FROM test_drv \
-             WHERE commit_ = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
+             WHERE tree = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [commit, system]
+            [tree, system]
                 .into_iter()
                 .chain(pkgs.iter().map(String::as_str)),
         );
@@ -387,7 +389,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("npd-testcache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
-        let (c, sys) = ("commitA", "aarch64-linux");
+        let (c, sys) = ("treeA", "aarch64-linux");
         let pkgs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
         // Nothing cached yet.
@@ -447,9 +449,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // a different commit shares nothing.
+        // a different tree shares nothing.
         assert!(
-            s.tests_cached_pkgs("commitB", sys, &pkgs(&["hello"]))
+            s.tests_cached_pkgs("treeB", sys, &pkgs(&["hello"]))
                 .unwrap()
                 .is_empty()
         );

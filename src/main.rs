@@ -22,7 +22,7 @@ use std::process::Command as Proc;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::model::BuildPolicy;
+use crate::model::{BuildPolicy, Rev};
 
 #[derive(Parser)]
 #[command(
@@ -211,7 +211,7 @@ fn resolve_pr(
     pr: u64,
     refetch: bool,
     fork_point: bool,
-) -> Result<(String, String)> {
+) -> Result<(Rev, Rev)> {
     let head_ref = format!("refs/pull/{pr}/head");
     if fork_point {
         if !ensure_pr_ref(repo, upstream, &head_ref, refetch)? {
@@ -220,7 +220,7 @@ fn resolve_pr(
         let head = resolve_commit(repo, &head_ref)?;
         let base = git_merge_base(repo, "master", &head)
             .context("computing the PR's fork point with master")?;
-        return Ok((base, head));
+        return Ok((commit_source(repo, base)?, commit_source(repo, head)?));
     }
 
     let merge_ref = format!("refs/pull/{pr}/merge");
@@ -240,7 +240,119 @@ fn resolve_pr(
     }
     let head = resolve_commit(repo, &merge_ref)?;
     let base = resolve_commit(repo, &format!("{merge_ref}^1"))?;
-    Ok((base, head))
+    Ok((commit_source(repo, base)?, commit_source(repo, head)?))
+}
+
+/// `git -C repo ARGS` with extra environment set — the spawn behind the
+/// working-tree capture (`worktree_source`), which needs a throwaway
+/// `GIT_INDEX_FILE` and pinned author/committer identity+dates. Trimmed stdout,
+/// or an error carrying stderr (like [`git`]).
+fn git_env(repo: &std::path::Path, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    let mut cmd = Proc::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+/// The tree object a commit points at — the eval cache key (see [`Rev`]).
+fn tree_of(repo: &std::path::Path, commit: &str) -> Result<String> {
+    git(repo, &["rev-parse", &format!("{commit}^{{tree}}")])
+}
+
+/// Wrap a resolved commit sha as a [`Rev`]: its tree is the eval cache key, and
+/// the sha itself is both `fetchGit`'s commit and the display label.
+fn commit_source(repo: &std::path::Path, commit: String) -> Result<Rev> {
+    let tree = tree_of(repo, &commit)?;
+    Ok(Rev {
+        tree,
+        label: commit.clone(),
+        commit,
+    })
+}
+
+/// The default head: `HEAD`, or — when the working tree has uncommitted edits to
+/// tracked files — the working tree itself, captured as a synthetic
+/// content-addressed commit ([`worktree_source`]). This is what lets `npd`
+/// review in-progress work; committing that work as-is later is a cache *hit*,
+/// since both resolve to the identical tree (see [`Rev`]).
+fn head_source(repo: &std::path::Path) -> Result<Rev> {
+    let head = resolve_commit(repo, "HEAD")?;
+    match worktree_source(repo, &head)? {
+        Some(rev) => {
+            eprintln!("head: uncommitted working tree (tree {})", &rev.tree[..12]);
+            Ok(rev)
+        }
+        None => commit_source(repo, head),
+    }
+}
+
+/// Capture the working tree's tracked-file state as a [`Rev`], or `None` when it
+/// matches `head` (nothing uncommitted to review). The tree is built in a
+/// throwaway index seeded from `head` and updated to the working tree via
+/// `git add -u`, so **edits and deletions of tracked files are captured but new
+/// untracked files are not** (`git add` them to have npd see them). The tree
+/// hash is pure content — no timestamp — so an unchanged working tree yields the
+/// same key on every run (a warm cache hit). When it differs, a *deterministic*
+/// commit is minted over it for `fetchGit` (pinned identity + dates, so its sha
+/// too is stable across runs) and pinned under `refs/npd/worktree` so git won't
+/// GC the dangling object before the eval fetches it. Two commits with one tree
+/// fetch to the identical source path, so keying on the tree — not this commit —
+/// is what makes the whole thing cache correctly (DESIGN §6).
+fn worktree_source(repo: &std::path::Path, head: &str) -> Result<Option<Rev>> {
+    let index_dir = tempfile::tempdir().context("creating a temp git index dir")?;
+    let index = index_dir.path().join("index");
+    let index_s = index.to_str().context("temp index path is not UTF-8")?;
+    let idx = [("GIT_INDEX_FILE", index_s)];
+    // Seed the throwaway index from HEAD, then stage the working tree's current
+    // content of tracked files (modifications + deletions).
+    git_env(repo, &idx, &["read-tree", head])?;
+    git_env(repo, &idx, &["add", "-u"])?;
+    let tree = git_env(repo, &idx, &["write-tree"])?;
+    if tree == tree_of(repo, head)? {
+        return Ok(None); // no uncommitted changes to tracked files
+    }
+    // A fixed timestamp + identity make the commit sha a pure function of
+    // (tree, parent), so the same working tree reproduces it run to run.
+    const EPOCH: &str = "1970-01-01T00:00:00Z";
+    let ident = [
+        ("GIT_AUTHOR_NAME", "npd"),
+        ("GIT_AUTHOR_EMAIL", "npd@localhost"),
+        ("GIT_AUTHOR_DATE", EPOCH),
+        ("GIT_COMMITTER_NAME", "npd"),
+        ("GIT_COMMITTER_EMAIL", "npd@localhost"),
+        ("GIT_COMMITTER_DATE", EPOCH),
+    ];
+    let commit = git_env(
+        repo,
+        &ident,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            head,
+            "-m",
+            "npd: uncommitted working tree",
+        ],
+    )?;
+    // Pin so a `git gc` can't drop the dangling commit before fetchGit reads it.
+    git(repo, &["update-ref", "refs/npd/worktree", &commit])?;
+    Ok(Some(Rev {
+        tree,
+        commit,
+        label: "worktree".into(),
+    }))
 }
 
 /// Resolve a revision (ref, short/full sha, tag, `HEAD~1`, …) to a full commit
@@ -257,18 +369,31 @@ fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-/// Resolve report revisions with ergonomic defaults: head defaults to `HEAD`,
-/// base to the merge-base of head and `master` (the fork point of this branch).
+/// Resolve report revisions with ergonomic defaults: head defaults to `HEAD`
+/// (or the uncommitted working tree, if dirty — see [`head_source`]), base to
+/// the merge-base of head and `master` (the fork point of this branch). An
+/// explicit head is always taken literally — the working tree is only ever used
+/// on the default path.
 fn resolve_base_head(
     repo: &std::path::Path,
     base: Option<String>,
     head: Option<String>,
-) -> Result<(String, String)> {
-    let head = resolve_commit(repo, &head.unwrap_or_else(|| "HEAD".to_string()))?;
+) -> Result<(Rev, Rev)> {
+    let head = match head {
+        Some(h) => commit_source(repo, resolve_commit(repo, &h)?)?,
+        None => head_source(repo)?,
+    };
     let base = match base {
-        Some(b) => resolve_commit(repo, &b)?,
-        None => git_merge_base(repo, "master", &head)
-            .context("no base given and could not merge-base with `master`; pass one explicitly")?,
+        Some(b) => commit_source(repo, resolve_commit(repo, &b)?)?,
+        // merge-base against head's commit: for the working tree that's the
+        // synthetic commit whose parent is HEAD, so this still finds HEAD's fork
+        // point with `master`.
+        None => {
+            let mb = git_merge_base(repo, "master", &head.commit).context(
+                "no base given and could not merge-base with `master`; pass one explicitly",
+            )?;
+            commit_source(repo, mb)?
+        }
     };
     Ok((base, head))
 }
@@ -338,7 +463,7 @@ fn run(cli: Cli) -> Result<()> {
     // for build+render.
     let mut per_system_changed: Vec<(String, Vec<evalfile::ChangedAttr>)> = Vec::new();
     for sys in &systems {
-        let changed = evalfile::changed_set(&base, &head, sys)?;
+        let changed = evalfile::changed_set(&base.tree, &head.tree, sys)?;
         per_system_changed.push((sys.clone(), changed));
     }
 
@@ -370,32 +495,33 @@ fn run(cli: Cli) -> Result<()> {
             })
             .collect();
 
-        // Gather the cache misses across every (commit, system, side) and
+        // Gather the cache misses across every (tree, system, side) and
         // evaluate them all through one scheduler, so `--tests` schedules and
-        // displays as a unit like the full eval. Deduped by (commit, system):
-        // with `npd X X`, base and head are the same key (and per the per-package
-        // cache, the same commit on different systems are distinct keys).
-        let mut requests: Vec<(String, String, Vec<String>)> = Vec::new();
+        // displays as a unit like the full eval. Deduped by (tree, system): with
+        // `npd X X` (or a base/head sharing a tree) both sides are one key (and
+        // per the per-package cache, the same tree on different systems are
+        // distinct keys).
+        let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for ((sys, _), (base_names, head_names)) in per_system_changed.iter().zip(&per_sys) {
-            for (commit, names) in [(&base, base_names), (&head, head_names)] {
-                if !seen.insert((commit.clone(), sys.clone())) {
+            for (rev, names) in [(&base, base_names), (&head, head_names)] {
+                if !seen.insert((rev.tree.clone(), sys.clone())) {
                     continue;
                 }
-                let cached = store.tests_cached_pkgs(commit, sys, names)?;
+                let cached = store.tests_cached_pkgs(&rev.tree, sys, names)?;
                 let misses: Vec<String> = names
                     .iter()
                     .filter(|p| !cached.contains(*p))
                     .cloned()
                     .collect();
                 if !misses.is_empty() {
-                    requests.push((commit.clone(), sys.clone(), misses));
+                    requests.push((rev.clone(), sys.clone(), misses));
                 }
             }
         }
         let jobs_per = eval::eval_tests_many(&repo, &requests)?;
-        for ((commit, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
-            store.cache_test_eval(commit, sys, misses, jobs)?;
+        for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
+            store.cache_test_eval(&rev.tree, sys, misses, jobs)?;
         }
 
         // The per-package cache is now populated; build each system's test-row
@@ -404,8 +530,8 @@ fn run(cli: Cli) -> Result<()> {
         for ((sys, changed), (base_names, head_names)) in
             per_system_changed.iter_mut().zip(&per_sys)
         {
-            let bmap = store.tests_drvs_for(&base, sys, base_names)?;
-            let hmap = store.tests_drvs_for(&head, sys, head_names)?;
+            let bmap = store.tests_drvs_for(&base.tree, sys, base_names)?;
+            let hmap = store.tests_drvs_for(&head.tree, sys, head_names)?;
             changed.extend(evalfile::changed_tests(&bmap, &hmap));
         }
     }
@@ -426,7 +552,7 @@ fn run(cli: Cli) -> Result<()> {
         // whole instantiation eval is skipped — the couple of seconds that
         // otherwise made a fully-cached run non-instant (DESIGN.md §5–§6).
         let need = build::drvs_to_materialize(&targets, policy)?;
-        let mut inst: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
         for (sys, changed) in &per_system_changed {
             let mut base_attrs = Vec::new();
             let mut head_attrs = Vec::new();
@@ -476,7 +602,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         per_system.push((sys.clone(), entries));
     }
-    print!("{}", report::render(&base, &head, &per_system));
+    print!("{}", report::render(&base.label, &head.label, &per_system));
     Ok(())
 }
 
@@ -600,12 +726,15 @@ mod tests {
         let upstream = up.path().to_str().unwrap();
         // Fetches the merge ref; base = merge^1 (master tip B), head = merge (M).
         let (base, head) = resolve_pr(local.path(), upstream, 1, false, false).unwrap();
-        assert_eq!(base, s["b"]);
-        assert_eq!(head, s["m"]);
+        assert_eq!(base.commit, s["b"]);
+        assert_eq!(head.commit, s["m"]);
         // Second call is offline (ref now cached) and resolves identically.
         let (base2, head2) = resolve_pr(local.path(), "file:///does/not/exist", 1, false, false)
             .expect("cached ref should resolve without touching upstream");
-        assert_eq!((base2, head2), (s["b"].clone(), s["m"].clone()));
+        assert_eq!(
+            (base2.commit, head2.commit),
+            (s["b"].clone(), s["m"].clone())
+        );
     }
 
     #[test]
@@ -626,8 +755,54 @@ mod tests {
         assert!(msg.contains("--fork-point"), "{msg}");
         // --fork-point: head = PR head (D), base = merge-base(master, D) = A.
         let (base, head) = resolve_pr(local.path(), upstream, 2, false, true).unwrap();
-        assert_eq!(head, s["d"]);
-        assert_eq!(base, s["a"]);
+        assert_eq!(head.commit, s["d"]);
+        assert_eq!(base.commit, s["a"]);
+    }
+
+    #[test]
+    fn worktree_source_is_deterministic_and_tree_keyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("f.txt"), "one\n").unwrap();
+        g(d, &["add", "f.txt"]);
+        g(d, &["commit", "-m", "init"]);
+        let head = resolve_commit(d, "HEAD").unwrap();
+
+        // A clean tree yields no working-tree source.
+        assert!(worktree_source(d, &head).unwrap().is_none());
+
+        // Edit a tracked file: now it's captured.
+        std::fs::write(d.join("f.txt"), "two\n").unwrap();
+        let a = worktree_source(d, &head)
+            .unwrap()
+            .expect("dirty tree captured");
+        let b = worktree_source(d, &head).unwrap().unwrap();
+        // Deterministic across runs: same tree key AND same synthetic commit
+        // (the whole point — an unchanged working tree is a warm cache hit).
+        assert_eq!(a.tree, b.tree);
+        assert_eq!(a.commit, b.commit);
+        assert_eq!(a.label, "worktree");
+        // The synthetic tree differs from HEAD's, and is pinned for GC-safety.
+        assert_ne!(a.tree, tree_of(d, &head).unwrap());
+        assert_eq!(resolve_commit(d, "refs/npd/worktree").unwrap(), a.commit);
+
+        // The cache-hit scenario: committing the working tree as-is gives a real
+        // commit whose *tree* equals the synthetic one, so the eval key matches
+        // and no re-eval is needed.
+        g(d, &["commit", "-am", "commit it"]);
+        let committed = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        assert_eq!(committed.tree, a.tree);
+        assert_ne!(committed.commit, a.commit); // different commit, same tree
+
+        // Tree is clean again; a new *untracked* file is NOT captured (documented
+        // limitation of the `git add -u` capture).
+        let now = resolve_commit(d, "HEAD").unwrap();
+        assert!(worktree_source(d, &now).unwrap().is_none());
+        std::fs::write(d.join("untracked.txt"), "x\n").unwrap();
+        assert!(worktree_source(d, &now).unwrap().is_none());
     }
 
     #[test]

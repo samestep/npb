@@ -1,12 +1,13 @@
 //! Run `nix-eval-jobs` and schedule the runs: evaluate a nixpkgs revision into
 //! an `attr -> drv` map — the first spine primitive (DESIGN.md §6, §9), a pure
-//! fact keyed by `(commit, system)`, computed at most once and cached as one
-//! flat file per eval (the file format and its diff live in [`crate::evalfile`]).
+//! fact keyed by `(tree, system)` (the git *tree*, not the commit — see
+//! [`crate::model::Rev`]), computed at most once and cached as one flat file per
+//! eval (the file format and its diff live in [`crate::evalfile`]).
 //!
-//! The revision's source comes from `builtins.fetchGit`, so Nix fetches and
-//! caches it in the store — npd manages no worktrees. `nix-eval-jobs` output is
-//! parsed by streaming NDJSON straight off the child's stdout (never buffering
-//! the whole, meta-heavy output).
+//! The revision's source comes from `builtins.fetchGit` on its [`Rev::commit`],
+//! so Nix fetches and caches it in the store — npd manages no worktrees.
+//! `nix-eval-jobs` output is parsed by streaming NDJSON straight off the child's
+//! stdout (never buffering the whole, meta-heavy output).
 
 use std::collections::VecDeque;
 use std::fs;
@@ -23,11 +24,11 @@ use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
 use crate::live::{human_elapsed, spinner, with_live};
-use crate::model::{AttrEval, TestJob};
+use crate::model::{AttrEval, Rev, TestJob};
 
 /// The one nixpkgs config every eval runs under. npd owns the config
 /// (DESIGN.md §6), which is what makes the eval cache key just
-/// `(commit, system)` — changing this line changes the attr→drv map, so cached
+/// `(tree, system)` — changing this line changes the attr→drv map, so cached
 /// evals must be discarded (delete `~/.cache/nix-npd`). The allow-flags are
 /// on so meta-blocked packages still yield a drv + meta rather than throwing —
 /// we want their drvpath and the option to build them anyway.
@@ -114,14 +115,17 @@ fn nix_string_list(items: &[String]) -> String {
 }
 
 /// Build the whole-package-set Nix expression `nix-eval-jobs` walks. The
-/// revision's source is fetched by `builtins.fetchGit`; interpolants are escaped
-/// via [`nix_escape`] (the repo path in particular is user input, `--nixpkgs`).
-fn build_expr(repo: &Path, commit: &str, system: &str) -> String {
+/// revision's source is fetched by `builtins.fetchGit` at `rev` (a commit — real
+/// or the synthetic one minted for the working tree; the eval depends only on
+/// the tree it resolves to, which is why the cache keys on the tree, not this
+/// commit — see [`Rev`]). Interpolants are escaped via [`nix_escape`] (the repo
+/// path in particular is user input, `--nixpkgs`).
+fn build_expr(repo: &Path, rev: &str, system: &str) -> String {
     format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
          {{ system = \"{}\"; config = {EVAL_CONFIG}; }}",
         nix_escape(&repo.display().to_string()),
-        nix_escape(commit),
+        nix_escape(rev),
         nix_escape(system),
     )
 }
@@ -315,7 +319,7 @@ fn stream_jobs<T>(
 /// derivations, so it never forces a derivation's internals, and each recursed
 /// leaf is wrapped in `tryEval` so one throwing test errors only itself — the
 /// per-leaf isolation nix-eval-jobs would otherwise give the untransformed tree.
-fn build_tests_expr(repo: &Path, commit: &str, system: &str, attrs: &[String]) -> String {
+fn build_tests_expr(repo: &Path, rev: &str, system: &str, attrs: &[String]) -> String {
     let list = nix_string_list(attrs);
     const TEMPLATE: &str = r#"
 let
@@ -356,7 +360,7 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 // { recurseForDerivations = true; }
 "#;
     TEMPLATE
-        .replace("@PKGS@", &build_expr(repo, commit, system))
+        .replace("@PKGS@", &build_expr(repo, rev, system))
         .replace("@ATTRS@", &list)
 }
 
@@ -369,7 +373,7 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 /// cached (see `main`); an empty/all-empty `requests` does no work.
 pub fn eval_tests_many(
     repo: &Path,
-    requests: &[(String, String, Vec<String>)],
+    requests: &[(Rev, String, Vec<String>)],
 ) -> Result<Vec<Vec<TestJob>>> {
     let slots = default_slots(None);
     // Slice every request's packages into ~2×`slots` shards total, so the pool
@@ -381,13 +385,10 @@ pub fn eval_tests_many(
 
     let labels: Vec<String> = requests
         .iter()
-        .map(|(commit, system, _)| format!("tests {} ({system})", short_commit(commit)))
+        .map(|(rev, system, _)| format!("tests {} ({system})", short_label(&rev.label)))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
-    let meta: Vec<(&str, &str)> = requests
-        .iter()
-        .map(|(c, s, _)| (c.as_str(), s.as_str()))
-        .collect();
+    let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
     let results: Vec<Mutex<Vec<TestJob>>> = (0..requests.len())
         .map(|_| Mutex::new(Vec::new()))
         .collect();
@@ -403,8 +404,8 @@ pub fn eval_tests_many(
             done: "evaluated",
         },
         |gi, label, pkgs, on_item| {
-            let (commit, system) = meta[gi];
-            let expr = build_tests_expr(repo, commit, system, pkgs);
+            let (rev, system) = meta[gi];
+            let expr = build_tests_expr(repo, &rev.commit, system, pkgs);
             stream_jobs(
                 &expr,
                 1,
@@ -572,17 +573,18 @@ fn default_slots(user: Option<u64>) -> usize {
     eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, user)
 }
 
-/// A commit's short display form (first 12 chars), for progress-line labels.
-fn short_commit(commit: &str) -> String {
-    commit.chars().take(12).collect()
+/// A revision's short display form (first 12 chars of its [`Rev::label`] — a
+/// commit sha, or the literal `worktree`), for progress-line labels.
+fn short_label(label: &str) -> String {
+    label.chars().take(12).collect()
 }
 
 /// The top-level attr names of the package set at `(commit, system)` — the
 /// space the shards partition. Cheap (well under a second warm): forcing
 /// `attrNames` touches no derivations. The literal `recurseForDerivations`
 /// key is dropped to mirror how `nix-eval-jobs` skips it when walking a set.
-fn enumerate_names(repo: &Path, commit: &str, system: &str) -> Result<Vec<String>> {
-    let expr = format!("builtins.attrNames ({})", build_expr(repo, commit, system));
+fn enumerate_names(repo: &Path, rev: &str, system: &str) -> Result<Vec<String>> {
+    let expr = format!("builtins.attrNames ({})", build_expr(repo, rev, system));
     let out = scrub_env(
         Command::new("nix-instantiate").args(["--eval", "--strict", "--json", "-E", &expr]),
     )
@@ -590,7 +592,7 @@ fn enumerate_names(repo: &Path, commit: &str, system: &str) -> Result<Vec<String
     .context("running nix-instantiate (attr names)")?;
     if !out.status.success() {
         bail!(
-            "enumerating top-level attrs of {commit} ({system}) failed:\n{}",
+            "enumerating top-level attrs of {rev} ({system}) failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -605,12 +607,12 @@ fn enumerate_names(repo: &Path, commit: &str, system: &str) -> Result<Vec<String
 /// per-attr in the worker, so walk semantics and error isolation match the
 /// monolithic root exactly — validated byte-for-byte against a whole-set eval
 /// (DESIGN §6).
-fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> String {
+fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String]) -> String {
     let list = nix_string_list(names);
     format!(
         "let pkgs = {}; in builtins.listToAttrs \
          (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
-        build_expr(repo, commit, system)
+        build_expr(repo, rev, system)
     )
 }
 
@@ -625,12 +627,12 @@ fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> Stri
 /// as `attr`) would replace. `splitString "."` also mis-splits a quoted path
 /// element like `haskell.compiler."ghc94"`, which `--select` would handle
 /// correctly. Adopt it (in both spots) once it lands upstream.
-fn select_expr(repo: &Path, commit: &str, system: &str, paths: &[String]) -> String {
+fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String]) -> String {
     let list = nix_string_list(paths);
     format!(
         "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
          (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
-        build_expr(repo, commit, system)
+        build_expr(repo, rev, system)
     )
 }
 
@@ -650,10 +652,10 @@ fn select_expr(repo: &Path, commit: &str, system: &str, paths: &[String]) -> Str
 /// re-pay that import for no gain. Concurrency is what wins — the phase's
 /// wall-time drops from the *sum* of the imports to (roughly) the *slowest*
 /// one, up to `slots` at a time, at no extra total work.
-pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> Result<()> {
+pub fn instantiate(repo: &Path, requests: &[(Rev, String, Vec<String>)]) -> Result<()> {
     // Drop the sides with nothing to instantiate (a diff side can have no
     // buildable changed attrs) so they don't clutter the display.
-    let requests: Vec<&(String, String, Vec<String>)> =
+    let requests: Vec<&(Rev, String, Vec<String>)> =
         requests.iter().filter(|(_, _, p)| !p.is_empty()).collect();
     if requests.is_empty() {
         return Ok(());
@@ -662,13 +664,10 @@ pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> R
 
     let labels: Vec<String> = requests
         .iter()
-        .map(|(commit, system, _)| format!("{} {system}", short_commit(commit)))
+        .map(|(rev, system, _)| format!("{} {system}", short_label(&rev.label)))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
-    let meta: Vec<(&str, &str)> = requests
-        .iter()
-        .map(|(c, s, _)| (c.as_str(), s.as_str()))
-        .collect();
+    let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
     // A shard per request: sizing at the largest request makes every group
     // exactly one shard (no split), so each pair re-imports nixpkgs just once.
     let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
@@ -684,8 +683,8 @@ pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> R
             done: "instantiated",
         },
         |gi, label, paths, on_item| {
-            let (commit, system) = meta[gi];
-            let expr = select_expr(repo, commit, system, paths);
+            let (rev, system) = meta[gi];
+            let expr = select_expr(repo, &rev.commit, system, paths);
             // Streamed rows are discarded (mapped to `()`); the `.drv` writes are
             // the point. The per-job callback drives the live count.
             stream_jobs(
@@ -981,13 +980,14 @@ fn run_shards<T: Send>(
 /// are held there too), so an interrupted eval re-runs from scratch rather than
 /// resuming; when an eval's last shard lands, its rows are assembled and
 /// written as the one cached file.
-pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
+pub fn eval_pairs(repo: &Path, pairs: &[(Rev, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
-    // Dedupe: `npd X X` (or repeated --system) would otherwise run the same
-    // eval twice concurrently — harmless (the write is atomic) but 2× the work.
+    // Dedupe on the eval key `(tree, system)`: `npd X X`, repeated --system, or
+    // two revisions sharing a tree would otherwise run the same eval twice
+    // concurrently — harmless (the write is atomic) but 2× the work.
     let mut seen = std::collections::HashSet::new();
-    for (i, (commit, system)) in pairs.iter().enumerate() {
-        if !eval_path(commit, system)?.exists() && seen.insert((commit, system)) {
+    for (i, (rev, system)) in pairs.iter().enumerate() {
+        if !eval_path(&rev.tree, system)?.exists() && seen.insert((&rev.tree, system)) {
             todo.push(i);
         }
     }
@@ -1000,15 +1000,16 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     // 4 GiB restart cap (`per_worker_mb`) — the two are deliberately decoupled.
     let slots = default_slots(opts.slots);
 
-    // One shard group per `(commit, system)` for both phases below; `meta` keeps
-    // the identifying pair per group, `labels` the display name.
-    let meta: Vec<(&str, &str)> = todo
+    // One shard group per `(tree, system)` for both phases below; `meta` keeps
+    // the identifying `(rev, system)` per group (the rev supplies fetchGit's
+    // commit; the tree is its cache key), `labels` the display name.
+    let meta: Vec<(&Rev, &str)> = todo
         .iter()
-        .map(|&i| (pairs[i].0.as_str(), pairs[i].1.as_str()))
+        .map(|&i| (&pairs[i].0, pairs[i].1.as_str()))
         .collect();
     let labels: Vec<String> = meta
         .iter()
-        .map(|(commit, system)| format!("{} {system}", short_commit(commit)))
+        .map(|(rev, system)| format!("{} {system}", short_label(&rev.label)))
         .collect();
 
     // Phase 1: enumerate each pair's top-level attr names — the space phase 2
@@ -1037,8 +1038,8 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
             done: "enumerated",
         },
         |gi, _label, _slice, on_item| {
-            let (commit, system) = meta[gi];
-            let names = enumerate_names(repo, commit, system)?;
+            let (rev, system) = meta[gi];
+            let names = enumerate_names(repo, &rev.commit, system)?;
             on_item(names.len());
             Ok(names)
         },
@@ -1065,8 +1066,8 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         },
         // Evaluate one shard by streaming its own one-worker `nix-eval-jobs`.
         |gi, label, names, on_item| {
-            let (commit, system) = meta[gi];
-            let expr = shard_expr(repo, commit, system, names);
+            let (rev, system) = meta[gi];
+            let expr = shard_expr(repo, &rev.commit, system, names);
             stream_jobs(
                 &expr,
                 1,
@@ -1077,28 +1078,30 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                 || on_item(1),
             )
         },
-        // Assemble the eval into its one cached file.
+        // Assemble the eval into its one cached file, keyed on the tree.
         |gi, rows| {
-            let (commit, system) = meta[gi];
-            write_eval(&eval_path(commit, system)?, &rows)
+            let (rev, system) = meta[gi];
+            write_eval(&eval_path(&rev.tree, system)?, &rows)
         },
     )
 }
 
-/// Ensure both commits are evaluated across all systems (they run concurrently).
+/// Ensure both revisions are evaluated across all systems (they run
+/// concurrently). Deduped by their eval key `(tree, system)` in [`eval_pairs`],
+/// so a `base`/`head` that share a tree pay for one eval, not two.
 pub fn eval_two(
     repo: &Path,
-    base: &str,
-    head: &str,
+    base: &Rev,
+    head: &Rev,
     systems: &[String],
     opts: EvalOpts,
 ) -> Result<()> {
-    let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
+    let mut pairs: Vec<(Rev, String)> = Vec::with_capacity(systems.len() * 2);
     for s in systems {
-        pairs.push((base.to_string(), s.clone()));
+        pairs.push((base.clone(), s.clone()));
     }
     for s in systems {
-        pairs.push((head.to_string(), s.clone()));
+        pairs.push((head.clone(), s.clone()));
     }
     eval_pairs(repo, &pairs, opts)
 }

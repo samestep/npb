@@ -73,11 +73,14 @@ deliberate simplification (it dropped out of the design discussion):
 
 | fact | key | discipline | storage |
 | --- | --- | --- | --- |
-| **eval** — attr→drv map | `(commit, system, config)` | **pure** → cache forever, never invalidate | one flat file per key |
+| **eval** — attr→drv map | `(tree, system, config)` | **pure** → cache forever, never invalidate | one flat file per key |
 | **observation** — one build/probe event | `drvpath` (or output path for `Cache`) | **append-only log** — never overwrite | SQLite |
 
-An eval at a fixed `(commit, system, config)` is deterministic, so its result is
-valid forever. Everything else is an **observation**: a single event, from some
+An eval at a fixed `(tree, system, config)` is deterministic, so its result is
+valid forever. The key is the git **tree** (the source content), not the commit
+that carries it — the evaluation can't observe a commit's parents, author,
+message, or timestamps (`fetchGit`'s checkout has no `.git`, and npd forwards
+only the path into `import`), so two commits with one tree share an eval (§6). Everything else is an **observation**: a single event, from some
 `Source` — a `Local` build we ran, or `Cache` (narinfo) presence on a
 substituter — stamped with `when`. We append and never discard, which is what
 makes flakiness representable (multiple observations of one drv with differing
@@ -105,7 +108,7 @@ again, Nix rebuilds or substitutes it.
 
 The two fact kinds have opposite access patterns, so they get different backends.
 
-**Evals → one flat file per `(commit, system)`** under `evals/`, sorted
+**Evals → one flat file per `(tree, system)`** under `evals/`, sorted
 `attr\tdrv` lines (empty drv = no derivation; a third field `b` marks the few
 attrs whose meta says broken/unsupported/insecure; `src/eval.rs`). The drv is stored
 stripped of its constant `/nix/store/…​.drv` prefix/suffix, and the whole file is
@@ -145,7 +148,7 @@ commit, and full drv paths are stored as-is like the observation log.
 ```
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log + --tests cache (tiny)
-  evals/<commit>-<sys>.tsv.zst       # attr→drv maps (zstd), one file per eval
+  evals/<tree>-<sys>.tsv.zst         # attr→drv maps (zstd), one file per eval
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -234,14 +237,14 @@ remote cache deleting a path later doesn't invalidate the fact (by design,
 
 ## 6. Evaluation, its cache key, and the diff
 
-**The cache key is `(commit, system, config)`, and it is not a can of worms —
+**The cache key is `(tree, system, config)`, and it is not a can of worms —
 provided `npd` owns the config.** What determines the attr→drv map is the
-nixpkgs revision, the platform, and the nixpkgs *config* (allowlists like
+nixpkgs source *tree*, the platform, and the nixpkgs *config* (allowlists like
 `allowBroken`/`allowUnfree`/`allowUnsupportedSystem`, `permittedInsecurePackages`,
 overlays, `config.allowAliases`, …). The trap is letting a user pass arbitrary
 Nix as config — that isn't cleanly hashable. `npd` avoids it by **defining the
 eval config itself**: one fixed allow-everything config (`EVAL_CONFIG` in
-`src/eval.rs`), so the key is just `(commit, system)`. There is no extra tag in
+`src/eval.rs`), so the key is just `(tree, system)`. There is no extra tag in
 the key: a change to the file format, *how* `nix-eval-jobs` is invoked, or the
 config itself alters the stored map, and the remedy is to delete
 `~/.cache/nix-npd` and regenerate (§1), not to coexist with old files. (An
@@ -249,6 +252,40 @@ earlier design threaded a named "profile" label through the key to leave room
 for several configs, and a later one an eval-version tag baked into each
 filename; with exactly one config ever defined and a delete-to-invalidate cache,
 both were redundant and dropped.)
+
+**Why the git *tree*, not the commit.** The eval is a pure function of the
+checked-out file content — a commit merely wraps a tree with parents, an author,
+a message, and timestamps, none of which the evaluation can see: `fetchGit`'s
+checkout carries no `.git`, and npd passes only the resulting *path* into
+`import` (never the fetchGit attrset's `rev`/`lastModified`/`revCount`). So
+keying on the commit was strictly *over*-specific — two commits with the same
+tree evaluate identically, and even fetch to the byte-identical store path.
+Keying on `tree` (`git rev-parse <commit>^{tree}`) collapses them into one cache
+entry: a rebase that leaves the changed files alone, a message-only `--amend`, a
+cherry-pick landing identical content, and — the payoff — committing an as-is
+working tree all become cache *hits*. npd resolves each requested revision to a
+`Rev { tree, commit, label }` (`src/model.rs`): `tree` is the eval/`--tests`
+cache key, `commit` is what `fetchGit` fetches (a commit is still needed — there
+is no fetch-a-bare-tree), and `label` is the human display (a sha, or
+`worktree`). The soundness rests on npd never forwarding `rev`/`lastModified`
+into the eval; if it ever did (to stamp `lib.version`/`config.revision`,
+flake-style), the eval would regain a commit dependency and tree-keying would
+serve a stale eval — so `build_expr` (`src/eval.rs`) deliberately interpolates
+only the path.
+
+**Reviewing the uncommitted working tree.** Because the key is a tree, an
+uncommitted working tree is reviewable like any revision: on the default head
+path (no explicit `head`), when the working tree has edits to tracked files, npd
+builds a tree from them — a throwaway index seeded from `HEAD` then `git add -u`
+(so tracked edits and deletions are captured; brand-new *untracked* files are
+not, a documented limitation) — and mints a **deterministic** synthetic commit
+over it (pinned identity + epoch dates, parent `HEAD`), pinned under
+`refs/npd/worktree` so a `git gc` can't drop the dangling object before
+`fetchGit` reads it (`worktree_source` in `src/main.rs`). The tree hash is pure
+content, so an unchanged working tree re-runs against the same cache entry, and
+committing it as-is hits that same entry (the real commit's tree equals the
+synthetic one). An explicit `head` is always taken literally — the working tree
+is used only on the default path.
 
 Caching is sound because nixpkgs evaluation is deterministic given those inputs
 (drv paths are content-addressed by their inputs, stable across time and
@@ -380,7 +417,10 @@ instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
   gaps — a change branched off a *non-`master`* base (`staging`,
   `haskell-updates`, a release branch) is compared against the wrong branch, and
   the base is frozen at the fork point, so drift on the base since then is
-  invisible.
+  invisible. When the working tree has uncommitted edits to tracked files, `head`
+  becomes the working tree itself (a synthetic tree-keyed revision, §6) so
+  in-progress work is reviewable; `base` is unaffected (merge-base still lands on
+  the same fork point). An explicit `head` opts out.
 - *PR* — `npd --pr N` closes both gaps by deferring to GitHub's own test-merge
   commit. GitHub publishes, on the **base repo** (so cross-fork PRs need no fork
   URL), `refs/pull/N/head` (the PR tip) and — when the PR merges cleanly —
@@ -428,10 +468,11 @@ marked-broken / …) exactly like any other attr — a delta view, a superset of
 #397's one-shot head-only build.
 
 This eval **is cached**, but *per package* rather than as a whole-set file. A
-test's drv is a pure function of `(commit, system, package-attr)` — it
+test's drv is a pure function of `(tree, system, package-attr)` — it
 does not depend on the base/head pairing — so the cache keys on the package, not
 the changed set, which means a package evaluated in one review is reused in any
-other at that commit. Each run looks up which changed packages are already
+other at that tree (§6's tree-keying: the same reuse a rebase/amend or a
+committed working tree gets on the full eval). Each run looks up which changed packages are already
 cached and evaluates only the misses through the **same shard scheduler as the
 full-set eval** (`run_shards` in `src/eval.rs`). The misses across *every*
 `(commit, system)` in the review are gathered and evaluated in **one** scheduler
@@ -581,9 +622,11 @@ macOS (see `stream_jobs` in `src/eval.rs`); drop that once the fix reaches the
 
 Recorded for context:
 
-- *Eval cache key* → `(commit, system)`; not a can of worms because `npd` owns
-  the fixed config (§6). No version tag — a format change invalidates by
-  deleting `~/.cache/nix-npd` (§1).
+- *Eval cache key* → `(tree, system)`, on the git *tree* not the commit (the
+  eval depends only on source content), so a rebase/amend or a committed
+  working tree is a cache hit and the uncommitted working tree is reviewable
+  (§6); not a can of worms because `npd` owns the fixed config. No version tag —
+  a format change invalidates by deleting `~/.cache/nix-npd` (§1).
 - *Concurrency* → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.

@@ -9,9 +9,41 @@
 //! keeps the model deterministic and trivially testable and lets the
 //! orchestration layer own all the impurity.
 
+/// A revision to evaluate, split into the two git identities it plays plus a
+/// display label (DESIGN.md §6).
+///
+/// The eval is a pure function of the source **tree** — the checked-out file
+/// content — not of the commit that carries it. A commit adds parents, an
+/// author, a message, and timestamps, none of which the evaluation can observe:
+/// `fetchGit`'s checkout has no `.git`, and npd forwards only the resulting
+/// *path* into `import`. So the eval (and `--tests`) cache keys on [`tree`]: two
+/// commits with the same tree share one eval — a rebase that doesn't touch the
+/// changed files, a message-only `--amend`, a cherry-pick landing identical
+/// content, and, crucially, committing an as-is working tree (so an
+/// uncommitted-then-committed edit is a cache *hit*).
+///
+/// [`commit`] is a commit that realizes that tree, for `builtins.fetchGit`
+/// (which fetches by commit, not by a bare tree). For a committed state it is
+/// the real commit; for the uncommitted working tree it is a synthetic,
+/// content-addressed commit minted over the tree. [`label`] is how the side is
+/// shown to a human: the commit sha for a real revision, or `worktree`.
+///
+/// [`tree`]: Rev::tree
+/// [`commit`]: Rev::commit
+/// [`label`]: Rev::label
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rev {
+    /// The git tree hash — the eval cache key.
+    pub tree: String,
+    /// A commit realizing `tree`, used as `builtins.fetchGit`'s `rev`.
+    pub commit: String,
+    /// Human-facing label (a commit sha, or `worktree`).
+    pub label: String,
+}
+
 /// Result of evaluating one attribute on one platform at one commit.
 ///
-/// Pure fact: fully determined by (commit, system, config). `drv_path` is
+/// Pure fact: fully determined by (tree, system, config). `drv_path` is
 /// `None` when evaluation itself errored (assertion, IFD failure, …) — distinct
 /// from a *build* failure, which is an [`Observation`]. The diff and report
 /// deliberately render an errored attr as *absent* (➖): in a delta view an

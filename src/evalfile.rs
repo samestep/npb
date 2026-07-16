@@ -34,15 +34,17 @@ use anyhow::{Context, Result};
 use crate::model::AttrEval;
 use crate::paths::cache_root;
 
-/// The cache file for one `(commit, system)` eval. The eval format carries no
-/// version tag: everything under `~/.cache/nix-npd` is re-derivable, so a change
-/// to the file format, the eval config (`EVAL_CONFIG` in `eval.rs`), or *how*
-/// `nix-eval-jobs` is invoked is invalidated by deleting the cache, not by
-/// coexisting versions (no migration code — see CLAUDE.md).
-pub fn eval_path(commit: &str, system: &str) -> Result<PathBuf> {
+/// The cache file for one `(tree, system)` eval. Keyed on the git *tree*, not
+/// the commit: the eval depends only on the source content, so two commits with
+/// the same tree share one file (see [`crate::model::Rev`], DESIGN.md §6). The
+/// eval format carries no version tag: everything under `~/.cache/nix-npd` is
+/// re-derivable, so a change to the file format, the eval config (`EVAL_CONFIG`
+/// in `eval.rs`), or *how* `nix-eval-jobs` is invoked is invalidated by deleting
+/// the cache, not by coexisting versions (no migration code — see CLAUDE.md).
+pub fn eval_path(tree: &str, system: &str) -> Result<PathBuf> {
     Ok(cache_root()?
         .join("evals")
-        .join(format!("{commit}-{system}.tsv.zst")))
+        .join(format!("{tree}-{system}.tsv.zst")))
 }
 
 /// Write an eval to its file, sorted by attr, zstd-compressed, atomically: a
@@ -374,12 +376,15 @@ fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<Change
     Ok(out)
 }
 
-/// The changed set between two cached evals, streaming both eval files through
-/// [`merge_rows`]: each side is decompressed on its own thread
-/// ([`spawn_eval_decoder`]) and consumed line-by-line ([`LineCursor`]), so the
-/// two decompressions overlap each other *and* the merge.
-pub fn changed_set(base: &str, head: &str, system: &str) -> Result<Vec<ChangedAttr>> {
-    changed_set_files(&eval_path(base, system)?, &eval_path(head, system)?)
+/// The changed set between two cached evals (keyed by their git trees),
+/// streaming both eval files through [`merge_rows`]: each side is decompressed
+/// on its own thread ([`spawn_eval_decoder`]) and consumed line-by-line
+/// ([`LineCursor`]), so the two decompressions overlap each other *and* the merge.
+pub fn changed_set(base_tree: &str, head_tree: &str, system: &str) -> Result<Vec<ChangedAttr>> {
+    changed_set_files(
+        &eval_path(base_tree, system)?,
+        &eval_path(head_tree, system)?,
+    )
 }
 
 /// [`changed_set`] on explicit file paths (separable for tests).
