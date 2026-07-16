@@ -282,11 +282,11 @@ fn commit_source(repo: &std::path::Path, commit: String) -> Result<Rev> {
     })
 }
 
-/// The default head: `HEAD`, or — when the working tree has uncommitted edits to
-/// tracked files — the working tree itself, captured as a synthetic
-/// content-addressed commit ([`worktree_source`]). This is what lets `npd`
-/// review in-progress work; committing that work as-is later is a cache *hit*,
-/// since both resolve to the identical tree (see [`Rev`]).
+/// The default head: `HEAD`, or — when the working tree has uncommitted changes
+/// — the working tree itself, captured as a synthetic content-addressed commit
+/// ([`worktree_source`]). This is what lets `npd` review in-progress work;
+/// committing that work as-is later is a cache *hit*, since both resolve to the
+/// identical tree (see [`Rev`]).
 fn head_source(repo: &std::path::Path) -> Result<Rev> {
     let head = resolve_commit(repo, "HEAD")?;
     match worktree_source(repo, &head)? {
@@ -298,32 +298,31 @@ fn head_source(repo: &std::path::Path) -> Result<Rev> {
     }
 }
 
-/// Capture the working tree's tracked-file state as a [`Rev`], or `None` when it
-/// matches `head` (nothing uncommitted to review). The tree is built in a
-/// throwaway index seeded from `head` and updated to the working tree via
-/// `git add -u`, so **edits and deletions of tracked files are captured but new
-/// untracked files are not** (`git add` them to have npd see them). The tree
-/// hash is pure content — no timestamp — so an unchanged working tree yields the
-/// same key on every run (a warm cache hit). When it differs, a *deterministic*
-/// commit is minted over it for `fetchGit` (pinned identity + dates, so its sha
-/// too is stable across runs) and pinned under `refs/npd/worktree` so git won't
-/// GC the dangling object before the eval fetches it. Two commits with one tree
-/// fetch to the identical source path, so keying on the tree — not this commit —
-/// is what makes the whole thing cache correctly (DESIGN §6).
+/// Capture the working tree's uncommitted changes as a [`Rev`], or `None` when
+/// there are none. Uses `git stash create`, which snapshots edits/deletions to
+/// tracked files and staged-new files — but **not fully-untracked files** (`git
+/// add` them to have npd see them) — into a commit *without* disturbing the
+/// branch, index, or working tree, and crucially reuses git's real index stat
+/// cache, so a clean tree costs ~`git status` time (tens of ms on nixpkgs)
+/// rather than re-hashing every tracked file (~1.3 s). Its *tree* is pure
+/// content (no timestamp), so an unchanged working tree yields the same eval key
+/// on every run (a warm cache hit); over that tree npd mints its *own*
+/// deterministic commit for `fetchGit` — pinned identity + epoch dates + parent
+/// `head`, so its sha is stable across runs (the stash commit's own sha is not:
+/// it embeds the current time, which is exactly why we don't use it) — pinned
+/// under `refs/npd/worktree` so a `git gc` can't drop the dangling object before
+/// the eval fetches it. Two commits with one tree fetch to the identical source
+/// path, so keying on the tree — not this commit — is what makes it cache
+/// correctly (DESIGN §6).
 fn worktree_source(repo: &std::path::Path, head: &str) -> Result<Option<Rev>> {
-    let index_dir = tempfile::tempdir().context("creating a temp git index dir")?;
-    let index = index_dir.path().join("index");
-    let index_s = index.to_str().context("temp index path is not UTF-8")?;
-    let idx = [("GIT_INDEX_FILE", index_s)];
-    // Seed the throwaway index from HEAD, then stage the working tree's current
-    // content of tracked files (modifications + deletions).
-    git_env(repo, &idx, &["read-tree", head])?;
-    git_env(repo, &idx, &["add", "-u"])?;
-    let tree = git_env(repo, &idx, &["write-tree"])?;
-    if tree == tree_of(repo, head)? {
-        return Ok(None); // no uncommitted changes to tracked files
+    // `stash create` prints the stash commit's sha, or nothing when the tree is
+    // clean — either way it leaves the branch/index/working tree untouched.
+    let stash = git(repo, &["stash", "create"])?;
+    if stash.is_empty() {
+        return Ok(None); // nothing uncommitted to review
     }
-    // A fixed timestamp + identity make the commit sha a pure function of
+    let tree = tree_of(repo, &stash)?;
+    // A fixed identity + timestamp make the commit sha a pure function of
     // (tree, parent), so the same working tree reproduces it run to run.
     const EPOCH: &str = "1970-01-01T00:00:00Z";
     let ident = [
@@ -797,8 +796,8 @@ mod tests {
         assert_eq!(committed.tree, a.tree);
         assert_ne!(committed.commit, a.commit); // different commit, same tree
 
-        // Tree is clean again; a new *untracked* file is NOT captured (documented
-        // limitation of the `git add -u` capture).
+        // Tree is clean again; a fully-untracked file is NOT captured (documented
+        // limitation — `git stash create` excludes untracked files).
         let now = resolve_commit(d, "HEAD").unwrap();
         assert!(worktree_source(d, &now).unwrap().is_none());
         std::fs::write(d.join("untracked.txt"), "x\n").unwrap();

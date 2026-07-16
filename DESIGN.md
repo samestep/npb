@@ -275,17 +275,20 @@ only the path.
 
 **Reviewing the uncommitted working tree.** Because the key is a tree, an
 uncommitted working tree is reviewable like any revision: on the default head
-path (no explicit `head`), when the working tree has edits to tracked files, npd
-builds a tree from them — a throwaway index seeded from `HEAD` then `git add -u`
-(so tracked edits and deletions are captured; brand-new *untracked* files are
-not, a documented limitation) — and mints a **deterministic** synthetic commit
-over it (pinned identity + epoch dates, parent `HEAD`), pinned under
-`refs/npd/worktree` so a `git gc` can't drop the dangling object before
-`fetchGit` reads it (`worktree_source` in `src/main.rs`). The tree hash is pure
-content, so an unchanged working tree re-runs against the same cache entry, and
-committing it as-is hits that same entry (the real commit's tree equals the
-synthetic one). An explicit `head` is always taken literally — the working tree
-is used only on the default path.
+path (no explicit `head`), when the working tree has uncommitted changes, npd
+captures them with `git stash create` — which snapshots edits/deletions to
+tracked files and staged-new files (but *not* fully-untracked files, a
+documented limitation) into a commit without disturbing the branch/index/working
+tree, and reuses git's real index stat cache so a clean tree costs ~`git status`
+time rather than re-hashing every tracked file. Over that stash's *tree* npd
+mints its own **deterministic** synthetic commit (pinned identity + epoch dates,
+parent `HEAD` — the stash commit's own sha is timestamped, hence unstable, so it
+is not used), pinned under `refs/npd/worktree` so a `git gc` can't drop the
+dangling object before `fetchGit` reads it (`worktree_source` in `src/main.rs`).
+The tree hash is pure content, so an unchanged working tree re-runs against the
+same cache entry, and committing it as-is hits that same entry (the real commit's
+tree equals the synthetic one). An explicit `head` is always taken literally —
+the working tree is used only on the default path.
 
 Caching is sound because nixpkgs evaluation is deterministic given those inputs
 (drv paths are content-addressed by their inputs, stable across time and
