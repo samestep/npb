@@ -52,9 +52,12 @@ delta (regression / blocked-by-a-regression / newly-skipped / fixed / dropped /
 with a copy-pasteable `sh` command that reproduces its **exact** changeset on
 any machine — a pinned `--base` and a head whose tree is pinned, so a shared
 report is always re-runnable, never the ambiguous invocation the author typed. A
-committed head is just `--head <sha>`; a PR rebuilds its head tree from GitHub's
-`compare/<fork>...<head>.diff` (force-push proof, since nixpkgs PRs rebase
-constantly); an uncommitted working tree embeds its diff as a heredoc. Flags: `--retry`
+committed head is just `--head <sha>`; otherwise the head is rebuilt with
+`--patch` (below): a PR from GitHub's `compare/<fork>...<head>.diff` (force-push
+proof, since nixpkgs PRs rebase constantly), an uncommitted working tree from its
+diff embedded as a heredoc. Flags: `--patch` (review a diff — a local file, or a
+GitHub `A...B` compare expression npd fetches — applied on top of the head; this
+is what the reproduction commands use), `--retry`
 (re-attempt a known failure), `--no-tests` (skip each changed package's
 `passthru.tests`, built on both sides by default — ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),

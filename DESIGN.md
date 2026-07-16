@@ -477,8 +477,9 @@ The pair comes from one of three modes:
   release branch — whatever it is) and head = `merge^2` (the PR tip). This needs
   **no GitHub API and no token**: the refs come over anonymous git, unlike
   `nixpkgs-review`, which calls the REST API to learn the merge sha (and nags for
-  `GITHUB_TOKEN`/`gh`). `--pr` is the **one exception** to "no network when
-  cached" (§1): the merge ref is a *moving pointer* GitHub regenerates on a
+  `GITHUB_TOKEN`/`gh`). `--pr` is a deliberate exception to "no network when
+  cached" (§1) — as is a `--patch <A...B>` compare download (§8); every other
+  path is offline. The merge ref is a *moving pointer* GitHub regenerates on a
   rebase or base move, so npd re-fetches it every run and resolves the fresh
   pointer — a repeat `--pr` always reflects the current PR, never a stale
   snapshot. This doesn't defeat the caches that matter: an unchanged PR is a
@@ -640,36 +641,41 @@ tree is recovered on another machine:
 
 - a committed / explicit head is already a fetchable commit → `--head <sha>`;
 - otherwise (a `--pr` head or an uncommitted working tree) the head has no
-  durably-fetchable commit, so the command **rebuilds** it: apply a diff onto a
-  durable anchor commit in a throwaway index and `git commit-tree` the result —
-  exactly what the live working-tree capture does internally (§6). The rebuilt
-  commit's *sha* differs from the original, but its *tree* is identical, which is
-  all a tree-keyed eval needs; so npd grows **no** `--patch` flag (the whole
-  reconstruction is emitted shell) and we never depend on an ephemeral sha.
-  The one difference between the two is the diff's source:
-  - **`--pr`**: `curl` GitHub's `compare/<fork>...<head>.diff` (`fork` = the PR's
-    merge-base — a durable base-branch commit) and apply it onto `fork`. This is
-    **force-push proof**, which matters because nixpkgs PRs rebase constantly:
-    GitHub retains a PR's commits by sha in its fork network, so the pinned
-    compare URL resolves even after the branch has moved. It is also why we
-    *don't* just `git fetch refs/pull/N/head` (that ref tracks the *current* tip,
-    so the reviewed sha vanishes on a force-push) and why we don't try to
-    recreate the exact commit from a `*.patch` (`git am` can't — a patch carries
-    no committer identity/date or parent, so the sha would differ anyway; the
-    tree is what we actually need). One download covers a multi-commit PR (it's a
-    net diff, not per-commit patches). `curl -f` and an `&&` chain keep it
-    conservative: any failure — an unreachable sha, or a binary change GitHub's
-    text `.diff` can't carry — stops before npd runs, rather than reviewing the
-    wrong tree. (npd re-mints the merge from `--base merge^1` and the rebuilt
-    head, so base drift is still reflected exactly as in the original review.)
-  - **working tree**: its content is local and unpushable, so the command embeds
-    the captured diff in a heredoc and applies it onto the pinned `HEAD`.
-    (Fully-untracked files are excluded, the same `git stash create` limitation
-    the live capture has — §6.)
+  durably-fetchable commit, so it is **rebuilt** by `--patch`: npd applies a diff
+  onto the resolved head (`--head`, else `HEAD`) in a throwaway index and
+  `git commit-tree`s the result — the same reconstruction the live working-tree
+  capture does internally (§6). The rebuilt commit's *sha* differs from the
+  original, but its *tree* is identical, which is all a tree-keyed eval needs, so
+  we never depend on an ephemeral sha. `--patch` takes one of two diff sources
+  (disambiguated by Nix path syntax — a `/` means a path, else a compare
+  expression):
+  - **`--pr`** → `--head <fork> --patch <fork>...<head>`, a GitHub compare
+    expression npd downloads (via its own `ureq`, no `curl`) as
+    `compare/<fork>...<head>.diff` and applies onto the fork. `fork` is the PR's
+    merge-base, a durable base-branch commit. This is **force-push proof**, which
+    matters because nixpkgs PRs rebase constantly: GitHub retains a PR's commits
+    by sha in its fork network, so the pinned compare resolves even after the
+    branch has moved. It is why we *don't* `git fetch refs/pull/N/head` (that ref
+    tracks the *current* tip, so the reviewed sha vanishes on a force-push) and
+    why we don't try to recreate the exact commit from a `*.patch` (`git am`
+    can't — a patch carries no committer identity/date or parent, so the sha
+    differs anyway; the tree is what we need). One download covers a multi-commit
+    PR (a net diff, not per-commit patches). A fetch failure — an unreachable
+    sha, or a binary change GitHub's text `.diff` can't carry — is fatal, rather
+    than a silent mis-review. (npd re-mints the merge from `--base merge^1` and
+    the rebuilt head, so base drift is still reflected exactly as in the review.)
+  - **working tree** → `--head <HEAD> --patch <path>`, where the local, unpushable
+    diff rides along in the report: a heredoc writes it to a temp file that
+    `--patch` reads. (Fully-untracked files are excluded, the same
+    `git stash create` limitation the live capture has — §6.)
 
-The rebuild is deliberately kept in the *emitted command*, not in npd: npd stays
-offline-pure except for its one `--pr` network exception (§6), and the fragile
-parts (a network fetch, walking a PR's commits) never enter the binary.
+Making `--patch` a real flag (rather than emitting the throwaway-index/`apply`/
+`commit-tree` dance as shell) keeps the commands to a single `npd` call with no
+external binary, and `--patch` is independently useful — "review a diff, or a
+GitHub compare range, on top of a base." Its compare form is a deliberate
+network fetch, so npd's network use is now: narinfo probes (§7), the `--pr` ref
+fetch, and a `--patch <A...B>` download — all explicit; the path form and every
+other flag stay offline.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
