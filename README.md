@@ -55,7 +55,7 @@ report is always re-runnable, never the ambiguous invocation the author typed. A
 committed head is just `--head <sha>`; otherwise the head is rebuilt with
 `--patch` (below): a PR from GitHub's `compare/<fork>...<head>.diff` (force-push
 proof, since nixpkgs PRs rebase constantly), an uncommitted working tree from its
-diff embedded as a heredoc. Flags: `--patch` (review a diff — a local file, or a
+diff piped in as a heredoc (`--patch /dev/stdin`). Flags: `--patch` (review a diff — a local file, or a
 GitHub `A...B` compare expression npd fetches — applied on top of the head; this
 is what the reproduction commands use), `--retry`
 (re-attempt a known failure), `--no-tests` (skip each changed package's

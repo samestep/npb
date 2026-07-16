@@ -684,12 +684,11 @@ fn repro_command(
             } else {
                 format!("{diff}\n")
             };
-            // A heredoc into a temp file, then `--patch` reads it (npd applies it
-            // internally). `<<'PATCH'` blocks interpolation; a diff body line
-            // always has a `+`/`-`/space prefix, so a bare `PATCH` can't occur.
+            // A heredoc straight into `--patch /dev/stdin` (just a path npd reads,
+            // no `-` special case). `<<'PATCH'` blocks interpolation; a diff body
+            // line always has a `+`/`-`/space prefix, so a bare `PATCH` can't occur.
             format!(
-                "p=\"$(mktemp)\"\ncat > \"$p\" <<'PATCH'\n{diff}PATCH\n\
-                 npd --base {base_sha} --head {anchor} --patch \"$p\"{flags}"
+                "npd --base {base_sha} --head {anchor} --patch /dev/stdin{flags} <<'PATCH'\n{diff}PATCH"
             )
         }
     }
@@ -1280,7 +1279,7 @@ mod tests {
         );
         assert_eq!(cmd, "npd --base m1 --head fork --patch fork...m2 -s sys");
 
-        // Embed (working tree): a heredoc to a temp file, then --patch reads it.
+        // Embed (working tree): a heredoc straight into `--patch /dev/stdin`.
         let cmd = repro_command(
             "b",
             &HeadRepro::Embed {
@@ -1294,8 +1293,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "p=\"$(mktemp)\"\ncat > \"$p\" <<'PATCH'\n--- a\n+++ b\nPATCH\n\
-             npd --base b --head h --patch \"$p\" -s sys"
+            "npd --base b --head h --patch /dev/stdin -s sys <<'PATCH'\n--- a\n+++ b\nPATCH"
         );
     }
 

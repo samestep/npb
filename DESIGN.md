@@ -664,10 +664,11 @@ tree is recovered on another machine:
     sha, or a binary change GitHub's text `.diff` can't carry — is fatal, rather
     than a silent mis-review. (npd re-mints the merge from `--base merge^1` and
     the rebuilt head, so base drift is still reflected exactly as in the review.)
-  - **working tree** → `--head <HEAD> --patch <path>`, where the local, unpushable
-    diff rides along in the report: a heredoc writes it to a temp file that
-    `--patch` reads. (Fully-untracked files are excluded, the same
-    `git stash create` limitation the live capture has — §6.)
+  - **working tree** → `--head <HEAD> --patch /dev/stdin`, where the local,
+    unpushable diff rides along in the report as a heredoc piped straight in
+    (`/dev/stdin` is just a path npd reads — no `-` special case). (Fully-untracked
+    files are excluded, the same `git stash create` limitation the live capture
+    has — §6.)
 
 Making `--patch` a real flag (rather than emitting the throwaway-index/`apply`/
 `commit-tree` dance as shell) keeps the commands to a single `npd` call with no
