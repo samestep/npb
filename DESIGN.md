@@ -677,11 +677,32 @@ tree is recovered on another machine:
     sha, or a binary change GitHub's text `.diff` can't carry — is fatal, rather
     than a silent mis-review. (npd re-mints the merge from `--base merge^1` and
     the rebuilt head, so base drift is still reflected exactly as in the review.)
-  - **working tree** → `--head <HEAD> --patch /dev/stdin`, where the local,
-    unpushable diff rides along in the report as a heredoc piped straight in
-    (`/dev/stdin` is just a path npd reads — no `-` special case). (Fully-untracked
-    files are excluded, the same `git stash create` limitation the live capture
-    has — §6.)
+  - **a compare `--patch A...B`** → `--head <sha> --patch <shaA>...<shaB>`, the
+    same compare form, but with both endpoints resolved to shas *in the local
+    clone* (`pin_compare`) before either the review's download or the repro is
+    formed. A raw `A...B` echoed into the repro would name whatever `A`/`B` are
+    (e.g. `<sha>...master`), and re-fetching `compare/A...B.diff` later resolves
+    them against the *current* tips — a different diff, applied onto the same
+    pinned anchor, silently reviewing a different tree while still exiting zero.
+    Pinning both sides keeps the compare compact and re-fetchable yet immutable.
+    (Resolving the endpoints locally means they must exist in the clone — and,
+    being shas, on GitHub; a name the clone lacks is a hard error, not a drift.)
+  - **working tree, or a file `--patch <path>`** → `--head <sha> --patch /dev/stdin`,
+    where the diff has no durable re-fetchable identity (a local, unpushable
+    working tree, or a diff file that won't exist elsewhere), so it rides along in
+    the report as a heredoc piped straight in (`/dev/stdin` is just a path npd
+    reads — no `-` special case). (For the working tree, fully-untracked files are
+    excluded, the same `git stash create` limitation the live capture has — §6.)
+
+**Resolve mutable refs once.** A branch or `HEAD` can move mid-run, so npd
+resolves each such ref to an immutable sha exactly once and thereafter passes only
+that sha: the `--patch` anchor is resolved a single time, up front, then reused
+for both the head it builds and the anchor it prints, and a compare's two
+endpoints are pinned once (above) and reused for both the download and the repro.
+Re-resolving the *same* ref a second time would reintroduce this class of bug: the
+head reviewed and the identity printed could disagree. A full sha re-checked
+downstream is harmless — it is content-addressed and cannot resolve to anything
+else.
 
 Making `--patch` a real flag (rather than emitting the throwaway-index/`apply`/
 `commit-tree` dance as shell) keeps the commands to a single `npd` call with no

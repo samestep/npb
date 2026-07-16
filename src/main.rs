@@ -455,6 +455,24 @@ fn fetch_compare_diff(expr: &str) -> Result<String> {
         .with_context(|| format!("reading the diff from {url}"))
 }
 
+/// Pin a compare expression `A...B` to `<shaA>...<shaB>` by resolving *both*
+/// endpoints in the local clone (each `resolve_commit`ed exactly once). The
+/// resulting immutable expression is what npd hands GitHub — for this review's
+/// download *and* for the reproduction command — so re-fetching it later returns
+/// the identical diff no matter how `A`/`B` have moved since. The `...`
+/// (merge-base) form is preserved: GitHub still diffs `merge-base(shaA, shaB)`
+/// against `shaB`, just against fixed commits. Endpoints must therefore resolve
+/// locally (and, being shas, exist on GitHub); a name the clone lacks is a hard
+/// error here rather than a silently-drifting review later.
+fn pin_compare(repo: &std::path::Path, expr: &str) -> Result<String> {
+    let (a, b) = expr
+        .split_once("...")
+        .with_context(|| format!("compare expression must be `A...B`; got {expr:?}"))?;
+    let a = resolve_commit(repo, a)?;
+    let b = resolve_commit(repo, b)?;
+    Ok(format!("{a}...{b}"))
+}
+
 /// Resolve a revision (ref, short/full sha, tag, `HEAD~1`, …) to a full commit
 /// sha, so callers can use friendly names even though `fetchGit` needs a rev.
 fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
@@ -627,12 +645,17 @@ enum HeadRepro {
     Commit(String),
     /// Rebuild the head by applying a GitHub compare diff onto `anchor`:
     /// `--head <anchor> --patch <A...B>`. npd downloads `compare/A...B.diff` and
-    /// applies it — force-push proof, since GitHub retains a PR's commits by sha
-    /// in its fork network, so the pinned compare resolves even after a rebase.
+    /// applies it — force-push proof, since GitHub retains commits by sha in its
+    /// fork network, so a pinned compare resolves even after a rebase. `expr` is
+    /// always sha-pinned (`<shaA>...<shaB>`): `--pr` builds it from the PR's
+    /// resolved endpoints, and a `--patch A...B` review pins both endpoints
+    /// locally via `pin_compare` — so re-fetching it can never drift.
     Compare { anchor: String, expr: String },
-    /// Rebuild the head by applying an embedded `diff` onto `anchor` — for a
-    /// working tree, whose content is local and unpushable, so it must ride along
-    /// in the report. Written to a temp file, then `--head <anchor> --patch`.
+    /// Rebuild the head by applying an embedded `diff` onto `anchor`:
+    /// `--head <anchor> --patch /dev/stdin <<'PATCH' … PATCH`. For a diff with no
+    /// durable re-fetchable identity — an uncommitted working tree, or a
+    /// `--patch <file>` review — so the exact diff rides along in the report and
+    /// reproduces byte-for-byte offline.
     Embed { anchor: String, diff: String },
 }
 
@@ -712,17 +735,46 @@ fn run(cli: Cli) -> Result<()> {
     // download (`A...B`) — so `resolve_local` can build the synthetic head and
     // the reproduction command can re-emit it. Disambiguated as Nix path syntax:
     // a `/` means a path, otherwise a compare expression.
+    //
+    // For a compare, `pin_compare` resolves *both* endpoints in the local clone
+    // to shas *once*, and that immutable `<shaA>...<shaB>` drives both this
+    // download and the reproduction command. A raw `A...B` echoed into the repro
+    // would re-resolve against GitHub's *current* tips on reproduction, so a
+    // moved branch could hand back a different diff — a different tree, reviewed
+    // silently at exit zero. `patch_compare` is the pinned expression (compare
+    // form only); the repro echoes it rather than re-deriving it.
+    let mut patch_compare: Option<String> = None;
     let patch_diff: Option<String> = match &cli.patch {
         None => None,
         Some(value) if value.contains('/') => Some(
             std::fs::read_to_string(value)
                 .with_context(|| format!("reading the --patch file {value}"))?,
         ),
-        Some(value) if value.contains("...") => Some(fetch_compare_diff(value)?),
+        Some(value) if value.contains("...") => {
+            let expr = pin_compare(&repo, value)?;
+            let diff = fetch_compare_diff(&expr)?;
+            patch_compare = Some(expr);
+            Some(diff)
+        }
         Some(value) => bail!(
             "--patch must be a path (containing a `/`, e.g. `./x.diff`) or a \
              compare expression `A...B`; got {value:?}"
         ),
+    };
+
+    // Resolve the --patch anchor (`--head`, else `HEAD`) to an immutable sha
+    // *once*, here, and thread that sha everywhere the run needs it (building the
+    // head, and the reproduction command). Resolving a mutable ref more than once
+    // in a single run risks it moving between lookups — the head we review and
+    // the anchor we later print could then disagree. A full sha, by contrast, is
+    // content-addressed: `resolve_commit` on it downstream is idempotent, so it
+    // can never diverge.
+    let patch_anchor: Option<String> = match &cli.patch {
+        Some(_) => Some(resolve_commit(
+            &repo,
+            cli.head.as_deref().unwrap_or("HEAD"),
+        )?),
+        None => None,
     };
 
     let (base, head) = match cli.pr {
@@ -730,7 +782,9 @@ fn run(cli: Cli) -> Result<()> {
         None => resolve_local(
             &repo,
             cli.base,
-            cli.head.clone(),
+            // For a --patch run the head arg *is* the anchor; pass the sha we
+            // already resolved so patch_source and the repro share one lookup.
+            patch_anchor.clone().or_else(|| cli.head.clone()),
             cli.no_merge,
             patch_diff.as_deref(),
         )?,
@@ -900,24 +954,26 @@ fn run(cli: Cli) -> Result<()> {
                 anchor: fork,
             },
         )
-    } else if let Some(value) = &cli.patch {
-        // Reproducing a --patch run: echo a compare expression, or re-embed a
-        // local diff (whose file won't exist elsewhere). Applied onto the same
-        // anchor (`--head`, else HEAD).
-        let anchor = resolve_commit(&repo, cli.head.as_deref().unwrap_or("HEAD"))?;
-        let display = format!("{anchor}\\*");
-        let repro = if value.contains('/') {
+    } else if let Some(expr) = patch_compare {
+        // Reproducing a compare `--patch A...B`: re-emit the sha-pinned compare
+        // npd downloaded (`pin_compare` resolved both endpoints once, locally),
+        // applied onto the pre-resolved anchor. Both endpoints are immutable, so
+        // re-fetching it returns the identical diff — no re-resolution, and no
+        // embedded diff to bloat the report.
+        let anchor = patch_anchor.expect("a --patch run resolves its anchor above");
+        (format!("{anchor}\\*"), HeadRepro::Compare { anchor, expr })
+    } else if cli.patch.is_some() {
+        // Reproducing a file `--patch <path>`: the diff is a local file that
+        // won't exist elsewhere, so it rides along in the report, applied onto
+        // the pre-resolved anchor.
+        let anchor = patch_anchor.expect("a --patch run resolves its anchor above");
+        (
+            format!("{anchor}\\*"),
             HeadRepro::Embed {
                 anchor,
                 diff: patch_diff.unwrap_or_default(),
-            }
-        } else {
-            HeadRepro::Compare {
-                anchor,
-                expr: value.clone(),
-            }
-        };
-        (display, repro)
+            },
+        )
     } else if head.label == "worktree" {
         // A live uncommitted working tree: embed its captured diff, shown as
         // HEAD with the `\*` diff marker.
@@ -1378,5 +1434,39 @@ mod tests {
         let real_merge = g(d, &["merge-tree", "--write-tree", &m1, &m2]);
         let repro_merge = g(d, &["merge-tree", "--write-tree", &m1, &rebuilt.commit]);
         assert_eq!(real_merge, repro_merge);
+    }
+
+    #[test]
+    fn pin_compare_pins_both_endpoints_locally() {
+        // A compare `A...B` must be pinned to `<shaA>...<shaB>` against the local
+        // clone, so the expression handed to GitHub — for the download *and* the
+        // repro — is immutable and can't drift when `A`/`B` later move.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("f.txt"), "one\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "a"]);
+        let a = resolve_commit(d, "HEAD").unwrap();
+        std::fs::write(d.join("f.txt"), "two\n").unwrap();
+        g(d, &["commit", "-am", "b"]);
+        let b = resolve_commit(d, "HEAD").unwrap();
+
+        // A branch endpoint pins to the sha it currently names; a sha endpoint
+        // passes through (resolving a full sha is idempotent).
+        assert_eq!(
+            pin_compare(d, &format!("{a}...master")).unwrap(),
+            format!("{a}...{b}")
+        );
+        assert_eq!(
+            pin_compare(d, &format!("{a}...{b}")).unwrap(),
+            format!("{a}...{b}")
+        );
+        // A malformed expression and an unresolvable endpoint are hard errors,
+        // not a silently-mispinned compare.
+        assert!(pin_compare(d, "only-one-side").is_err());
+        assert!(pin_compare(d, &format!("{a}...no-such-ref")).is_err());
     }
 }
