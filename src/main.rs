@@ -49,10 +49,6 @@ struct Cli {
     /// resolves them offline.
     #[arg(long, value_name = "N")]
     pr: Option<u64>,
-    /// With --pr: re-fetch the PR's refs even if already cached locally (to
-    /// pick up a rebased PR or a base branch that has moved since last run).
-    #[arg(long, requires = "pr")]
-    refetch: bool,
     /// Diff from the merge-base of base and head, instead of the default —
     /// building a synthetic merge of the head onto the base and diffing the
     /// base against that. The merge-base shape ignores drift on the base since
@@ -63,18 +59,9 @@ struct Cli {
     /// Systems to report on (repeatable); defaults to the host system.
     #[arg(short, long)]
     system: Vec<String>,
-    /// Don't build; render only from facts already in the log (may show `❓`).
-    #[arg(long)]
-    no_build: bool,
-    /// Rebuild even a previously-succeeded drv (suspect a flaky success).
-    #[arg(long)]
-    recheck: bool,
     /// Re-attempt a previously-failed drv (expect it might pass now).
     #[arg(long)]
     retry: bool,
-    /// Ignore a substitutable (cached) success; require a genuine local build.
-    #[arg(long)]
-    prefer_local: bool,
     /// Skip each changed package's `passthru.tests`. By default npd also
     /// evaluates and builds those tests (on both sides), classifying each
     /// test's `base → head` delta like any other attr — the behaviour ported
@@ -86,9 +73,6 @@ struct Cli {
     /// nixpkgs-review's "skipped").
     #[arg(long)]
     no_skip: bool,
-    /// Everything on: implies --no-skip (tests are on by default).
-    #[arg(long)]
-    max: bool,
     /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
     /// cores and total RAM (see `eval::eval_slots`).
     #[command(flatten)]
@@ -188,14 +172,9 @@ fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<b
 }
 
 /// Ensure PR #`pr`'s `ref_name` is present in `repo`, fetching from `upstream`
-/// when it is absent (or always, when `refetch`). Returns whether it exists.
-fn ensure_pr_ref(
-    repo: &std::path::Path,
-    upstream: &str,
-    ref_name: &str,
-    refetch: bool,
-) -> Result<bool> {
-    if !refetch && have_commit(repo, ref_name) {
+/// when it is absent. Returns whether it exists.
+fn ensure_pr_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<bool> {
+    if have_commit(repo, ref_name) {
         return Ok(true);
     }
     fetch_ref(repo, upstream, ref_name)
@@ -222,12 +201,11 @@ fn resolve_pr(
     repo: &std::path::Path,
     upstream: &str,
     pr: u64,
-    refetch: bool,
     no_merge: bool,
 ) -> Result<(Rev, Rev)> {
     let head_ref = format!("refs/pull/{pr}/head");
     let merge_ref = format!("refs/pull/{pr}/merge");
-    let have_merge = ensure_pr_ref(repo, upstream, &merge_ref, refetch)?;
+    let have_merge = ensure_pr_ref(repo, upstream, &merge_ref)?;
 
     if no_merge {
         // Fork-point shape: merge-base(base-branch tip, PR head) → PR head. With
@@ -240,7 +218,7 @@ fn resolve_pr(
                 resolve_commit(repo, &format!("{merge_ref}^2"))?,
             )
         } else {
-            if !ensure_pr_ref(repo, upstream, &head_ref, refetch)? {
+            if !ensure_pr_ref(repo, upstream, &head_ref)? {
                 bail!("PR #{pr} not found on {upstream}");
             }
             (
@@ -554,19 +532,17 @@ fn assemble_targets(
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // Tests run by default; --no-tests opts out. --max is "everything on".
+    // Tests run by default; --no-tests opts out.
     let tests = !cli.no_tests;
-    let no_skip = cli.no_skip || cli.max;
+    let no_skip = cli.no_skip;
     let policy = BuildPolicy {
-        recheck: cli.recheck,
         retry: cli.retry,
-        prefer_local: cli.prefer_local,
         no_skip,
     };
     let opts = cli.eval;
     let repo = resolve_repo(cli.path)?;
     let (base, head) = match cli.pr {
-        Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.refetch, cli.no_merge)?,
+        Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.no_merge)?,
         None => resolve_local(&repo, cli.base, cli.head, cli.no_merge)?,
     };
     let systems = resolve_systems(cli.system);
@@ -653,44 +629,42 @@ fn run(cli: Cli) -> Result<()> {
 
     // Build both sides of the changed set (skipping anything already known,
     // substitutable, or meta-blocked) so the report has a real state for every
-    // row, not a `❓`.
-    if !cli.no_build {
-        let targets = assemble_targets(&per_system_changed);
+    // row.
+    let targets = assemble_targets(&per_system_changed);
 
-        // The evals ran with --no-instantiate (no `.drv` writes for the ~114k
-        // attrs npd never builds), so materialize the changed set's `.drv`s now —
-        // the narinfo probe and the build both read them from the store. But only
-        // for drvs the build phase will actually touch: a drv already known
-        // built/substitutable/failing is decided from the log alone, so writing
-        // its `.drv` is pure waste. When *every* changed drv is already known (the
-        // warm-cache iterative loop npd is built for), this set is empty and the
-        // whole instantiation eval is skipped — the couple of seconds that
-        // otherwise made a fully-cached run non-instant (DESIGN.md §5–§6).
-        let need = build::drvs_to_materialize(&targets, policy)?;
-        let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
-        for (sys, changed) in &per_system_changed {
-            let mut base_attrs = Vec::new();
-            let mut head_attrs = Vec::new();
-            for c in changed {
-                let wants = |drv: &Option<String>, skipped: bool| {
-                    drv.as_ref()
-                        .is_some_and(|d| (no_skip || !skipped) && need.contains(d))
-                };
-                if wants(&c.base_drv, c.base_skipped) {
-                    base_attrs.push(c.attr.clone());
-                }
-                if wants(&c.head_drv, c.head_skipped) {
-                    head_attrs.push(c.attr.clone());
-                }
+    // The evals ran with --no-instantiate (no `.drv` writes for the ~114k
+    // attrs npd never builds), so materialize the changed set's `.drv`s now —
+    // the narinfo probe and the build both read them from the store. But only
+    // for drvs the build phase will actually touch: a drv already known
+    // built/substitutable/failing is decided from the log alone, so writing
+    // its `.drv` is pure waste. When *every* changed drv is already known (the
+    // warm-cache iterative loop npd is built for), this set is empty and the
+    // whole instantiation eval is skipped — the couple of seconds that
+    // otherwise made a fully-cached run non-instant (DESIGN.md §5–§6).
+    let need = build::drvs_to_materialize(&targets, policy)?;
+    let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
+    for (sys, changed) in &per_system_changed {
+        let mut base_attrs = Vec::new();
+        let mut head_attrs = Vec::new();
+        for c in changed {
+            let wants = |drv: &Option<String>, skipped: bool| {
+                drv.as_ref()
+                    .is_some_and(|d| (no_skip || !skipped) && need.contains(d))
+            };
+            if wants(&c.base_drv, c.base_skipped) {
+                base_attrs.push(c.attr.clone());
             }
-            inst.push((base.clone(), sys.clone(), base_attrs));
-            inst.push((head.clone(), sys.clone(), head_attrs));
+            if wants(&c.head_drv, c.head_skipped) {
+                head_attrs.push(c.attr.clone());
+            }
         }
-        eval::instantiate(&repo, &inst)?;
+        inst.push((base.clone(), sys.clone(), base_attrs));
+        inst.push((head.clone(), sys.clone(), head_attrs));
+    }
+    eval::instantiate(&repo, &inst)?;
 
-        if !targets.is_empty() {
-            build::build_targets(&targets, policy)?;
-        }
+    if !targets.is_empty() {
+        build::build_targets(&targets, policy)?;
     }
 
     // Render from the (now-populated) log: reduce each side to a state.
@@ -841,17 +815,17 @@ mod tests {
         let upstream = up.path().to_str().unwrap();
         // Merge shape (default): reuse GitHub's merge. base = merge^1 (master
         // tip B), head = merge (M), whose label is the PR tip merge^2 (C).
-        let (base, head) = resolve_pr(local.path(), upstream, 1, false, false).unwrap();
+        let (base, head) = resolve_pr(local.path(), upstream, 1, false).unwrap();
         assert_eq!(base.commit, s["b"]);
         assert_eq!(head.commit, s["m"]);
         assert_eq!(head.label, s["c"]);
         // --no-merge shape: fork point on the PR's real base branch —
         // merge-base(merge^1 = B, PR tip = C) = A, and head = the PR tip C.
-        let (nb, nh) = resolve_pr(local.path(), upstream, 1, false, true).unwrap();
+        let (nb, nh) = resolve_pr(local.path(), upstream, 1, true).unwrap();
         assert_eq!(nb.commit, s["a"]);
         assert_eq!(nh.commit, s["c"]);
         // Second call is offline (ref now cached) and resolves identically.
-        let (base2, head2) = resolve_pr(local.path(), "file:///does/not/exist", 1, false, false)
+        let (base2, head2) = resolve_pr(local.path(), "file:///does/not/exist", 1, false)
             .expect("cached ref should resolve without touching upstream");
         assert_eq!(
             (base2.commit, head2.commit),
@@ -871,13 +845,13 @@ mod tests {
             .unwrap();
         let upstream = up.path().to_str().unwrap();
         // No merge ref → the merge shape can't apply; a clear error → --no-merge.
-        let err = resolve_pr(local.path(), upstream, 2, false, false).unwrap_err();
+        let err = resolve_pr(local.path(), upstream, 2, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not mergeable"), "{msg}");
         assert!(msg.contains("--no-merge"), "{msg}");
         // --no-merge falls back to the fork point with master: head = PR head
         // (D), base = merge-base(master = B, D) = A.
-        let (base, head) = resolve_pr(local.path(), upstream, 2, false, true).unwrap();
+        let (base, head) = resolve_pr(local.path(), upstream, 2, true).unwrap();
         assert_eq!(head.commit, s["d"]);
         assert_eq!(base.commit, s["a"]);
     }
@@ -1012,8 +986,7 @@ mod tests {
             .arg(local.path())
             .status()
             .unwrap();
-        let err =
-            resolve_pr(local.path(), up.path().to_str().unwrap(), 99, false, false).unwrap_err();
+        let err = resolve_pr(local.path(), up.path().to_str().unwrap(), 99, false).unwrap_err();
         assert!(format!("{err}").contains("not found"), "{err}");
     }
 

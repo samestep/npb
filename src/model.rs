@@ -146,12 +146,8 @@ pub enum Decision {
 /// plus whether the output is substitutable.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BuildPolicy {
-    /// Rebuild even a previously-succeeded drv (suspect a flaky success).
-    pub recheck: bool,
     /// Re-attempt a previously-failed drv (expect it might pass now).
     pub retry: bool,
-    /// Ignore a substitutable (cached) success; require a genuine local build.
-    pub prefer_local: bool,
     /// Build the packages npd would otherwise skip for being meta-blocked
     /// (broken/unsupported/insecure) — off by default, like nixpkgs-review.
     pub no_skip: bool,
@@ -199,11 +195,11 @@ impl BuildPolicy {
                 Decision::Skipped
             };
         }
-        // A trusted success short-circuits unless we're deliberately re-checking.
-        if local_built && !self.recheck {
+        // A trusted success short-circuits.
+        if local_built {
             return Decision::SkipOk;
         }
-        if substitutable && !self.prefer_local && !self.recheck {
+        if substitutable {
             return Decision::SkipOk;
         }
         // A known-failing derivation is not worth re-running unless asked. A
@@ -244,30 +240,20 @@ mod tests {
     }
 
     #[test]
-    fn substitutable_skips_unless_prefer_local() {
+    fn substitutable_skips() {
         assert_eq!(
             BuildPolicy::default().decide(&[], true, false, false),
             Decision::SkipOk
         );
-        let p = BuildPolicy {
-            prefer_local: true,
-            ..Default::default()
-        };
-        assert_eq!(p.decide(&[], true, false, false), Decision::Build);
     }
 
     #[test]
-    fn local_success_skips_unless_recheck() {
+    fn local_success_skips() {
         let o = [obs(Source::Local, Outcome::Built)];
         assert_eq!(
             BuildPolicy::default().decide(&o, false, false, false),
             Decision::SkipOk
         );
-        let p = BuildPolicy {
-            recheck: true,
-            ..Default::default()
-        };
-        assert_eq!(p.decide(&o, false, false, false), Decision::Build);
     }
 
     #[test]
@@ -346,7 +332,7 @@ mod tests {
     #[test]
     fn skipped_stays_skipped_unless_no_skip() {
         // Meta-blocked: never attempted by default — not even when
-        // substitutable, and not under --retry/--recheck alone.
+        // substitutable, and not under --retry alone.
         let p = BuildPolicy::default();
         assert_eq!(p.decide(&[], false, true, false), Decision::Skipped);
         assert_eq!(p.decide(&[], true, true, false), Decision::Skipped);
@@ -358,11 +344,6 @@ mod tests {
             retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true, false),
             Decision::Skipped
         );
-        let recheck = BuildPolicy {
-            recheck: true,
-            ..Default::default()
-        };
-        assert_eq!(recheck.decide(&[], false, true, false), Decision::Skipped);
 
         // A prior forced build's success is still a trusted fact.
         let o = [obs(Source::Local, Outcome::Built)];

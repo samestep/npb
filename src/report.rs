@@ -28,7 +28,10 @@ pub enum State {
     Skipped,
     /// No derivation on this side (the attr doesn't exist there).
     Absent,
-    /// Has a derivation but no build fact yet (only reachable with `--no-build`).
+    /// Has a derivation but no build fact yet. Builds always run, so this is
+    /// only the build phase's accepted gap (§5): a target nix never reached,
+    /// with nothing verifiably failing in its closure, left unrecorded to be
+    /// re-attempted next run.
     Unknown,
 }
 
@@ -169,8 +172,8 @@ fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
         (Absent, Built) => (25, "new package", "new here, build"),
         (Unknown, Built) => (26, "built package", "build here; base status unknown"),
         (Built, Built) => (27, "unchanged package", "build on the base and here"),
-        // A head-side Unknown is only reachable with --no-build (§8): the drv
-        // exists but nothing has been built or probed yet.
+        // A head-side Unknown means the build phase left this drv unrecorded
+        // (§5's accepted gap): the drv exists but has no fact yet.
         (Built, Unknown) => (28, "unbuilt package", "build on the base; no fact here yet"),
         (Failed, Unknown) => (29, "unbuilt package", "fail on the base; no fact here yet"),
         (Blocked, Unknown) => (

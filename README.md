@@ -48,13 +48,11 @@ skipping anything already known, substitutable, or meta-blocked
 (broken/unsupported/insecure) — the last reported as ⏩ **skipped**, npd's name
 for what nixpkgs-review skips), then groups the result by its `before → after`
 delta (regression / blocked-by-a-regression / newly-skipped / fixed / dropped /
-…), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
-(render from existing facts only), `--recheck` / `--retry` / `--prefer-local`
-(build-policy knobs), `--no-tests` (skip each changed package's
+…), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--retry`
+(re-attempt a known failure), `--no-tests` (skip each changed package's
 `passthru.tests`, built on both sides by default — ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),
-`--no-skip` (build the meta-blocked packages npd otherwise skips), `--max`
-(everything on: implies `--no-skip`; tests are on by default),
+`--no-skip` (build the meta-blocked packages npd otherwise skips),
 `--system` (repeatable), `--nixpkgs`, and sizing knobs for the parallel
 evaluator (`--eval-slots`, `--worker-mem-mb`). Under the hood: evals cached
 as flat per-commit files (diffed by a streaming linear merge), a tiny SQLite

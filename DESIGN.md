@@ -163,11 +163,11 @@ over that log plus substituter presence:
 
 - meta-blocked (broken/unsupported/insecure), `--no-skip` off → **skipped**
   — never attempted, like nixpkgs-review; the report shows ⏩. (Checked first,
-  so `--retry`/`--recheck` alone don't build it; a real fact recorded by an
-  earlier `--no-skip` run still wins.)
+  so `--retry` alone doesn't build it; a real fact recorded by an earlier
+  `--no-skip` run still wins.)
 - never observed, or forced → **build**
-- a `LOCAL` success exists, `--recheck` off → **skip (ok)**
-- substitutable success, `--prefer-local`/`--recheck` off → **skip (ok)**
+- a `LOCAL` success exists → **skip (ok)**
+- substitutable success → **skip (ok)**
 - only failures observed, `--retry` off → **skip (fail)**
 - otherwise → **build**
 
@@ -176,12 +176,10 @@ meta-blocked subset; a *missing* attr is a separate state, ➖ absent. The
 cache-skips above — `skip (ok)`/`skip (fail)` — are not that state: they still
 render as the real built/failed outcome.)
 
-So the cache-bypass knobs are just fields on the policy: `recheck` (rebuild a
-suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
-(don't trust a substituted success — build it here), `no_skip` (build the
-meta-blocked packages npd otherwise skips). See `BuildPolicy::decide` in
-`src/model.rs`. `--max` at the CLI is simply everything on: `--no-skip` (tests
-run by default; `--no-tests` opts out).
+So the cache-bypass knobs are just fields on the policy: `retry` (re-attempt a
+known failure) and `no_skip` (build the meta-blocked packages npd otherwise
+skips). See `BuildPolicy::decide` in `src/model.rs`. (Tests run by default;
+`--no-tests` opts out.)
 
 **Staying instant when cached.** The driver loads every target's history in one
 SQLite query, and only *probes the cache* for drvs it doesn't already know are
@@ -422,8 +420,8 @@ silently re-importing nixpkgs once per pair in series. Each pair is *one* shard
 — the cost here is the per-run nixpkgs import, so sub-slicing a pair's handful
 of changed attrs would only re-pay that import — so this trims the phase's
 wall-time from the *sum* of the imports toward the *slowest single* one at no
-extra total work. It is skipped under `--no-build`, which needs neither — and,
-crucially, it instantiates *only the drvs the build phase will actually touch*.
+extra total work. Crucially, it instantiates *only the drvs the build phase
+will actually touch*.
 A drv already known built / substitutable / failing is decided from the
 observation log alone (§5), so writing its `.drv` buys nothing; the driver asks
 the log which drvs still need probing or building (`build::drvs_to_materialize`,
@@ -456,9 +454,10 @@ The pair comes from one of three modes:
   release branch — whatever it is) and head = `merge^2` (the PR tip). This needs
   **no GitHub API and no token**: the refs come over anonymous git, unlike
   `nixpkgs-review`, which calls the REST API to learn the merge sha (and nags for
-  `GITHUB_TOKEN`/`gh`). The refs are fetched into the local clone once and then
-  resolved with a `rev-parse` (~0 ms), so a repeat run touches no network.
-  `--refetch` re-fetches to pick up a rebased PR or a moved base.
+  `GITHUB_TOKEN`/`gh`). The refs are fetched into the local clone once (only
+  when absent) and then resolved with a `rev-parse` (~0 ms), so a repeat run
+  touches no network; picking up a rebased PR or a moved base means fetching the
+  ref again by hand.
 
 **The merge rule (`apply_merge`), and `--no-merge`.** Given the `(base-branch
 tip, head)` pair, npd reports one of two deltas:
@@ -579,7 +578,9 @@ marking; a *missing* attr is `➖` absent, not this), `➖`
 absent (no such attr on that side, or it no longer evaluates — a *known* fact,
 never a `?`; in a delta view an eval breakage is visible as disappearance, so
 there is no separate eval-error state), `❓` unbuilt
-(has a drv, no fact yet; only under `--no-build`). A section is one `(base, head)`
+(has a drv but no fact yet — since builds always run, only the build phase's
+accepted gap of §5: a target nix never reached with nothing verifiably failing
+in its closure). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
 Sections are ordered worst-delta-first, each folded in a `<details>` (an
@@ -590,10 +591,9 @@ are collapsed onto one line (`a = b = c`, shortest attr first), like
 
 An `npd` run is not merely read-only: with defaults (`head` = `HEAD` merged onto
 the `master` tip; or the PR merged onto its base branch under `--pr`; or the
-merge-base under `--no-merge` — §6) it first **builds both sides of the changed
+merge-base under `--no-merge` — §6) it **builds both sides of the changed
 set** (skipping anything already known or substitutable), so a fresh report has
-a real state for every row rather than a wall of `❓`. `--no-build` opts back
-into pure read-only rendering.
+a real state for every row rather than a wall of `❓`.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 

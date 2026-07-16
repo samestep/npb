@@ -85,11 +85,7 @@ const ACT_BUILD: i64 = 105;
 /// drvs that got no build activity, the post-batch output-validity check in
 /// [`build_targets_at`] — never an inference gated on the ambiguous exit code
 /// (DESIGN.md §5).
-fn batch_build(
-    drvs: &[&str],
-    force: bool,
-    mut on_finish: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
+fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
     nix.arg("build").args(&installables).args([
@@ -104,9 +100,6 @@ fn batch_build(
         "--extra-experimental-features",
         "nix-command",
     ]);
-    if force {
-        nix.arg("--rebuild");
-    }
     let mut nix = nix
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -338,9 +331,6 @@ fn drvs_to_materialize_at(
     let store = Store::open(db)?;
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
-    // --recheck / --prefer-local force a genuine local build, so a substitutable
-    // fact no longer excuses instantiation — mirror `build_targets_at`'s `force`.
-    let force = policy.recheck || policy.prefer_local;
     // A stale dep-block re-opens its target (it will be re-attempted), so its
     // `.drv` is needed again — compute staleness the same offline way the build
     // driver does, keeping the two decisions in lockstep.
@@ -351,10 +341,9 @@ fn drvs_to_materialize_at(
             .get(&t.drv_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let cache_built = obs
+        let substitutable = obs
             .iter()
             .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
-        let substitutable = !force && cache_built;
         let dep_stale = stale.get(&t.drv_path).copied().unwrap_or(false);
         if policy.decide(obs, substitutable, t.skipped, dep_stale) == Decision::Build {
             need.insert(t.drv_path.clone());
@@ -374,13 +363,9 @@ fn drvs_to_materialize_at(
 /// anyway), and a recorded cache hit is decided too. This is what keeps a
 /// re-run of an unchanged report near-instant: we don't re-probe (HTTP +
 /// `nix-store`) the failures every time. Probes run concurrently
-/// (`cache::in_cache_many`), and under --recheck/--prefer-local (which force
-/// genuine local builds) not at all. Idempotent: recorded facts make the next
-/// call a no-op.
+/// (`cache::in_cache_many`). Idempotent: recorded facts make the next call a
+/// no-op.
 fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -> Result<()> {
-    if policy.recheck || policy.prefer_local {
-        return Ok(());
-    }
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
     let has_fact = |drv: &str| {
@@ -446,9 +431,6 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
 
 fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
     let mut store = Store::open(db)?;
-    // --recheck / --prefer-local force a genuine local build; otherwise a cached
-    // (substitutable) output means we needn't build at all.
-    let force = policy.recheck || policy.prefer_local;
 
     // Gather any missing cache facts, then load every target's history in one
     // SQLite round-trip — an all-known set costs a single query, no network.
@@ -462,7 +444,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .iter()
             .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built)
     };
-    let substitutable = |drv: &str| !force && cache_built(drv);
+    let substitutable = |drv: &str| cache_built(drv);
 
     // Pass 1: decide per target, purely from the (just-refreshed) log, plus the
     // one store-backed input the pure predicate can't compute — whether a
@@ -565,7 +547,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         // Several targets can share a drv (aliased attrs); record it once.
         let requested: HashSet<&str> = drvs.iter().copied().collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
-        batch_build(&drvs, force, |drv| {
+        batch_build(&drvs, |drv| {
             let built = drv_built(drv)?;
             if requested.contains(drv) {
                 // A requested target: record its own outcome, success or failure.
@@ -741,18 +723,8 @@ mod tests {
                 .is_empty()
         );
 
-        // The cache-bypass knobs re-open their targets: --recheck a success,
-        // --retry a failure, --prefer-local a substitutable, --no-skip a
-        // meta-blocked one — each then needs its `.drv` again.
-        let recheck = BuildPolicy {
-            recheck: true,
-            ..Default::default()
-        };
-        assert!(
-            drvs_to_materialize_at(&db, &targets, recheck)
-                .unwrap()
-                .contains("/d/built")
-        );
+        // The cache-bypass knobs re-open their targets: --retry a failure,
+        // --no-skip a meta-blocked one — each then needs its `.drv` again.
         let retry = BuildPolicy {
             retry: true,
             ..Default::default()
@@ -761,15 +733,6 @@ mod tests {
             drvs_to_materialize_at(&db, &targets, retry)
                 .unwrap()
                 .contains("/d/failed")
-        );
-        let prefer_local = BuildPolicy {
-            prefer_local: true,
-            ..Default::default()
-        };
-        assert!(
-            drvs_to_materialize_at(&db, &targets, prefer_local)
-                .unwrap()
-                .contains("/d/cached")
         );
         let no_skip = BuildPolicy {
             no_skip: true,
