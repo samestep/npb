@@ -22,6 +22,21 @@ untracked files.** `git add` any new file (a new `src/*.rs` module, an
 confusing `E0583` ("file not found for module") and cascade noise — the module
 simply isn't in the source Nix copied.
 
+## Commit messages: `Assisted-by:`, no session links
+
+Attribute Claude assistance with an `Assisted-by:` trailer naming the model,
+and nothing else:
+
+```
+Assisted-by: Claude:opus-4.8
+Assisted-by: Claude:fable-5
+```
+
+Do **not** use `Co-Authored-By: Claude … <noreply@anthropic.com>` trailers, and
+do **not** include links to Claude Code sessions (`Claude-Session:` lines or
+`claude.ai/code/…` URLs) — the whole history has been rewritten to this
+convention, so keep new commits consistent with it.
+
 ## No backward compatibility, ever
 
 npd has exactly one user, no releases, and no deployments. Everything it stores
