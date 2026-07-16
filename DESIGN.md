@@ -605,29 +605,48 @@ a real state for every row rather than a wall of `❓`.
 block right under the heading, `repro_command` in `src/main.rs`) so anyone can
 re-run `npd` on the *exact same changeset* — not the ambiguous invocation the
 author happened to type (`npd` alone means a different changeset per machine and
-day), but the resolved identity. Every form reduces to `npd --base <sha> --head
-<sha>` on **pinned commits**: because the eval is tree-keyed and the synthetic
-merge is deterministic (§6), pinning the two input commits reproduces the review
-byte-for-byte, and npd re-mints the merge itself — the command never names a
-synthetic (local-only) commit. Only report-shaping flags are echoed
+day), but the resolved identity. Every form runs `npd --base <sha> --head <…>`
+on a **pinned base** and a head whose **tree** is pinned: because the eval is
+tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
+review byte-for-byte, and npd re-mints the merge itself — the command never names
+a synthetic (local-only) commit. Only report-shaping flags are echoed
 (`--no-merge`, `--no-skip`, `--no-tests`, and an explicit `-s` per system, since
 the default system is host-specific); `--retry` and the eval-sizing knobs don't
-change the changeset, so they're omitted. What varies is only how the *head* is
-made resolvable on another machine:
+change the changeset, so they're omitted. What varies is only how the *head*'s
+tree is recovered on another machine:
 
-- a committed / explicit head is already a fetchable commit → nothing extra;
-- a `--pr` head lives only on `refs/pull/N/head`, which a plain clone omits, so
-  the command prepends `git fetch <upstream> refs/pull/N/head`, chained with
-  `&&` — conservative: if the fetch can't supply the pinned sha (the PR was
-  force-pushed), npd simply fails rather than reviewing the wrong commits;
-- an uncommitted working tree has no shareable commit, so the command embeds its
-  diff in a heredoc and rebuilds the identical synthetic commit with plain git
-  (a throwaway index → `git apply --cached` → `git commit-tree`, exactly what
-  the live working-tree capture does internally — §6), then reviews that. npd
-  grows **no** `--patch` flag for this: the whole reconstruction is emitted
-  shell, and since the eval keys on the content-addressed tree the rebuilt
-  commit needs no pinned identity. (Fully-untracked files are excluded, the same
-  `git stash create` limitation the live capture has — §6.)
+- a committed / explicit head is already a fetchable commit → `--head <sha>`;
+- otherwise (a `--pr` head or an uncommitted working tree) the head has no
+  durably-fetchable commit, so the command **rebuilds** it: apply a diff onto a
+  durable anchor commit in a throwaway index and `git commit-tree` the result —
+  exactly what the live working-tree capture does internally (§6). The rebuilt
+  commit's *sha* differs from the original, but its *tree* is identical, which is
+  all a tree-keyed eval needs; so npd grows **no** `--patch` flag (the whole
+  reconstruction is emitted shell) and we never depend on an ephemeral sha.
+  The one difference between the two is the diff's source:
+  - **`--pr`**: `curl` GitHub's `compare/<fork>...<head>.diff` (`fork` = the PR's
+    merge-base — a durable base-branch commit) and apply it onto `fork`. This is
+    **force-push proof**, which matters because nixpkgs PRs rebase constantly:
+    GitHub retains a PR's commits by sha in its fork network, so the pinned
+    compare URL resolves even after the branch has moved. It is also why we
+    *don't* just `git fetch refs/pull/N/head` (that ref tracks the *current* tip,
+    so the reviewed sha vanishes on a force-push) and why we don't try to
+    recreate the exact commit from a `*.patch` (`git am` can't — a patch carries
+    no committer identity/date or parent, so the sha would differ anyway; the
+    tree is what we actually need). One download covers a multi-commit PR (it's a
+    net diff, not per-commit patches). `curl -f` and an `&&` chain keep it
+    conservative: any failure — an unreachable sha, or a binary change GitHub's
+    text `.diff` can't carry — stops before npd runs, rather than reviewing the
+    wrong tree. (npd re-mints the merge from `--base merge^1` and the rebuilt
+    head, so base drift is still reflected exactly as in the original review.)
+  - **working tree**: its content is local and unpushable, so the command embeds
+    the captured diff in a heredoc and applies it onto the pinned `HEAD`.
+    (Fully-untracked files are excluded, the same `git stash create` limitation
+    the live capture has — §6.)
+
+The rebuild is deliberately kept in the *emitted command*, not in npd: npd stays
+offline-pure except for its one `--pr` network exception (§6), and the fragile
+parts (a network fetch, walking a PR's commits) never enter the binary.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 

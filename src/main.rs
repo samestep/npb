@@ -540,22 +540,33 @@ fn assemble_targets(
 }
 
 /// The shell command a report prints (DESIGN §8) so anyone can reproduce its
-/// exact changeset. Every form ultimately runs `npd --base <sha> --head <sha>`
-/// on pinned commits — the eval is tree-keyed and the synthetic merge is
-/// deterministic (DESIGN §6), so pinning the two input commits reproduces the
-/// review byte-for-byte. What differs is how the *head* is made resolvable on
-/// another machine:
+/// exact changeset. Every form runs `npd --base <sha> --head <…>` on a **pinned
+/// base** and a head whose **tree** is pinned — the eval is tree-keyed and the
+/// synthetic merge is deterministic (DESIGN §6), so that reproduces the review
+/// byte-for-byte. What differs is how the head's tree is recovered on another
+/// machine:
 ///
-/// - a committed / explicit head is already a fetchable commit → nothing extra;
-/// - a `--pr` head lives only on `refs/pull/N/head`, which a plain clone omits,
-///   so the command fetches that ref first, chained with `&&` so npd never runs
-///   on the wrong commit if the fetch can't supply the pinned sha (e.g. the PR
-///   was force-pushed) — it just fails, conservatively;
-/// - an uncommitted working tree has no shareable commit, so the command embeds
-///   its diff in a heredoc and rebuilds the identical synthetic commit with
-///   plain git (a throwaway index → `git apply` → `git commit-tree`, exactly
-///   what the live capture does internally — DESIGN §6), then reviews that. npd
-///   needs no `--patch` flag: the reconstruction is all in the emitted script.
+/// - a committed / explicit head is already a fetchable commit → `--head <sha>`,
+///   nothing extra;
+/// - otherwise (a `--pr` head or an uncommitted working tree) the head has no
+///   durably-fetchable commit, so the command **rebuilds** it: apply a diff onto
+///   a durable anchor commit in a throwaway index and `git commit-tree` the
+///   result (exactly what the live working-tree capture does internally). The
+///   rebuilt commit's *sha* differs from the original — but its *tree* is
+///   identical, which is all a tree-keyed eval needs, so npd needs no `--patch`
+///   flag and we never depend on an ephemeral sha. The two only differ in where
+///   the diff comes from:
+///   - **`--pr`**: `curl` GitHub's `compare/<fork>...<head>.diff` (`fork` = the
+///     PR's merge-base, a durable base-branch commit) and apply it onto `fork`.
+///     This is **force-push proof** — GitHub retains PR commits by sha in the
+///     fork network, so the pinned compare URL resolves even after a rebase —
+///     and one download covers a multi-commit PR (a net diff, not per-commit
+///     patches). `curl -f` + an `&&` chain make it conservative: any failure
+///     (an unreachable sha, a binary diff GitHub can't emit) stops before npd
+///     runs, rather than reviewing the wrong tree. (npd re-mints the merge from
+///     `--base merge^1` and the rebuilt head, so base drift is still reflected.)
+///   - **working tree**: its content is local, so embed the captured diff in a
+///     heredoc and apply it onto the pinned `HEAD`.
 ///
 /// Only flags that change *what the report contains* are echoed (`--no-merge`,
 /// `--no-skip`, `--no-tests`, and the systems); `--retry` and the eval-sizing
@@ -584,11 +595,26 @@ fn repro_command(
     }
     let base_sha = &base.commit;
 
-    // A working-tree head is the only one with no shareable commit (its content
-    // is uncommitted and local). Embed its diff and rebuild the synthetic
-    // commit the reproducer reviews; the tree is content-addressed, so the
-    // commit needs no pinned identity to reproduce the eval. The pinned `HEAD`
-    // sha (not the reproducer's live HEAD) is what the patch applies onto.
+    // Rebuild-a-synthetic-head tail: the patch is now in "$p"; apply it onto
+    // `anchor` in a throwaway index, commit the result (its tree — not its sha —
+    // is what matters), pin it against `git gc`, and review that. A single `&&`
+    // chain so any earlier failure stops before npd runs (conservative: never
+    // review the wrong tree). Shared by the two heads with no fetchable commit.
+    let tail = |anchor: &str, msg: &str| {
+        format!(
+            "i=\"$(mktemp)\" \\\n  \
+             && GIT_INDEX_FILE=\"$i\" git read-tree {anchor} \\\n  \
+             && GIT_INDEX_FILE=\"$i\" git apply --cached --binary \"$p\" \\\n  \
+             && h=\"$(GIT_INDEX_FILE=\"$i\" git write-tree)\" \\\n  \
+             && h=\"$(git commit-tree \"$h\" -p {anchor} -m '{msg}')\" \\\n  \
+             && git update-ref refs/npd/repro \"$h\" \\\n  \
+             && rm -f \"$i\" \"$p\" \\\n  \
+             && npd --base {base_sha} --head \"$h\"{flags}"
+        )
+    };
+
+    // A working-tree head's content is local, so embed its diff (applied onto
+    // the pinned HEAD, not the reproducer's live HEAD).
     if head.label == "worktree" {
         let head_sha = resolve_commit(repo, "HEAD")?;
         let diff = git_diff_binary(repo, &head_sha, "refs/npd/worktree")?;
@@ -598,27 +624,29 @@ fn repro_command(
             format!("{diff}\n")
         };
         return Ok(format!(
-            "i=\"$(mktemp)\"\n\
-             GIT_INDEX_FILE=\"$i\" git read-tree {head_sha}\n\
-             GIT_INDEX_FILE=\"$i\" git apply --cached --binary <<'PATCH'\n\
-             {diff}\
-             PATCH\n\
-             h=\"$(GIT_INDEX_FILE=\"$i\" git write-tree)\"\n\
-             rm -f \"$i\"\n\
-             h=\"$(git commit-tree \"$h\" -p {head_sha} -m 'npd: uncommitted working tree')\"\n\
-             git update-ref refs/npd/worktree \"$h\"\n\
-             npd --base {base_sha} --head \"$h\"{flags}"
+            "p=\"$(mktemp)\"\ncat > \"$p\" <<'PATCH'\n{diff}PATCH\n{}",
+            tail(&head_sha, "npd: uncommitted working tree")
         ));
     }
 
-    let head_sha = &head.label;
+    // A PR head: rebuild its tree from GitHub's fork-point compare diff, which
+    // survives the force-pushes nixpkgs PRs rebase through (the pinned sha stays
+    // resolvable in the fork network).
     if let Some(n) = pr {
+        let head_sha = &head.label;
+        let fork = git_merge_base(repo, base_sha, head_sha)
+            .context("computing the PR's fork point for the reproduction command")?;
+        let url = format!("{UPSTREAM}/compare/{fork}...{head_sha}.diff");
         return Ok(format!(
-            "git fetch {UPSTREAM} refs/pull/{n}/head \
-             && npd --base {base_sha} --head {head_sha}{flags}"
+            "p=\"$(mktemp)\" && curl -fsSL \"{url}\" -o \"$p\" \\\n  && {}",
+            tail(&fork, &format!("npd: PR #{n} head"))
         ));
     }
-    Ok(format!("npd --base {base_sha} --head {head_sha}{flags}"))
+
+    Ok(format!(
+        "npd --base {base_sha} --head {}{flags}",
+        head.label
+    ))
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -1112,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn repro_command_commit_and_pr_forms() {
+    fn repro_command_commit_forms() {
         let dummy = std::path::Path::new(".");
         let base = rev("aaa", "aaa");
         let head = rev("bbb", "bbb");
@@ -1146,23 +1174,6 @@ mod tests {
             cmd,
             "npd --base aaa --head bbb --no-merge --no-skip --no-tests -s a -s b"
         );
-
-        // PR: fetch the pull head first (a plain clone lacks it), chained with
-        // && so npd never runs if the pinned sha can't be supplied.
-        let cmd = repro_command(
-            dummy,
-            (&base, &head),
-            Some(42),
-            false,
-            false,
-            false,
-            &["s".into()],
-        )
-        .unwrap();
-        assert_eq!(
-            cmd,
-            format!("git fetch {UPSTREAM} refs/pull/42/head && npd --base aaa --head bbb -s s")
-        );
     }
 
     #[test]
@@ -1191,18 +1202,15 @@ mod tests {
 
         // The head handed to the report is the worktree Rev (label "worktree").
         let cmd = repro_command(d, (&base, &wt), None, true, false, true, &["sys".into()]).unwrap();
-        assert!(
-            cmd.contains("git apply --cached --binary <<'PATCH'"),
-            "{cmd}"
-        );
+        assert!(cmd.contains("cat > \"$p\" <<'PATCH'"), "{cmd}");
         assert!(
             cmd.trim_end().ends_with("--no-merge --no-tests -s sys"),
             "{cmd}"
         );
 
         // Run the emitted script in a pristine tree (working tree restored,
-        // refs/npd/worktree dropped) with the final npd call stubbed out — it
-        // must rebuild a commit whose tree is the captured working tree's,
+        // npd's live worktree ref dropped) with the final npd call stubbed out —
+        // it must rebuild a commit whose tree is the captured working tree's,
         // proving the reproduction depends on nothing but the embedded diff.
         g(d, &["reset", "--hard", &head]);
         g(d, &["update-ref", "-d", "refs/npd/worktree"]);
@@ -1218,7 +1226,99 @@ mod tests {
             "reproduction script failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let rebuilt = resolve_commit(d, "refs/npd/worktree").unwrap();
+        let rebuilt = resolve_commit(d, "refs/npd/repro").unwrap();
         assert_eq!(tree_of(d, &rebuilt).unwrap(), wt.tree);
+    }
+
+    #[test]
+    fn repro_command_pr_reconstructs_head_tree_offline() {
+        // A PR shaped like the real thing: a fork point, base drift on a
+        // *different* file (so the merge is a genuine 3-way), and a two-commit
+        // PR head. The reproduction must rebuild the PR head's tree from the
+        // fork-point compare diff and reproduce the same test-merge — all
+        // without touching the network.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("pkg.txt"), "v1\n").unwrap();
+        std::fs::write(d.join("other.txt"), "base\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "fork"]);
+        let fork = resolve_commit(d, "HEAD").unwrap();
+        // Base branch (merge^1) drifts on other.txt.
+        std::fs::write(d.join("other.txt"), "base2\n").unwrap();
+        g(d, &["commit", "-am", "drift"]);
+        let m1 = resolve_commit(d, "HEAD").unwrap();
+        // PR head (merge^2): two commits on pkg.txt off the fork.
+        g(d, &["checkout", "-q", &fork]);
+        std::fs::write(d.join("pkg.txt"), "v2\n").unwrap();
+        g(d, &["commit", "-am", "pr1"]);
+        std::fs::write(d.join("pkg.txt"), "v3\n").unwrap();
+        g(d, &["commit", "-am", "pr2"]);
+        let m2 = resolve_commit(d, "HEAD").unwrap();
+
+        // The (base, head) resolve_pr's merge shape produces: base = merge^1,
+        // head labelled with the PR tip merge^2.
+        let base = commit_source(d, m1.clone()).unwrap();
+        let head = Rev {
+            tree: tree_of(d, &m2).unwrap(),
+            commit: m2.clone(),
+            label: m2.clone(),
+        };
+        let cmd = repro_command(
+            d,
+            (&base, &head),
+            Some(7),
+            false,
+            false,
+            false,
+            &["sys".into()],
+        )
+        .unwrap();
+
+        // String: the compare URL is pinned to the fork point and PR tip, fetched
+        // conservatively, and npd reviews against the real base-branch tip.
+        assert!(
+            cmd.contains(&format!("/compare/{fork}...{m2}.diff")),
+            "{cmd}"
+        );
+        assert!(cmd.contains("curl -fsSL"), "{cmd}");
+        assert!(
+            cmd.contains(&format!("npd --base {m1} --head \"$h\"")),
+            "{cmd}"
+        );
+
+        // Execute it offline: swap the GitHub download for a local compare diff
+        // (what GitHub would serve), and stub the final npd. The rebuilt head's
+        // tree must equal the PR tip's, and merging it onto merge^1 must give the
+        // same test-merge tree as merging the real PR tip — base drift included.
+        let url = format!("{UPSTREAM}/compare/{fork}...{m2}.diff");
+        let diff = git_diff_binary(d, &fork, &m2).unwrap();
+        let pf = d.join("compare.diff");
+        std::fs::write(&pf, &diff).unwrap();
+        let script = cmd
+            .replace(
+                &format!("curl -fsSL \"{url}\" -o \"$p\""),
+                &format!("cp {} \"$p\"", pf.display()),
+            )
+            .replace("npd --base", "true npd --base");
+        let out = Proc::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(d)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "reproduction script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rebuilt = resolve_commit(d, "refs/npd/repro").unwrap();
+        assert_eq!(tree_of(d, &rebuilt).unwrap(), tree_of(d, &m2).unwrap());
+        let real_merge = g(d, &["merge-tree", "--write-tree", &m1, &m2]);
+        let repro_merge = g(d, &["merge-tree", "--write-tree", &m1, &rebuilt]);
+        assert_eq!(real_merge, repro_merge);
     }
 }
