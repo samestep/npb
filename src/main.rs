@@ -45,8 +45,9 @@ struct Cli {
     /// Review NixOS/nixpkgs PR #N: shorthand for `--head` = the PR's head,
     /// `--base` = its base-branch tip (GitHub's test-merge commit's first
     /// parent) — the same delta ofborg/Hydra and nixpkgs-review evaluate. The
-    /// PR's refs are fetched into the local clone once, so a repeat run
-    /// resolves them offline.
+    /// PR's refs are re-fetched from GitHub every run so the review always
+    /// reflects the current PR (npd's one network exception; hard-errors if
+    /// GitHub is unreachable, rather than reviewing a stale snapshot).
     #[arg(long, value_name = "N")]
     pr: Option<u64>,
     /// Diff from the merge-base of base and head, instead of the default —
@@ -147,14 +148,12 @@ fn git_merge_base(repo: &std::path::Path, base: &str, head: &str) -> Result<Stri
     git(repo, &["merge-base", base, head])
 }
 
-/// Is `rev` resolvable to a commit in `repo`? (No network.)
-fn have_commit(repo: &std::path::Path, rev: &str) -> bool {
-    resolve_commit(repo, rev).is_ok()
-}
-
-/// Fetch `ref_name` from `upstream` into `repo`'s ref of the same name. Returns
+/// Fetch `ref_name` from `upstream` into `repo`'s ref of the same name,
+/// force-updating it (the `+` refspec) so a moved PR ref is picked up. Returns
 /// `Ok(true)` if it now exists, `Ok(false)` if `upstream` has no such ref (a
-/// conflicted PR publishes no `merge` ref), and `Err` on any other failure.
+/// conflicted PR publishes no `merge` ref), and `Err` on any other failure —
+/// including an unreachable network, which a `--pr` run treats as fatal rather
+/// than silently reviewing a stale snapshot.
 fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<bool> {
     let refspec = format!("+{ref_name}:{ref_name}");
     let out = git_output(repo, &["fetch", upstream, &refspec])?;
@@ -171,15 +170,6 @@ fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<b
     );
 }
 
-/// Ensure PR #`pr`'s `ref_name` is present in `repo`, fetching from `upstream`
-/// when it is absent. Returns whether it exists.
-fn ensure_pr_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<bool> {
-    if have_commit(repo, ref_name) {
-        return Ok(true);
-    }
-    fetch_ref(repo, upstream, ref_name)
-}
-
 /// Resolve the report's `(base, head)` for a PR review. GitHub publishes
 /// `refs/pull/N/head` (the PR tip) and, when the PR merges cleanly,
 /// `refs/pull/N/merge` — a test-merge commit whose first parent is the
@@ -187,8 +177,11 @@ fn ensure_pr_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Resu
 /// shorthand for a `(base, head)` pair — base = the base-branch tip
 /// (`merge^1`), head = the PR tip (`merge^2`) — onto which the shared
 /// merge/`--no-merge` rule (see [`apply_merge`]) then applies, exactly as for a
-/// local review. A repeat run reuses the cached refs and touches no network (a
-/// rev-parse, not the ~0.2 s merge-base walk).
+/// local review. Unlike every other path, `--pr` *always* re-fetches the merge
+/// ref first — it's a moving pointer GitHub regenerates on a rebase or base
+/// move, so a repeat run must reflect the current PR, not a stale snapshot. An
+/// unchanged PR makes this a near-free "up to date" fetch, and the tree-keyed
+/// eval/build caches still hit (DESIGN §6), so only the pointer is refreshed.
 ///
 /// The default (merge) shape reuses GitHub's `merge` commit verbatim — it *is*
 /// the head merged onto the base — so there's no local merge, and the diff is
@@ -205,7 +198,7 @@ fn resolve_pr(
 ) -> Result<(Rev, Rev)> {
     let head_ref = format!("refs/pull/{pr}/head");
     let merge_ref = format!("refs/pull/{pr}/merge");
-    let have_merge = ensure_pr_ref(repo, upstream, &merge_ref)?;
+    let have_merge = fetch_ref(repo, upstream, &merge_ref)?;
 
     if no_merge {
         // Fork-point shape: merge-base(base-branch tip, PR head) → PR head. With
@@ -218,7 +211,7 @@ fn resolve_pr(
                 resolve_commit(repo, &format!("{merge_ref}^2"))?,
             )
         } else {
-            if !ensure_pr_ref(repo, upstream, &head_ref)? {
+            if !fetch_ref(repo, upstream, &head_ref)? {
                 bail!("PR #{pr} not found on {upstream}");
             }
             (
@@ -233,7 +226,7 @@ fn resolve_pr(
     if !have_merge {
         // No test-merge commit. Distinguish a conflicted PR from a missing one
         // by whether the (always-published) head ref exists.
-        let exists = have_commit(repo, &head_ref) || fetch_ref(repo, upstream, &head_ref)?;
+        let exists = fetch_ref(repo, upstream, &head_ref)?;
         if exists {
             bail!(
                 "PR #{pr} is not mergeable (it conflicts with its base branch), \
@@ -824,13 +817,11 @@ mod tests {
         let (nb, nh) = resolve_pr(local.path(), upstream, 1, true).unwrap();
         assert_eq!(nb.commit, s["a"]);
         assert_eq!(nh.commit, s["c"]);
-        // Second call is offline (ref now cached) and resolves identically.
-        let (base2, head2) = resolve_pr(local.path(), "file:///does/not/exist", 1, false)
-            .expect("cached ref should resolve without touching upstream");
-        assert_eq!(
-            (base2.commit, head2.commit),
-            (s["b"].clone(), s["m"].clone())
-        );
+        // --pr re-fetches the merge ref every run — even a repeat, and even
+        // though it's already cached — so an unreachable upstream is a hard
+        // error, never a silent fall back to a possibly-stale local snapshot.
+        resolve_pr(local.path(), "file:///does/not/exist", 1, false)
+            .expect_err("--pr must re-fetch, so an unreachable upstream errors");
     }
 
     #[test]

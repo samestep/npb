@@ -454,10 +454,16 @@ The pair comes from one of three modes:
   release branch — whatever it is) and head = `merge^2` (the PR tip). This needs
   **no GitHub API and no token**: the refs come over anonymous git, unlike
   `nixpkgs-review`, which calls the REST API to learn the merge sha (and nags for
-  `GITHUB_TOKEN`/`gh`). The refs are fetched into the local clone once (only
-  when absent) and then resolved with a `rev-parse` (~0 ms), so a repeat run
-  touches no network; picking up a rebased PR or a moved base means fetching the
-  ref again by hand.
+  `GITHUB_TOKEN`/`gh`). `--pr` is the **one exception** to "no network when
+  cached" (§1): the merge ref is a *moving pointer* GitHub regenerates on a
+  rebase or base move, so npd re-fetches it every run and resolves the fresh
+  pointer — a repeat `--pr` always reflects the current PR, never a stale
+  snapshot. This doesn't defeat the caches that matter: an unchanged PR is a
+  near-free "up to date" fetch, and eval/build stay keyed on the git
+  tree/drvpath, so a genuinely-unchanged PR still hits them; only a PR that
+  *actually* moved (new tree) re-evaluates, which is exactly right. An
+  unreachable upstream is fatal (npd won't review a stale snapshot), so `--pr`
+  needs the network where every other path is offline.
 
 **The merge rule (`apply_merge`), and `--no-merge`.** Given the `(base-branch
 tip, head)` pair, npd reports one of two deltas:
