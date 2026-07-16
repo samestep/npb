@@ -163,9 +163,10 @@ indexed point-lookup per operation to resolve the id. It's evictable by
 `--clean`), then `VACUUM`ed to return the pages. The observation log strips its
 paths the same way — `drv_path` of the `/nix/store/`+`.drv` affixes, and each
 `blocker` output path of the `/nix/store/` prefix (an output has no `.drv`, so
-it uses a prefix-only `strip_out` rather than `strip_drv`) — which matters more
-there than anywhere else: it's the one append-only, never-evicted table, so its
-per-row bytes are what compound over time (~15% off it, measured).
+it uses a prefix-only `strip_out` rather than `strip_drv`) — and stores its
+`source`/`outcome` as small integer enum codes rather than English labels. This
+matters more there than anywhere else: it's the one append-only, never-evicted
+table, so its per-row bytes are what compound over time (~15% off it, measured).
 
 ```
 ~/.cache/nix-npd/

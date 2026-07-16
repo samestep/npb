@@ -20,14 +20,15 @@ const SCHEMA: &str = "
 -- `local`/`cache` fact here per drv. `drv_path` is stored stripped of its
 -- constant `/nix/store/` prefix and `.drv` suffix (`evalfile::strip_drv`), and
 -- `blocker`'s output paths of their `/nix/store/` prefix (`strip_out` — an
--- output path has no `.drv`); both restored on read. This is the one
--- append-only, never-evicted table, so trimming its per-row bytes is what
--- compounds over time.
+-- output path has no `.drv`); both restored on read. `source` and `outcome` are
+-- small integer enum codes (`source_code`/`outcome_code`), not their English
+-- labels. This is the one append-only, never-evicted table, so trimming its
+-- per-row bytes is what compounds over time.
 CREATE TABLE IF NOT EXISTS observation (
     id         INTEGER PRIMARY KEY,
     drv_path   TEXT    NOT NULL,
-    source     TEXT    NOT NULL,
-    outcome    TEXT    NOT NULL,
+    source     INTEGER NOT NULL,
+    outcome    INTEGER NOT NULL,
     when_      INTEGER NOT NULL,
     -- For a `dep-failed`: newline-joined output paths of the culprit dependency
     -- (DESIGN.md §5), so a later run can re-check the block's validity offline.
@@ -80,35 +81,40 @@ CREATE TABLE IF NOT EXISTS test_drv (
 CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (key_id, pkg_attr);
 ";
 
-fn source_str(s: Source) -> &'static str {
+// `source`/`outcome` persist as small integer enum codes, not English labels.
+// The values are stable on-disk (the cache is re-derivable, so they need no
+// migration — but keeping them fixed keeps the `failing_drvs` query below and
+// any hand-inspection legible). Changing a variant's code is a format change:
+// delete `~/.cache/nix-npd` (CLAUDE.md), never migrate.
+fn source_code(s: Source) -> i64 {
     match s {
-        Source::Local => "local",
-        Source::Cache => "cache",
+        Source::Local => 0,
+        Source::Cache => 1,
     }
 }
 
-fn source_from(s: &str) -> Result<Source> {
-    Ok(match s {
-        "local" => Source::Local,
-        "cache" => Source::Cache,
-        other => anyhow::bail!("unknown observation source in store: {other:?}"),
+fn source_from_code(c: i64) -> Result<Source> {
+    Ok(match c {
+        0 => Source::Local,
+        1 => Source::Cache,
+        other => anyhow::bail!("unknown observation source code in store: {other}"),
     })
 }
 
-fn outcome_str(o: Outcome) -> &'static str {
+fn outcome_code(o: Outcome) -> i64 {
     match o {
-        Outcome::Built => "built",
-        Outcome::Failed => "failed",
-        Outcome::DepFailed => "dep-failed",
+        Outcome::Built => 0,
+        Outcome::Failed => 1,
+        Outcome::DepFailed => 2,
     }
 }
 
-fn outcome_from(s: &str) -> Result<Outcome> {
-    Ok(match s {
-        "built" => Outcome::Built,
-        "failed" => Outcome::Failed,
-        "dep-failed" => Outcome::DepFailed,
-        other => anyhow::bail!("unknown observation outcome in store: {other:?}"),
+fn outcome_from_code(c: i64) -> Result<Outcome> {
+    Ok(match c {
+        0 => Outcome::Built,
+        1 => Outcome::Failed,
+        2 => Outcome::DepFailed,
+        other => anyhow::bail!("unknown observation outcome code in store: {other}"),
     })
 }
 
@@ -181,8 +187,8 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 strip_drv(&o.drv_path),
-                source_str(o.source),
-                outcome_str(o.outcome),
+                source_code(o.source),
+                outcome_code(o.outcome),
                 o.when,
                 blocker,
             ],
@@ -223,8 +229,8 @@ impl Store {
         let rows = stmt.query_map(params, |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<String>>(4)?,
             ))
@@ -234,8 +240,8 @@ impl Store {
             let drv_path = restore_drv(Some(&stored_drv)).expect("Some maps to Some");
             out.entry(drv_path.clone()).or_default().push(Observation {
                 drv_path,
-                source: source_from(&source)?,
-                outcome: outcome_from(&outcome)?,
+                source: source_from_code(source)?,
+                outcome: outcome_from_code(outcome)?,
                 when,
                 blocker: blocker
                     .filter(|s| !s.is_empty())
@@ -256,10 +262,15 @@ impl Store {
     /// substitutable via a recorded `Cache`/`Built`) is excluded — nix wouldn't
     /// re-attempt it as a dependency, so it blocks nothing.
     pub fn failing_drvs(&self) -> Result<std::collections::HashSet<String>> {
-        let mut stmt = self.conn.prepare(
+        // The enum codes are interpolated from the mappers so the query can't
+        // drift from them (both are integer literals in a STRICT column).
+        let sql = format!(
             "SELECT drv_path FROM observation GROUP BY drv_path \
-             HAVING SUM(outcome = 'built') = 0 AND SUM(source = 'local') > 0",
-        )?;
+             HAVING SUM(outcome = {built}) = 0 AND SUM(source = {local}) > 0",
+            built = outcome_code(Outcome::Built),
+            local = source_code(Source::Local),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
