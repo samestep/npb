@@ -576,10 +576,21 @@ the identical `done + running / total` display. Sharing the scheduler means its
 concurrency logic is exercised — and kept correct — by **every** memory-heavy
 `nix-eval-jobs` fan-out (enumeration, the full-set eval, `--tests`, and
 instantiation, §6) rather than each re-implementing it. And every live readout in
-npd — the scheduler *and* the network-bound cache probe (§7) — animates through
-one display primitive (`live::with_live` in `src/live.rs`: a refresher thread that
-redraws a block at a steady 100 ms and tears it down on completion), so they look
-and behave identically even though their concurrency engines differ. Persistence stays path-specific (§4): the full eval assembles a flat
+npd shares **one persistent progress tree** (`live::Tree`/`live::with_live` in
+`src/live.rs`) spanning the whole pre-build run — a refresher thread redraws it at
+a steady 100 ms off lock-free per-node atomics that the workers bump. It is a
+tree: each piece of network or nontrivial work (`fetch`/`download`, `enumerate`,
+`evaluate`, `tests`, `instantiate`, `probe`) is a top-level node the moment npd
+learns it needs it — nesting a system level (elided when there's one system) and
+the per-side commit *display* (`Rev::display`, §6: the friendly name of the tree
+actually evaluated — `master`, `HEAD`, `merge(a, b)`, `#431 merge` — never a
+resolved sha unless the user typed one) — and cached/no-op work never appears at
+all, so a fully-cached run shows nothing. Nodes only change: blue *waiting* →
+yellow *running* → green *done* (nom's three colors, on the label; the count is
+plain, the ` / total` dim), never disappearing. When the tree finishes it freezes
+into scrollback, a dim separator fences it from what follows (nom's build display,
+then the report — the same separator between each), and the build proceeds
+(§5, nom's own display, not this tree). Persistence stays path-specific (§4): the full eval assembles a flat
 file, `--tests` returns rows for the per-package SQLite cache. A fully-cached
 re-run touches no `nix-eval-jobs` at all. Caching matters here because evaluating a test's drv
 means evaluating its whole derivation graph, and a `nixosTest` in `passthru.tests`
@@ -772,9 +783,9 @@ warm-cache iterative loop npd is built for (§1) eval is instant and little
 cross-phase slack remains, so this is gated on cold multi-system runs actually
 hurting in practice — it is *not* a general task-graph engine for what is really a
 regular pipeline. The near-term, unconditionally-worthwhile piece of it — one
-shared progress-display primitive (`live::with_live`) that every phase animates
-through — is already done (§6); the executor is the part deferred until the
-cold-run wall-time justifies it.
+shared persistent progress tree (`live::Tree`, driven through `live::with_live`)
+that every phase feeds nodes into — is already done (§6); the executor is the part
+deferred until the cold-run wall-time justifies it.
 
 **Resolved gotcha (root-caused) — `nix-eval-jobs` restarted its worker after
 every job on macOS.** The ~100× darwin slowdown (measured ~1.5 attrs/s on an

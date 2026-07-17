@@ -157,10 +157,10 @@ fn drv_outputs_many(drvs: &[String]) -> HashMap<String, Vec<String>> {
 /// force a local build. A drv absent from the resolved map (not in the store,
 /// or floating CA) probes as not-substitutable: the safe direction.
 ///
-/// `done` is bumped as each drv resolves, so a caller can render progress for
-/// this otherwise-silent (and, on a first run over a big changed set,
+/// `progress(1)` is called as each drv resolves, so a caller can render progress
+/// for this otherwise-silent (and, on a first run over a big changed set,
 /// minute-long) network phase.
-pub fn in_cache_many(drvs: &[String], done: &AtomicUsize) -> HashMap<String, bool> {
+pub fn in_cache_many(drvs: &[String], progress: &(dyn Fn(usize) + Sync)) -> HashMap<String, bool> {
     if drvs.is_empty() {
         return HashMap::new();
     }
@@ -185,7 +185,7 @@ pub fn in_cache_many(drvs: &[String], done: &AtomicUsize) -> HashMap<String, boo
                             !outs.is_empty() && outs.iter().all(|o| output_in_cache(agent, o))
                         });
                         local.push((drv.clone(), sub));
-                        done.fetch_add(1, Ordering::Relaxed);
+                        progress(1);
                     }
                     local
                 })

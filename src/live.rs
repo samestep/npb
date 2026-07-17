@@ -31,12 +31,14 @@
 //! non-interactive pty. This relative-move renderer needs neither.
 
 use std::fmt::Write as _;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use console::{Term, style, truncate_str};
+
+use crate::model::Rev;
 
 /// Braille spinner frames (indicatif's default set).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -217,6 +219,330 @@ pub fn human_elapsed(d: Duration) -> String {
     format!("{clock:>7}")
 }
 
+// --- the progress tree (DESIGN §6, §9) ---------------------------------------
+//
+// One persistent, append-only tree spanning eval → probe: every piece of
+// network or nontrivial work becomes a node the moment npd learns it needs it,
+// nothing is ever removed, and cached/no-op work never appears at all. Phases
+// (`enumerate`, `evaluate`, `tests`, `instantiate`, `probe`, and the network
+// `fetch`/`download`) are top-level nodes; under them a system level (elided for
+// a single-system run) and the per-side commit `display`s. State is one of three
+// nom colors — blue waiting, yellow running, green done — carried by the label;
+// counts are plain, the `/ total` denominator dim, nothing bold. See the
+// rendering spec in `scratch/tree_demo.py`.
+
+// Dull ANSI, matching nom (`lib/NOM/Print.hs`) and the demo.
+const BLUE: &str = "\x1b[34m";
+const YELLOW: &str = "\x1b[33m";
+const GREEN: &str = "\x1b[32m";
+const CYAN: &str = "\x1b[36m";
+const DIM: &str = "\x1b[90m";
+const RESET: &str = "\x1b[0m";
+
+/// Two spaces per tree level.
+const INDENT: &str = "  ";
+/// Fixed width of each number column (a count, and its total). Six digits covers
+/// the largest count — the ~119k attr eval — with headroom, and being fixed
+/// means a count gaining a digit never shifts the column.
+const NUM_W: usize = 6;
+
+/// The three node states — the blue/yellow/green of nom.
+const WAIT: u8 = 0;
+const RUN: u8 = 1;
+const DONE: u8 = 2;
+
+/// A node in the progress [`Tree`]. Workers bump its atomics lock-free while the
+/// refresher reads them, so updates need no locking. `counter` marks a node that
+/// shows a running count once active (an eval side, the probe); a count-less
+/// node (a phase, a system, a network ref) carries only a state color.
+pub struct Node {
+    label: String,
+    depth: usize,
+    counter: bool,
+    state: AtomicU8,
+    /// Items done. Only rendered for a `counter` node that has left `WAIT`.
+    count: AtomicI64,
+    /// Progress denominator, or `-1` when unknown (e.g. `enumerate`, which
+    /// discovers its count). Rendered only while `RUN`.
+    total: AtomicI64,
+}
+
+impl Node {
+    fn new(label: String, depth: usize, counter: bool, total: i64) -> Self {
+        Self {
+            label,
+            depth,
+            counter,
+            state: AtomicU8::new(WAIT),
+            count: AtomicI64::new(0),
+            total: AtomicI64::new(total),
+        }
+    }
+
+    /// Move `WAIT` → `RUN`; never regress a node that has already finished (so
+    /// concurrent shards of one group race harmlessly).
+    pub fn set_running(&self) {
+        let _ = self
+            .state
+            .compare_exchange(WAIT, RUN, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    pub fn set_done(&self) {
+        self.state.store(DONE, Ordering::Relaxed);
+    }
+
+    /// Add `n` to the running count (drives the live number).
+    pub fn add_count(&self, n: i64) {
+        self.count.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Pin the count to an exact value (e.g. the assembled row count on
+    /// completion, in case the streamed tally drifted).
+    pub fn set_count(&self, n: i64) {
+        self.count.store(n, Ordering::Relaxed);
+    }
+
+    pub fn set_total(&self, n: i64) {
+        self.total.store(n, Ordering::Relaxed);
+    }
+}
+
+/// The one live progress tree, shared (`&Tree`) by every pre-build phase. Nodes
+/// are appended under a mutex; their per-node state/counts are lock-free atomics
+/// the refresher reads. The number columns start at a width fixed up front (see
+/// [`plan_label_width`]) so nothing shifts horizontally as phases appear.
+pub struct Tree {
+    nodes: Mutex<Vec<Arc<Node>>>,
+    start: Instant,
+    min_label_w: usize,
+    multi: bool,
+    /// Whether stderr is a terminal — gates coloring the frozen reprint.
+    color: bool,
+}
+
+impl Tree {
+    pub fn new(min_label_w: usize, multi: bool) -> Self {
+        Self {
+            nodes: Mutex::new(Vec::new()),
+            start: Instant::now(),
+            min_label_w,
+            multi,
+            color: Term::stderr().is_term(),
+        }
+    }
+
+    /// Whether the run spans more than one system (so phases nest a system level).
+    pub fn multi(&self) -> bool {
+        self.multi
+    }
+
+    /// Append a count-less node (a phase, a system, a network ref).
+    pub fn node(&self, label: impl Into<String>, depth: usize) -> Arc<Node> {
+        let n = Arc::new(Node::new(label.into(), depth, false, -1));
+        self.nodes.lock().unwrap().push(n.clone());
+        n
+    }
+
+    /// Append a counting leaf; `total` is `-1` when the denominator is unknown.
+    pub fn counter(&self, label: impl Into<String>, depth: usize, total: i64) -> Arc<Node> {
+        let n = Arc::new(Node::new(label.into(), depth, true, total));
+        self.nodes.lock().unwrap().push(n.clone());
+        n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.lock().unwrap().is_empty()
+    }
+
+    /// The live frame for tick `t`: node lines plus a cyan spinner + clock footer.
+    pub fn render(&self, t: usize) -> Vec<String> {
+        self.lines(Some(t), true)
+    }
+
+    /// The frozen reprint (permanent scrollback): the same node lines with a
+    /// resting cyan `.` in place of the spinner. Colorized only on a terminal.
+    pub fn render_frozen(&self) -> Vec<String> {
+        self.lines(None, self.color)
+    }
+
+    fn lines(&self, tick: Option<usize>, color: bool) -> Vec<String> {
+        let nodes = self.nodes.lock().unwrap();
+        if nodes.is_empty() {
+            // An empty tree draws nothing at all (a fully-cached run stays quiet).
+            return Vec::new();
+        }
+        // Snapshot the raw per-node fields, then roll parent states up from their
+        // descendant leaves.
+        let snap: Vec<(usize, &str, bool, u8, i64, i64)> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.depth,
+                    n.label.as_str(),
+                    n.counter,
+                    n.state.load(Ordering::Relaxed),
+                    n.count.load(Ordering::Relaxed),
+                    n.total.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        let eff: Vec<u8> = (0..snap.len()).map(|i| eff_state(&snap, i)).collect();
+
+        // The number columns start past the widest label of ANY node, so a
+        // vertical line between the tree and the numbers clips neither.
+        let mut left_w = self.min_label_w;
+        for (depth, label, ..) in &snap {
+            left_w = left_w.max(INDENT.len() * depth + label.chars().count());
+        }
+
+        let mut out = Vec::with_capacity(snap.len() + 1);
+        for (i, &(depth, label, counter, _raw, count, total)) in snap.iter().enumerate() {
+            let col = state_color(eff[i]);
+            let indent = INDENT.repeat(depth);
+            // A count shows only for a counter node that has started running.
+            if !(counter && eff[i] != WAIT) {
+                out.push(if color {
+                    format!("{col}{indent}{label}{RESET}")
+                } else {
+                    format!("{indent}{label}")
+                });
+                continue;
+            }
+            let left = format!("{indent}{label}");
+            let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
+            let count_s = format!("{count:>NUM_W$}");
+            // The total is a progress denominator, so it shows only while running;
+            // a done node collapses the redundant N/N to a bare count.
+            let tail = if total >= 0 && eff[i] == RUN {
+                let t = format!("{total:>NUM_W$}");
+                if color {
+                    format!("{DIM} / {t}{RESET}")
+                } else {
+                    format!(" / {t}")
+                }
+            } else {
+                String::new()
+            };
+            // Only the label carries the state color; the count is plain (like the
+            // clock), the ` / total` dim.
+            if color {
+                out.push(format!("{col}{left}{pad}{RESET}  {count_s}{tail}"));
+            } else {
+                out.push(format!("{left}{pad}  {count_s}{tail}"));
+            }
+        }
+
+        let clock = human_elapsed(self.start.elapsed());
+        out.push(match tick {
+            Some(t) => format!("{} {clock}", spinner(t)),
+            None if color => format!("{CYAN}.{RESET} {clock}"),
+            None => format!(". {clock}"),
+        });
+        out
+    }
+}
+
+/// A node's effective (rolled-up) state: any descendant leaf running → running;
+/// all done → done; some done but not all → running; else waiting. A node with
+/// no descendants uses its own state.
+fn eff_state(snap: &[(usize, &str, bool, u8, i64, i64)], i: usize) -> u8 {
+    let d = snap[i].0;
+    let (mut any_run, mut any_done, mut any_wait, mut any_leaf) = (false, false, false, false);
+    let mut j = i + 1;
+    while j < snap.len() && snap[j].0 > d {
+        let is_leaf = j + 1 >= snap.len() || snap[j + 1].0 <= snap[j].0;
+        if is_leaf {
+            any_leaf = true;
+            match snap[j].3 {
+                RUN => any_run = true,
+                DONE => any_done = true,
+                _ => any_wait = true,
+            }
+        }
+        j += 1;
+    }
+    if !any_leaf {
+        return snap[i].3;
+    }
+    if any_run {
+        RUN
+    } else if !any_wait {
+        DONE
+    } else if any_done {
+        RUN
+    } else {
+        WAIT
+    }
+}
+
+fn state_color(state: u8) -> &'static str {
+    match state {
+        RUN => YELLOW,
+        DONE => GREEN,
+        _ => BLUE,
+    }
+}
+
+/// The width the tree's number columns start at, computed once up front from
+/// every label the run can produce (DESIGN §6): the fixed phase names, the
+/// systems, the two `display`s at their nesting depth, and any PR refs or
+/// `--patch` compare expr. Passed to [`Tree::new`] so the columns never shift as
+/// phases appear (all these labels are known at resolution).
+pub fn plan_label_width(
+    systems: &[String],
+    base: &Rev,
+    head: &Rev,
+    pr: Option<u64>,
+    compare: Option<&str>,
+) -> usize {
+    let ind = INDENT.len();
+    let mut w = [
+        "fetch",
+        "download",
+        "enumerate",
+        "evaluate",
+        "tests",
+        "instantiate",
+        "probe",
+    ]
+    .iter()
+    .map(|p| p.len())
+    .max()
+    .unwrap();
+    let cdepth = if systems.len() > 1 { 2 } else { 1 };
+    for d in [&base.display, &head.display] {
+        w = w.max(ind * cdepth + d.chars().count());
+    }
+    if systems.len() > 1 {
+        for s in systems {
+            w = w.max(ind + s.chars().count());
+        }
+    }
+    if let Some(n) = pr {
+        w = w.max(ind + format!("refs/pull/{n}/merge").len());
+        w = w.max(ind + format!("refs/pull/{n}/head").len());
+    }
+    if let Some(c) = compare {
+        w = w.max(ind + c.chars().count());
+    }
+    w
+}
+
+/// npd's one visual separator, on stderr, between each of its phases (the live
+/// tree, nom's build, the report): a blank line, a dim rule, a blank line — the
+/// spacing does the separating, the rule just marks it. Dimmed only on a
+/// terminal, so a redirected stderr gets plain hyphens.
+pub fn separator() {
+    let rule = "-".repeat(48);
+    eprintln!();
+    if Term::stderr().is_term() {
+        eprintln!("{DIM}{rule}{RESET}");
+    } else {
+        eprintln!("{rule}");
+    }
+    eprintln!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +561,113 @@ mod tests {
         for s in [0, 51, 599, 3600, 35999] {
             assert_eq!(human_elapsed(Duration::from_secs(s)).len(), 7);
         }
+    }
+
+    fn rev(display: &str) -> Rev {
+        Rev {
+            tree: "t".into(),
+            commit: "c".into(),
+            label: "l".into(),
+            display: display.into(),
+        }
+    }
+
+    /// All node lines except the (time-dependent) footer.
+    fn node_lines(tree: &Tree) -> Vec<String> {
+        let mut lines = tree.render(0);
+        lines.pop(); // drop the spinner + clock footer
+        lines
+    }
+
+    #[test]
+    fn renders_states_counts_and_totals() {
+        // Single system: phase → commit. Colors live only on the label; the count
+        // is plain, the ` / total` dim, nothing bold. A done side collapses to a
+        // bare count; a running side shows `count / total`.
+        let tree = Tree::new(0, false);
+        tree.node("evaluate", 0);
+        let base = tree.counter("master", 1, -1);
+        let head = tree.counter("HEAD", 1, -1);
+        base.set_running();
+        base.set_count(114230);
+        base.set_done();
+        head.set_running();
+        head.set_total(114231);
+        head.add_count(107347);
+
+        let lines = node_lines(&tree);
+        assert_eq!(
+            lines,
+            vec![
+                // rollup: a running child → the phase is yellow.
+                "\x1b[33mevaluate\x1b[0m".to_string(),
+                // done → green label, bare plain count, aligned in the 8-wide column.
+                "\x1b[32m  master\x1b[0m  114230".to_string(),
+                // running → yellow label, plain count, dim ` / total`.
+                "\x1b[33m  HEAD  \x1b[0m  107347\x1b[90m / 114231\x1b[0m".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn waiting_counter_shows_no_number() {
+        // A counter still in WAIT renders as a bare colored label — no `0`.
+        let tree = Tree::new(0, false);
+        tree.node("tests", 0);
+        tree.counter("HEAD", 1, -1); // left in WAIT
+        assert_eq!(
+            node_lines(&tree),
+            vec![
+                "\x1b[34mtests\x1b[0m".to_string(),
+                "\x1b[34m  HEAD\x1b[0m".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rollup_all_done_is_green() {
+        let tree = Tree::new(0, false);
+        tree.node("enumerate", 0);
+        for c in ["master", "HEAD"] {
+            let n = tree.counter(c, 1, -1);
+            n.set_running();
+            n.set_count(100);
+            n.set_done();
+        }
+        assert_eq!(node_lines(&tree)[0], "\x1b[32menumerate\x1b[0m");
+    }
+
+    #[test]
+    fn empty_tree_draws_nothing() {
+        let tree = Tree::new(11, false);
+        assert!(tree.is_empty());
+        assert!(tree.render(0).is_empty());
+        assert!(tree.render_frozen().is_empty());
+    }
+
+    #[test]
+    fn plan_width_clears_every_label() {
+        let (b, h) = (rev("master"), rev("HEAD"));
+        // Single system: the longest phase name (`instantiate`, 11) is the floor.
+        assert_eq!(
+            plan_label_width(&["aarch64-linux".into()], &b, &h, None, None),
+            11
+        );
+        // Multi-system: a system name at depth 1 is widest (2 + 13).
+        assert_eq!(
+            plan_label_width(
+                &["aarch64-linux".into(), "x86_64-linux".into()],
+                &b,
+                &h,
+                None,
+                None
+            ),
+            15
+        );
+        // A PR fetch ref at depth 1 (2 + 19) beats them all.
+        assert_eq!(
+            plan_label_width(&["aarch64-linux".into()], &b, &h, Some(431), None),
+            21
+        );
     }
 }

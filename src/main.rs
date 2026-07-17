@@ -249,7 +249,10 @@ fn resolve_pr(
             )
         };
         let mb = git_merge_base(repo, &base_tip, &head).context("computing the PR's fork point")?;
-        return Ok((commit_source(repo, mb)?, commit_source(repo, head)?));
+        return Ok((
+            commit_source(repo, mb, format!("merge-base(#{pr} base, #{pr} head)"))?,
+            commit_source(repo, head, format!("#{pr} head"))?,
+        ));
     }
 
     if !have_merge {
@@ -273,11 +276,12 @@ fn resolve_pr(
     let base = resolve_commit(repo, &format!("{merge_ref}^1"))?;
     let head_tip = resolve_commit(repo, &format!("{merge_ref}^2"))?;
     Ok((
-        commit_source(repo, base)?,
+        commit_source(repo, base, format!("#{pr} base"))?,
         Rev {
             tree: tree_of(repo, &merge)?,
             commit: merge,
             label: head_tip,
+            display: format!("#{pr} merge"),
         },
     ))
 }
@@ -334,14 +338,17 @@ fn tree_of(repo: &std::path::Path, commit: &str) -> Result<String> {
     git(repo, &["rev-parse", &format!("{commit}^{{tree}}")])
 }
 
-/// Wrap a resolved commit sha as a [`Rev`]: its tree is the eval cache key, and
-/// the sha itself is both `fetchGit`'s commit and the display label.
-fn commit_source(repo: &std::path::Path, commit: String) -> Result<Rev> {
+/// Wrap a resolved commit sha as a [`Rev`]: its tree is the eval cache key, the
+/// sha is both `fetchGit`'s commit and the [`Rev::label`], and `display` is the
+/// human name of this side for the live tree (the ref the user typed, or a
+/// default's name — never the resolved sha unless the user typed one).
+fn commit_source(repo: &std::path::Path, commit: String, display: String) -> Result<Rev> {
     let tree = tree_of(repo, &commit)?;
     Ok(Rev {
         tree,
         label: commit.clone(),
         commit,
+        display,
     })
 }
 
@@ -349,12 +356,13 @@ fn commit_source(repo: &std::path::Path, commit: String) -> Result<Rev> {
 /// — the working tree itself, captured as a synthetic content-addressed commit
 /// ([`worktree_source`]). This is what lets `npd` review in-progress work;
 /// committing that work as-is later is a cache *hit*, since both resolve to the
-/// identical tree (see [`Rev`]).
+/// identical tree (see [`Rev`]). Its live-tree `display` is `HEAD` when clean and
+/// `HEAD *` when dirty (the same `*` marker the report and `--patch` use).
 fn head_source(repo: &std::path::Path) -> Result<Rev> {
     let head = resolve_commit(repo, "HEAD")?;
     match worktree_source(repo, &head)? {
         Some(rev) => Ok(rev),
-        None => commit_source(repo, head),
+        None => commit_source(repo, head, "HEAD".into()),
     }
 }
 
@@ -381,7 +389,12 @@ fn worktree_source(repo: &std::path::Path, head: &str) -> Result<Option<Rev>> {
     if stash.is_empty() {
         return Ok(None); // nothing uncommitted to review
     }
-    Ok(Some(worktree_commit(repo, tree_of(repo, &stash)?, head)?))
+    Ok(Some(worktree_commit(
+        repo,
+        tree_of(repo, &stash)?,
+        head,
+        "HEAD *".into(),
+    )?))
 }
 
 /// Mint npd's deterministic synthetic head commit over `tree` with parent
@@ -392,7 +405,12 @@ fn worktree_source(repo: &std::path::Path, head: &str) -> Result<Option<Rev>> {
 /// ([`worktree_source`]) and the `--patch` reconstruction ([`patch_source`]):
 /// both are "a synthetic head over an anchor", so both yield the identical Rev
 /// for identical content (DESIGN §6).
-fn worktree_commit(repo: &std::path::Path, tree: String, parent: &str) -> Result<Rev> {
+fn worktree_commit(
+    repo: &std::path::Path,
+    tree: String,
+    parent: &str,
+    display: String,
+) -> Result<Rev> {
     const EPOCH: &str = "1970-01-01T00:00:00Z";
     let ident = [
         ("GIT_AUTHOR_NAME", "npd"),
@@ -419,6 +437,7 @@ fn worktree_commit(repo: &std::path::Path, tree: String, parent: &str) -> Result
         tree,
         commit,
         label: "worktree".into(),
+        display,
     })
 }
 
@@ -432,7 +451,12 @@ fn worktree_commit(repo: &std::path::Path, tree: String, parent: &str) -> Result
 /// fetchable (DESIGN §8). The diff must apply cleanly onto `anchor` (npd emits
 /// it against exactly that anchor); a failure is fatal rather than a silent
 /// mis-review.
-fn patch_source(repo: &std::path::Path, anchor: &str, diff: &str) -> Result<Rev> {
+fn patch_source(
+    repo: &std::path::Path,
+    anchor: &str,
+    diff: &str,
+    anchor_display: &str,
+) -> Result<Rev> {
     let anchor = resolve_commit(repo, anchor)?;
     // A throwaway index seeded from the anchor, so `git apply --cached` matches
     // the patch's context against the anchor's blobs without touching anything.
@@ -446,7 +470,9 @@ fn patch_source(repo: &std::path::Path, anchor: &str, diff: &str) -> Result<Rev>
     git_env(repo, &env, &["apply", "--cached", "--binary", patch])
         .context("applying the --patch diff onto the head")?;
     let tree = git_env(repo, &env, &["write-tree"])?;
-    worktree_commit(repo, tree, &anchor)
+    // The patched head is `anchor` plus a diff, shown with the same `*` marker
+    // the report and the working-tree capture use.
+    worktree_commit(repo, tree, &anchor, format!("{anchor_display} *"))
 }
 
 /// A path as a UTF-8 `&str`, or an error (paths npd makes are always UTF-8).
@@ -511,6 +537,10 @@ fn resolve_local(
     repo: &std::path::Path,
     base: Option<String>,
     head: Option<String>,
+    // The human `display` for the head anchor — for `--patch` it names the
+    // commit the diff sits on (`HEAD`, a branch), since the `head` arg there is
+    // the resolved anchor sha rather than something the user typed.
+    head_display: Option<String>,
     no_merge: bool,
     patch: Option<&str>,
 ) -> Result<(Rev, Rev)> {
@@ -518,14 +548,23 @@ fn resolve_local(
         // --patch: the head is the given diff applied on top of the anchor commit
         // (resolved by the caller — an explicit `--head`, else the default head,
         // which may be the working tree), yielding a synthetic content-addressed
-        // commit.
-        (anchor, Some(diff)) => patch_source(repo, anchor.as_deref().unwrap_or("HEAD"), diff)?,
-        (Some(h), None) => commit_source(repo, resolve_commit(repo, &h)?)?,
+        // commit shown as `<anchor> *`.
+        (anchor, Some(diff)) => patch_source(
+            repo,
+            anchor.as_deref().unwrap_or("HEAD"),
+            diff,
+            head_display.as_deref().unwrap_or("HEAD"),
+        )?,
+        // An explicit `--head <ref>` is echoed as the ref the user typed.
+        (Some(h), None) => {
+            let disp = head_display.unwrap_or_else(|| h.clone());
+            commit_source(repo, resolve_commit(repo, &h)?, disp)?
+        }
         (None, None) => head_source(repo)?,
     };
     let base_tip = match base {
-        Some(b) => commit_source(repo, resolve_commit(repo, &b)?)?,
-        None => commit_source(repo, resolve_commit(repo, "master")?)
+        Some(b) => commit_source(repo, resolve_commit(repo, &b)?, b)?,
+        None => commit_source(repo, resolve_commit(repo, "master")?, "master".into())
             .context("no base given and no `master` branch to default to; pass --base")?,
     };
     apply_merge(repo, base_tip, head, no_merge)
@@ -553,7 +592,9 @@ fn apply_merge(
     if no_merge {
         let mb = git_merge_base(repo, &base_tip.commit, &head.commit)
             .context("could not merge-base base and head; pass --base explicitly")?;
-        return Ok((commit_source(repo, mb)?, head));
+        // The base side is really the fork point, not the base tip — name it so.
+        let display = format!("merge-base({}, {})", base_tip.display, head.display);
+        return Ok((commit_source(repo, mb, display)?, head));
     }
     let merge = merge_source(repo, &base_tip, &head)?;
     Ok((base_tip, merge))
@@ -606,10 +647,19 @@ fn merge_source(repo: &std::path::Path, base: &Rev, head: &Rev) -> Result<Rev> {
         ],
     )?;
     git(repo, &["update-ref", "refs/npd/merge", &commit])?;
+    // The live-tree name describes the tree actually evaluated: when the merge is
+    // a fast-forward its tree equals the head's, so it *is* the head (show it as
+    // such); only a genuine drift produces a distinct merge, named `merge(a, b)`.
+    let display = if tree == head.tree {
+        head.display.clone()
+    } else {
+        format!("merge({}, {})", base.display, head.display)
+    };
     Ok(Rev {
         tree,
         commit,
         label: head.label.clone(),
+        display,
     })
 }
 
@@ -730,6 +780,145 @@ fn repro_command(
     }
 }
 
+/// The changed set per system: `(system, changed attrs)`, with `--tests` rows
+/// folded in. Threaded from [`run_phases`] into the build and the report.
+type PerSystemChanged = Vec<(String, Vec<evalfile::ChangedAttr>)>;
+
+/// The pre-build phases — everything that runs behind the one live progress tree
+/// (DESIGN §6, §9): evaluate both sides, diff to the changed set, expand
+/// `--tests`, instantiate the `.drv`s the build will touch, and probe the cache.
+/// The nom build and the report come after, outside the tree. Returns the
+/// per-system changed set (with test rows folded in) and the build targets.
+#[allow(clippy::too_many_arguments)]
+fn run_phases(
+    repo: &std::path::Path,
+    base: &Rev,
+    head: &Rev,
+    systems: &[String],
+    opts: eval::EvalOpts,
+    policy: BuildPolicy,
+    tests: bool,
+    no_skip: bool,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<(PerSystemChanged, Vec<build::Target>)> {
+    eval::eval_two(repo, base, head, systems, opts, tree, handle)?;
+
+    // The changed set per system — each attr's drv + meta-blocked bit per side —
+    // from a linear merge of the two sorted eval files. Computed once, reused
+    // for build+render.
+    let mut per_system_changed: Vec<(String, Vec<evalfile::ChangedAttr>)> = Vec::new();
+    for sys in systems {
+        let changed = evalfile::changed_set(&base.tree, &head.tree, sys)?;
+        per_system_changed.push((sys.clone(), changed));
+    }
+
+    // --tests: expand each system's changed set with the changed packages'
+    // `passthru.tests`. We resolve the tests on *both* sides (through the
+    // per-package SQLite cache) and keep a test as a changed attr only when its
+    // drv actually differs base→head — exactly `changed_set`'s own semantics, so
+    // the test rows classify (regression / fixed / new / …) like every other
+    // attr. A side where the package is skipped contributes no tests (a test drv
+    // depends on the package, so building it would build the skipped package)
+    // unless --no-skip.
+    if tests {
+        let mut store = store::Store::open(&paths::db_path()?)?;
+        // The not-skipped changed-package names per system, on each side.
+        let per_sys: Vec<(Vec<String>, Vec<String>)> = per_system_changed
+            .iter()
+            .map(|(_, changed)| {
+                let names_on = |not_skipped: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
+                    let mut v: Vec<String> = changed
+                        .iter()
+                        .filter(|c| no_skip || not_skipped(c))
+                        .map(|c| c.attr.clone())
+                        .collect();
+                    v.sort();
+                    v.dedup();
+                    v
+                };
+                (names_on(|c| !c.base_skipped), names_on(|c| !c.head_skipped))
+            })
+            .collect();
+
+        // Gather the cache misses across every (tree, system, side) and
+        // evaluate them all through one scheduler, so `--tests` schedules and
+        // displays as a unit like the full eval. Deduped by (tree, system).
+        let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for ((sys, _), (base_names, head_names)) in per_system_changed.iter().zip(&per_sys) {
+            for (rev, names) in [(base, base_names), (head, head_names)] {
+                if !seen.insert((rev.tree.clone(), sys.clone())) {
+                    continue;
+                }
+                let cached = store.tests_cached_pkgs(&rev.tree, sys, names)?;
+                let misses: Vec<String> = names
+                    .iter()
+                    .filter(|p| !cached.contains(*p))
+                    .cloned()
+                    .collect();
+                if !misses.is_empty() {
+                    requests.push((rev.clone(), sys.clone(), misses));
+                }
+            }
+        }
+        let jobs_per = eval::eval_tests_many(repo, &requests, tree, handle)?;
+        for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
+            store.cache_test_eval(&rev.tree, sys, misses, jobs)?;
+        }
+
+        // The per-package cache is now populated; build each system's test-row
+        // diff, classified like every other attr.
+        for ((sys, changed), (base_names, head_names)) in
+            per_system_changed.iter_mut().zip(&per_sys)
+        {
+            let bmap = store.tests_drvs_for(&base.tree, sys, base_names)?;
+            let hmap = store.tests_drvs_for(&head.tree, sys, head_names)?;
+            changed.extend(evalfile::changed_tests(&bmap, &hmap));
+        }
+    }
+
+    // Build both sides of the changed set (skipping anything already known,
+    // substitutable, or meta-blocked) so the report has a real state for every
+    // row.
+    let targets = assemble_targets(&per_system_changed);
+
+    // The evals ran with --no-instantiate (no `.drv` writes for the ~114k attrs
+    // npd never builds), so materialize the changed set's `.drv`s now — but only
+    // for drvs the build phase will actually touch (a drv already known
+    // built/substitutable/failing is decided from the log alone). When *every*
+    // changed drv is already known (the warm-cache iterative loop), this is empty
+    // and the instantiation eval is skipped, keeping the run instant (§5–§6).
+    let need = build::drvs_to_materialize(&targets, policy)?;
+    let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
+    for (sys, changed) in &per_system_changed {
+        let mut base_attrs = Vec::new();
+        let mut head_attrs = Vec::new();
+        for c in changed {
+            let wants = |drv: &Option<String>, skipped: bool| {
+                drv.as_ref()
+                    .is_some_and(|d| (no_skip || !skipped) && need.contains(d))
+            };
+            if wants(&c.base_drv, c.base_skipped) {
+                base_attrs.push(c.attr.clone());
+            }
+            if wants(&c.head_drv, c.head_skipped) {
+                head_attrs.push(c.attr.clone());
+            }
+        }
+        inst.push((base.clone(), sys.clone(), base_attrs));
+        inst.push((head.clone(), sys.clone(), head_attrs));
+    }
+    eval::instantiate(repo, &inst, tree, handle)?;
+
+    // Probe the cache for the drvs with no fact yet — the run's only network
+    // phase inside the tree (a cross-cutting `probe` leaf). Runs before the nom
+    // build so the build set is fully decided from facts.
+    build::probe_facts(&targets, policy, tree)?;
+
+    Ok((per_system_changed, targets))
+}
+
 fn run(cli: Cli) -> Result<()> {
     // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
     // files and exit, reviewing nothing. It conflicts with every review knob.
@@ -800,7 +989,7 @@ fn run(cli: Cli) -> Result<()> {
     // synthetic, unpushable commit; the repro handles that by embedding.
     let patch_anchor: Option<Rev> = match &cli.patch {
         Some(_) => Some(match &cli.head {
-            Some(h) => commit_source(&repo, resolve_commit(&repo, h)?)?,
+            Some(h) => commit_source(&repo, resolve_commit(&repo, h)?, h.clone())?,
             None => head_source(&repo)?,
         }),
         None => None,
@@ -818,130 +1007,55 @@ fn run(cli: Cli) -> Result<()> {
                 .as_ref()
                 .map(|r| r.commit.clone())
                 .or_else(|| cli.head.clone()),
+            // …and its live-tree name is the anchor's `display` (the ref the user
+            // typed, since the arg above is the resolved anchor sha).
+            patch_anchor.as_ref().map(|r| r.display.clone()),
             cli.no_merge,
             patch_diff.as_deref(),
         )?,
     };
     let systems = resolve_systems(cli.system);
 
-    eval::eval_two(&repo, &base, &head, &systems, opts)?;
-
-    // The changed set per system — each attr's drv + meta-blocked bit per side —
-    // from a linear merge of the two sorted eval files. Computed once, reused
-    // for build+render.
-    let mut per_system_changed: Vec<(String, Vec<evalfile::ChangedAttr>)> = Vec::new();
-    for sys in &systems {
-        let changed = evalfile::changed_set(&base.tree, &head.tree, sys)?;
-        per_system_changed.push((sys.clone(), changed));
+    // The one persistent progress tree, spanning eval → probe (the build itself
+    // is nom's display). Its number columns start after the widest label the run
+    // can produce — all known now, so nothing shifts as phases appear (DESIGN §6).
+    let tree = live::Tree::new(
+        live::plan_label_width(&systems, &base, &head, cli.pr, patch_compare.as_deref()),
+        systems.len() > 1,
+    );
+    // Network work already happened during resolution; record it as done nodes so
+    // the tree documents every network touch (DESIGN §6–§7).
+    if let Some(pr) = cli.pr {
+        let fetch = tree.node("fetch", 0);
+        fetch.set_done();
+        tree.node(format!("refs/pull/{pr}/merge"), 1).set_done();
+    } else if let Some(expr) = &patch_compare {
+        tree.node("download", 0).set_done();
+        tree.node(expr.clone(), 1).set_done();
     }
 
-    // --tests: expand each system's changed set with the changed packages'
-    // `passthru.tests`. We resolve the tests on *both* sides (through the
-    // per-package SQLite cache — see `cached_test_drvs`) and keep a test as a
-    // changed attr only when its drv actually differs base→head — exactly
-    // `changed_set`'s own semantics, so the test rows classify (regression /
-    // fixed / new / …) like every other attr. A side where the package is
-    // skipped contributes no tests (a test drv depends on the package,
-    // so building it would build the skipped package) unless --no-skip.
-    if tests {
-        let mut store = store::Store::open(&paths::db_path()?)?;
-        // The not-skipped changed-package names per system, on each side.
-        let per_sys: Vec<(Vec<String>, Vec<String>)> = per_system_changed
-            .iter()
-            .map(|(_, changed)| {
-                let names_on = |not_skipped: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
-                    let mut v: Vec<String> = changed
-                        .iter()
-                        .filter(|c| no_skip || not_skipped(c))
-                        .map(|c| c.attr.clone())
-                        .collect();
-                    v.sort();
-                    v.dedup();
-                    v
-                };
-                (names_on(|c| !c.base_skipped), names_on(|c| !c.head_skipped))
-            })
-            .collect();
-
-        // Gather the cache misses across every (tree, system, side) and
-        // evaluate them all through one scheduler, so `--tests` schedules and
-        // displays as a unit like the full eval. Deduped by (tree, system): with
-        // `npd X X` (or a base/head sharing a tree) both sides are one key (and
-        // per the per-package cache, the same tree on different systems are
-        // distinct keys).
-        let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for ((sys, _), (base_names, head_names)) in per_system_changed.iter().zip(&per_sys) {
-            for (rev, names) in [(&base, base_names), (&head, head_names)] {
-                if !seen.insert((rev.tree.clone(), sys.clone())) {
-                    continue;
-                }
-                let cached = store.tests_cached_pkgs(&rev.tree, sys, names)?;
-                let misses: Vec<String> = names
-                    .iter()
-                    .filter(|p| !cached.contains(*p))
-                    .cloned()
-                    .collect();
-                if !misses.is_empty() {
-                    requests.push((rev.clone(), sys.clone(), misses));
-                }
-            }
+    let (per_system_changed, targets) = live::with_live(
+        |tick| tree.render(tick),
+        |handle| {
+            run_phases(
+                &repo, &base, &head, &systems, opts, policy, tests, no_skip, &tree, handle,
+            )
+        },
+    )?;
+    // Freeze the tree as scrollback, then the consistent separator before what
+    // follows (nom's build, or the report).
+    if !tree.is_empty() {
+        for line in tree.render_frozen() {
+            eprintln!("{line}");
         }
-        let jobs_per = eval::eval_tests_many(&repo, &requests)?;
-        for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
-            store.cache_test_eval(&rev.tree, sys, misses, jobs)?;
-        }
-
-        // The per-package cache is now populated; build each system's test-row
-        // diff. The same diff the full set went through, so test rows classify
-        // (regression / fixed / new / meta-only …) identically.
-        for ((sys, changed), (base_names, head_names)) in
-            per_system_changed.iter_mut().zip(&per_sys)
-        {
-            let bmap = store.tests_drvs_for(&base.tree, sys, base_names)?;
-            let hmap = store.tests_drvs_for(&head.tree, sys, head_names)?;
-            changed.extend(evalfile::changed_tests(&bmap, &hmap));
-        }
+        live::separator();
     }
 
-    // Build both sides of the changed set (skipping anything already known,
-    // substitutable, or meta-blocked) so the report has a real state for every
-    // row.
-    let targets = assemble_targets(&per_system_changed);
-
-    // The evals ran with --no-instantiate (no `.drv` writes for the ~114k
-    // attrs npd never builds), so materialize the changed set's `.drv`s now —
-    // the narinfo probe and the build both read them from the store. But only
-    // for drvs the build phase will actually touch: a drv already known
-    // built/substitutable/failing is decided from the log alone, so writing
-    // its `.drv` is pure waste. When *every* changed drv is already known (the
-    // warm-cache iterative loop npd is built for), this set is empty and the
-    // whole instantiation eval is skipped — the couple of seconds that
-    // otherwise made a fully-cached run non-instant (DESIGN.md §5–§6).
-    let need = build::drvs_to_materialize(&targets, policy)?;
-    let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
-    for (sys, changed) in &per_system_changed {
-        let mut base_attrs = Vec::new();
-        let mut head_attrs = Vec::new();
-        for c in changed {
-            let wants = |drv: &Option<String>, skipped: bool| {
-                drv.as_ref()
-                    .is_some_and(|d| (no_skip || !skipped) && need.contains(d))
-            };
-            if wants(&c.base_drv, c.base_skipped) {
-                base_attrs.push(c.attr.clone());
-            }
-            if wants(&c.head_drv, c.head_skipped) {
-                head_attrs.push(c.attr.clone());
-            }
-        }
-        inst.push((base.clone(), sys.clone(), base_attrs));
-        inst.push((head.clone(), sys.clone(), head_attrs));
-    }
-    eval::instantiate(&repo, &inst)?;
-
+    // nom's build runs after the tree freezes; a trailing separator fences its
+    // output off from the report (the tree→build separator was printed above).
     if !targets.is_empty() {
         build::build_targets(&targets, policy)?;
+        live::separator();
     }
 
     // Render from the (now-populated) log: reduce each side to a state.
@@ -1224,12 +1338,12 @@ mod tests {
         std::fs::write(d.join("base.txt"), "base\n").unwrap();
         g(d, &["add", "."]);
         g(d, &["commit", "-m", "A"]);
-        let a = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let a = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
         // A feature commit descending from A.
         std::fs::write(d.join("feat.txt"), "feat\n").unwrap();
         g(d, &["add", "."]);
         g(d, &["commit", "-m", "F"]);
-        let f = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let f = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
 
         // F already descends A, so the merge fast-forwards: its tree equals F's
         // (base → merge collapses to A → F, no extra eval). Deterministic sha,
@@ -1252,14 +1366,14 @@ mod tests {
         std::fs::write(d.join("shared.txt"), "base\n").unwrap();
         g(d, &["add", "."]);
         g(d, &["commit", "-m", "A"]);
-        let a = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let a = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
 
         // Head: add a new file (no overlap with the base's drift).
         g(d, &["checkout", "-b", "head", &a.commit]);
         std::fs::write(d.join("head.txt"), "head\n").unwrap();
         g(d, &["add", "."]);
         g(d, &["commit", "-m", "H"]);
-        let head = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let head = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
 
         // Base drifts on a *different* file: a real 3-way merge, whose tree
         // carries both changes and so differs from either side.
@@ -1267,7 +1381,7 @@ mod tests {
         std::fs::write(d.join("drift.txt"), "drift\n").unwrap();
         g(d, &["add", "."]);
         g(d, &["commit", "-m", "B"]);
-        let base = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let base = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
         let m = merge_source(d, &base, &head).unwrap();
         assert_ne!(m.tree, base.tree);
         assert_ne!(m.tree, head.tree);
@@ -1278,12 +1392,12 @@ mod tests {
         std::fs::write(d.join("shared.txt"), "clash\n").unwrap();
         g(d, &["add", "."]);
         g(d, &["commit", "-m", "C"]);
-        let clash = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let clash = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
         // Head must also touch shared.txt to actually conflict.
         g(d, &["checkout", "head"]);
         std::fs::write(d.join("shared.txt"), "head\n").unwrap();
         g(d, &["commit", "-am", "H2"]);
-        let head2 = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let head2 = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
         let err = merge_source(d, &clash, &head2).unwrap_err();
         assert!(format!("{err}").contains("--no-merge"), "{err}");
     }
@@ -1322,7 +1436,8 @@ mod tests {
         // commit whose *tree* equals the synthetic one, so the eval key matches
         // and no re-eval is needed.
         g(d, &["commit", "-am", "commit it"]);
-        let committed = commit_source(d, resolve_commit(d, "HEAD").unwrap()).unwrap();
+        let committed =
+            commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
         assert_eq!(committed.tree, a.tree);
         assert_ne!(committed.commit, a.commit); // different commit, same tree
 
@@ -1448,7 +1563,7 @@ mod tests {
         // same deterministic commit worktree_source minted) from the diff alone.
         g(d, &["reset", "--hard", &head]);
         g(d, &["update-ref", "-d", "refs/npd/worktree"]);
-        let rebuilt = patch_source(d, &head, &diff).unwrap();
+        let rebuilt = patch_source(d, &head, &diff, "HEAD").unwrap();
         assert_eq!(rebuilt.tree, wt.tree);
         assert_eq!(rebuilt.commit, wt.commit);
         assert_eq!(rebuilt.label, "worktree");
@@ -1483,7 +1598,7 @@ mod tests {
         // The diff GitHub's compare/fork...m2.diff serves, applied onto the fork.
         let diff = git_diff_binary(d, &fork, &m2).unwrap();
         g(d, &["checkout", "-q", &m1]);
-        let rebuilt = patch_source(d, &fork, &diff).unwrap();
+        let rebuilt = patch_source(d, &fork, &diff, "HEAD").unwrap();
         assert_eq!(
             tree_of(d, &rebuilt.commit).unwrap(),
             tree_of(d, &m2).unwrap()

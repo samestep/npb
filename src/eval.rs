@@ -14,16 +14,16 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
-use crate::live::{human_elapsed, spinner, with_live};
+use crate::live;
 use crate::model::{AttrEval, Rev, TestJob};
 
 /// The one nixpkgs config every eval runs under. npd owns the config
@@ -361,7 +361,12 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 pub fn eval_tests_many(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<TestJob>>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
     let slots = default_slots(None);
     // Slice every request's packages into ~2×`slots` shards total, so the pool
     // stays full and balances across requests (a nixosTest ≈ a whole NixOS
@@ -370,9 +375,14 @@ pub fn eval_tests_many(
     let total: usize = requests.iter().map(|(_, _, p)| p.len()).sum();
     let shard_size = total.div_ceil(slots * 2).max(1);
 
+    let groups: Vec<(String, String)> = requests
+        .iter()
+        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
+        .collect();
+    let nodes = add_phase(tree, "tests", &groups);
     let labels: Vec<String> = requests
         .iter()
-        .map(|(rev, system, _)| format!("tests {} ({system})", short_label(&rev.label)))
+        .map(|(rev, system, _)| format!("tests {} ({system})", rev.display))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
     let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
@@ -381,15 +391,15 @@ pub fn eval_tests_many(
         .collect();
 
     run_shards(
+        nodes,
         labels,
         items,
         shard_size,
         slots,
-        ShardWords {
-            unit: "tests",
-            active: "evaluating",
-            done: "evaluated",
-        },
+        // The count is streamed test *jobs*, not the package count, so `items`
+        // is not a meaningful denominator — show a bare count.
+        false,
+        handle,
         |gi, label, pkgs, on_item| {
             let (rev, system) = meta[gi];
             let expr = build_tests_expr(repo, &rev.commit, system, pkgs);
@@ -560,10 +570,36 @@ fn default_slots(user: Option<u64>) -> usize {
     eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, user)
 }
 
-/// A revision's short display form (first 12 chars of its [`Rev::label`] — a
-/// commit sha, or the literal `worktree`), for progress-line labels.
-fn short_label(label: &str) -> String {
-    label.chars().take(12).collect()
+/// Build a phase subtree in `tree`: the phase node, then (for a multi-system
+/// run) a system level, then the per-side commit `display` leaves — returning
+/// the leaf handles in `groups` order (parallel to the scheduler's groups, one
+/// `(system, display)` each). The single-system run elides the system level, so
+/// the commits sit directly under the phase (DESIGN §6).
+fn add_phase(tree: &live::Tree, phase: &str, groups: &[(String, String)]) -> Vec<Arc<live::Node>> {
+    tree.node(phase, 0);
+    let mut handles: Vec<Option<Arc<live::Node>>> = vec![None; groups.len()];
+    if tree.multi() {
+        // Distinct systems in first-seen order; each side's commit nests under it.
+        let mut order: Vec<&str> = Vec::new();
+        for (s, _) in groups {
+            if !order.contains(&s.as_str()) {
+                order.push(s);
+            }
+        }
+        for s in order {
+            tree.node(s.to_string(), 1);
+            for (gi, (gs, disp)) in groups.iter().enumerate() {
+                if gs == s {
+                    handles[gi] = Some(tree.counter(disp.clone(), 2, -1));
+                }
+            }
+        }
+    } else {
+        for (gi, (_s, disp)) in groups.iter().enumerate() {
+            handles[gi] = Some(tree.counter(disp.clone(), 1, -1));
+        }
+    }
+    handles.into_iter().map(Option::unwrap).collect()
 }
 
 /// The top-level attr names of the package set at `(commit, system)` — the
@@ -639,7 +675,12 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String]) -> String
 /// re-pay that import for no gain. Concurrency is what wins — the phase's
 /// wall-time drops from the *sum* of the imports to (roughly) the *slowest*
 /// one, up to `slots` at a time, at no extra total work.
-pub fn instantiate(repo: &Path, requests: &[(Rev, String, Vec<String>)]) -> Result<()> {
+pub fn instantiate(
+    repo: &Path,
+    requests: &[(Rev, String, Vec<String>)],
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<()> {
     // Drop the sides with nothing to instantiate (a diff side can have no
     // buildable changed attrs) so they don't clutter the display.
     let requests: Vec<&(Rev, String, Vec<String>)> =
@@ -649,9 +690,14 @@ pub fn instantiate(repo: &Path, requests: &[(Rev, String, Vec<String>)]) -> Resu
     }
     let slots = default_slots(None);
 
+    let groups: Vec<(String, String)> = requests
+        .iter()
+        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
+        .collect();
+    let nodes = add_phase(tree, "instantiate", &groups);
     let labels: Vec<String> = requests
         .iter()
-        .map(|(rev, system, _)| format!("{} {system}", short_label(&rev.label)))
+        .map(|(rev, system, _)| format!("{} {system}", rev.display))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
     let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
@@ -660,15 +706,14 @@ pub fn instantiate(repo: &Path, requests: &[(Rev, String, Vec<String>)]) -> Resu
     let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
 
     run_shards(
+        nodes,
         labels,
         items,
         shard_size,
         slots,
-        ShardWords {
-            unit: "drvs",
-            active: "instantiating",
-            done: "instantiated",
-        },
+        // One streamed job per requested drv, so `items` is the total.
+        true,
+        handle,
         |gi, label, paths, on_item| {
             let (rev, system) = meta[gi];
             let expr = select_expr(repo, &rev.commit, system, paths);
@@ -690,27 +735,16 @@ pub fn instantiate(repo: &Path, requests: &[(Rev, String, Vec<String>)]) -> Resu
 
 // --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
 
-/// The words the shard display uses for a run: `unit` is the item noun (e.g.
-/// "attrs"), `active`/`done` the in-progress/finished verbs ("evaluating" /
-/// "evaluated"). Bundled so [`run_shards`] stays within a sane arg count.
-#[derive(Clone, Copy)]
-struct ShardWords<'a> {
-    unit: &'a str,
-    active: &'a str,
-    done: &'a str,
-}
-
-/// One group of shards run together: one line in the progress display, one
+/// One group of shards run together: one leaf node in the progress tree, one
 /// assembled result. Its `items` (top-level names for the full eval, changed
-/// packages for `--tests`) are sliced into shards; the counters below drive the
-/// `done + running / total` display and are owned by [`run_shards`].
+/// packages for `--tests`) are sliced into shards; the shard counters drive the
+/// AIMD scheduler, while progress is reflected onto `node` for the display.
 struct ShardGroup<T> {
-    label: String,
+    node: Arc<live::Node>,
     items: Vec<String>,
     shards_total: usize,
     shards_done: AtomicUsize,
     shards_running: AtomicUsize,
-    items_done: AtomicUsize,
     rows: Mutex<Vec<T>>,
 }
 
@@ -720,40 +754,52 @@ struct Shard {
     items: std::ops::Range<usize>,
 }
 
-/// Run a set of shard groups through one bounded, AIMD-controlled worker pool
-/// with a live `done + running / total` display, shared by the full-set, tests,
-/// and instantiate paths (DESIGN §6). `words` supplies the item noun and the
-/// active/done verbs the display labels each group with.
-/// Persistence is the caller's job (via the closures),
-/// since the full eval assembles a flat file while `--tests` returns rows for
-/// SQLite (DESIGN §4); this owns only the scheduling and the display.
+/// Run a set of shard groups through one bounded, AIMD-controlled worker pool,
+/// reflecting progress onto each group's [`live::Node`] in the shared tree
+/// (DESIGN §6). Shared by the full-set, tests, and instantiate paths. `nodes`
+/// gives the leaf node per group (parallel to `items`); `labels` names each
+/// group for error messages; `known_total` sets the node's denominator to
+/// `items.len()` — true when one streamed row == one item (evaluate,
+/// instantiate), false for enumerate (which discovers its count) and tests
+/// (whose count is streamed jobs, not packages). Persistence is the caller's job
+/// via the closures (the full eval assembles a flat file, `--tests` returns
+/// rows; DESIGN §4); this owns only the scheduling and the node updates. The
+/// outer `with_live` in `run` owns the refresher that redraws the tree.
 ///
 /// `eval_shard(group, label, items, on_item)` evaluates one shard's item slice
-/// to its rows, calling `on_item(n)` as items surface (drives the live count);
-/// it may return an [`EvalAborted`] error to have the shard requeued at reduced
-/// concurrency, or any other error to fail the whole run. `on_group_complete`
-/// fires the moment a group's last shard lands, with the group's assembled rows.
+/// to its rows, calling `on_item(n)` as items surface (bumps the node count); it
+/// may return an [`EvalAborted`] error to have the shard requeued at reduced
+/// concurrency (a note is emitted above the tree via `handle`), or any other
+/// error to fail the whole run. `on_group_complete` fires the moment a group's
+/// last shard lands, with the group's assembled rows.
+#[allow(clippy::too_many_arguments)]
 fn run_shards<T: Send>(
+    nodes: Vec<Arc<live::Node>>,
     labels: Vec<String>,
     items: Vec<Vec<String>>,
     shard_size: usize,
     slots: usize,
-    words: ShardWords<'_>,
+    known_total: bool,
+    handle: live::LiveHandle<'_>,
     eval_shard: impl Fn(usize, &str, &[String], &(dyn Fn(usize) + Sync)) -> Result<Vec<T>> + Sync,
     on_group_complete: impl Fn(usize, Vec<T>) -> Result<()> + Sync,
 ) -> Result<()> {
     let shard_size = shard_size.max(1);
-    let groups: Vec<ShardGroup<T>> = labels
+    let groups: Vec<ShardGroup<T>> = nodes
         .into_iter()
         .zip(items)
-        .map(|(label, items)| ShardGroup {
-            label,
-            shards_total: items.len().div_ceil(shard_size),
-            items,
-            shards_done: AtomicUsize::new(0),
-            shards_running: AtomicUsize::new(0),
-            items_done: AtomicUsize::new(0),
-            rows: Mutex::new(Vec::new()),
+        .map(|(node, items)| {
+            if known_total {
+                node.set_total(items.len() as i64);
+            }
+            ShardGroup {
+                node,
+                shards_total: items.len().div_ceil(shard_size),
+                items,
+                shards_done: AtomicUsize::new(0),
+                shards_running: AtomicUsize::new(0),
+                rows: Mutex::new(Vec::new()),
+            }
         })
         .collect();
 
@@ -774,53 +820,6 @@ fn run_shards<T: Send>(
     }
     // No point in more workers than shards.
     let slots = slots.min(queue.len());
-    let label_w = groups.iter().map(|g| g.label.len()).max().unwrap_or(0);
-
-    let start = Instant::now();
-
-    // One line per group: `done + running / total` shards (the `+running` term
-    // elided once idle), item count right-aligned in a fixed column.
-    let render = |g: &ShardGroup<T>| -> String {
-        let done = g.shards_done.load(Ordering::Relaxed);
-        let running = g.shards_running.load(Ordering::Relaxed);
-        let done_items = g.items_done.load(Ordering::Relaxed);
-        let unit = words.unit;
-        let verb = if done == g.shards_total {
-            words.done
-        } else {
-            words.active
-        };
-        let shards = if running > 0 {
-            format!("{done}+{running}/{}", g.shards_total)
-        } else {
-            format!("{done}/{}", g.shards_total)
-        };
-        format!(
-            "  {verb:<13} {label:<label_w$}  {done_items:>6} {unit}  {shards} shards",
-            label = g.label,
-        )
-    };
-    let render_total = || -> String {
-        let (mut done, mut running, mut total, mut done_items) = (0, 0, 0, 0);
-        for g in &groups {
-            done += g.shards_done.load(Ordering::Relaxed);
-            running += g.shards_running.load(Ordering::Relaxed);
-            total += g.shards_total;
-            done_items += g.items_done.load(Ordering::Relaxed);
-        }
-        let unit = words.unit;
-        let verb = if done == total {
-            words.done
-        } else {
-            words.active
-        };
-        let shards = if running > 0 {
-            format!("{done}+{running}/{total}")
-        } else {
-            format!("{done}/{total}")
-        };
-        format!("{verb} {shards} shards, {done_items} {unit}")
-    };
 
     struct Q {
         queue: VecDeque<Shard>,
@@ -839,121 +838,97 @@ fn run_shards<T: Send>(
     let target = AtomicUsize::new(slots);
     let successes = AtomicUsize::new(0);
 
-    // The live block is driven by `with_live` (the shared display primitive):
-    // its refresher redraws the whole block every 100 ms off the atomics below,
-    // while `body` runs the worker pool. Workers only bump atomics and, on a
-    // requeue, emit a note above the block via the handle.
-    with_live(
-        |tick| {
-            let mut lines: Vec<String> = groups.iter().map(&render).collect();
-            lines.push(format!(
-                "{} ⏱ {} {}",
-                spinner(tick),
-                human_elapsed(start.elapsed()),
-                render_total(),
-            ));
-            lines
-        },
-        |handle| {
-            thread::scope(|s| {
-                for w in 0..slots {
-                    let (q, target, successes, groups, eval_shard, on_group_complete) = (
-                        &q,
-                        &target,
-                        &successes,
-                        &groups,
-                        &eval_shard,
-                        &on_group_complete,
-                    );
-                    s.spawn(move || {
-                        loop {
-                            let shard = {
-                                let mut g = q.lock().unwrap();
-                                if g.fatal.is_some() || g.outstanding == 0 {
-                                    return;
-                                }
-                                // Parked slots (w >= target) and an empty-but-not-done
-                                // queue both just wait: an aborted shard may requeue.
-                                if w < target.load(Ordering::Relaxed) {
-                                    g.queue.pop_front()
-                                } else {
-                                    None
-                                }
-                            };
-                            let Some(shard) = shard else {
-                                thread::sleep(Duration::from_millis(200));
-                                continue;
-                            };
-                            let g = &groups[shard.group];
-                            let slice = &g.items[shard.items.clone()];
+    // The worker pool. Workers only bump atomics / node state and, on a requeue,
+    // emit a note above the tree via `handle`; the refresher (owned by the outer
+    // `with_live` in `run`) redraws the tree off the node atomics every 100 ms.
+    thread::scope(|s| {
+        for w in 0..slots {
+            let (q, target, successes, groups, labels, eval_shard, on_group_complete) = (
+                &q,
+                &target,
+                &successes,
+                &groups,
+                &labels,
+                &eval_shard,
+                &on_group_complete,
+            );
+            s.spawn(move || {
+                loop {
+                    let shard = {
+                        let mut g = q.lock().unwrap();
+                        if g.fatal.is_some() || g.outstanding == 0 {
+                            return;
+                        }
+                        // Parked slots (w >= target) and an empty-but-not-done
+                        // queue both just wait: an aborted shard may requeue.
+                        if w < target.load(Ordering::Relaxed) {
+                            g.queue.pop_front()
+                        } else {
+                            None
+                        }
+                    };
+                    let Some(shard) = shard else {
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    };
+                    let g = &groups[shard.group];
+                    let slice = &g.items[shard.items.clone()];
 
-                            g.shards_running.fetch_add(1, Ordering::Relaxed);
-                            let outcome = (|| -> Result<()> {
-                                let on_item = |n: usize| {
-                                    g.items_done.fetch_add(n, Ordering::Relaxed);
-                                };
-                                let rows = eval_shard(shard.group, &g.label, slice, &on_item)?;
-                                g.rows.lock().unwrap().extend(rows);
-                                let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
-                                if done == g.shards_total {
-                                    let rows = std::mem::take(&mut *g.rows.lock().unwrap());
-                                    // Pin the count to the assembled rows in case the
-                                    // streamed tallies drifted.
-                                    g.items_done.store(rows.len(), Ordering::Relaxed);
-                                    on_group_complete(shard.group, rows)?;
-                                }
-                                Ok(())
-                            })();
-                            g.shards_running.fetch_sub(1, Ordering::Relaxed);
+                    g.node.set_running();
+                    g.shards_running.fetch_add(1, Ordering::Relaxed);
+                    let outcome = (|| -> Result<()> {
+                        let on_item = |n: usize| g.node.add_count(n as i64);
+                        let rows = eval_shard(shard.group, &labels[shard.group], slice, &on_item)?;
+                        g.rows.lock().unwrap().extend(rows);
+                        let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == g.shards_total {
+                            let rows = std::mem::take(&mut *g.rows.lock().unwrap());
+                            // Pin the count to the assembled rows in case the
+                            // streamed tallies drifted.
+                            g.node.set_count(rows.len() as i64);
+                            on_group_complete(shard.group, rows)?;
+                            g.node.set_done();
+                        }
+                        Ok(())
+                    })();
+                    g.shards_running.fetch_sub(1, Ordering::Relaxed);
 
-                            match outcome {
-                                Ok(()) => {
-                                    q.lock().unwrap().outstanding -= 1;
-                                    let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
-                                    let t = target.load(Ordering::Relaxed);
-                                    if n % 4 == 0 && t < slots {
-                                        target.store(t + 1, Ordering::Relaxed);
-                                    }
-                                }
-                                Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
-                                    let t = target.load(Ordering::Relaxed);
-                                    let nt = (t / 2).max(1);
-                                    target.store(nt, Ordering::Relaxed);
-                                    successes.store(0, Ordering::Relaxed);
-                                    handle.note(&format!(
-                                        "  a shard of {} aborted — likely out of memory; \
-                                         requeued, slots {t} -> {nt}",
-                                        g.label,
-                                    ));
-                                    q.lock().unwrap().queue.push_back(shard);
-                                }
-                                Err(e) => {
-                                    let mut g = q.lock().unwrap();
-                                    if g.fatal.is_none() {
-                                        g.fatal = Some(e);
-                                    }
-                                }
+                    match outcome {
+                        Ok(()) => {
+                            q.lock().unwrap().outstanding -= 1;
+                            let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
+                            let t = target.load(Ordering::Relaxed);
+                            if n % 4 == 0 && t < slots {
+                                target.store(t + 1, Ordering::Relaxed);
                             }
                         }
-                    });
+                        Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
+                            let t = target.load(Ordering::Relaxed);
+                            let nt = (t / 2).max(1);
+                            target.store(nt, Ordering::Relaxed);
+                            successes.store(0, Ordering::Relaxed);
+                            handle.note(&format!(
+                                "  a shard of {} aborted — likely out of memory; \
+                                 requeued, slots {t} -> {nt}",
+                                labels[shard.group],
+                            ));
+                            q.lock().unwrap().queue.push_back(shard);
+                        }
+                        Err(e) => {
+                            let mut g = q.lock().unwrap();
+                            if g.fatal.is_none() {
+                                g.fatal = Some(e);
+                            }
+                        }
+                    }
                 }
             });
-        },
-    );
+        }
+    });
 
-    // `with_live` has erased the block; reprint the finished lines as ordinary
-    // output, so the summary stays on screen and a later resize reflows it like
-    // any command's output (the block itself was already resize-safe; see
-    // `crate::live`).
     match q.into_inner().unwrap().fatal {
         Some(e) => Err(e),
-        None => {
-            for g in &groups {
-                eprintln!("{}", render(g));
-            }
-            eprintln!("⏱ {} {}", human_elapsed(start.elapsed()), render_total());
-            Ok(())
-        }
+        None => Ok(()),
     }
 }
 
@@ -967,7 +942,13 @@ fn run_shards<T: Send>(
 /// are held there too), so an interrupted eval re-runs from scratch rather than
 /// resuming; when an eval's last shard lands, its rows are assembled and
 /// written as the one cached file.
-pub fn eval_pairs(repo: &Path, pairs: &[(Rev, String)], opts: EvalOpts) -> Result<()> {
+pub fn eval_pairs(
+    repo: &Path,
+    pairs: &[(Rev, String)],
+    opts: EvalOpts,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     // Dedupe on the eval key `(tree, system)`: `npd X X`, repeated --system, or
     // two revisions sharing a tree would otherwise run the same eval twice
@@ -995,15 +976,23 @@ pub fn eval_pairs(repo: &Path, pairs: &[(Rev, String)], opts: EvalOpts) -> Resul
 
     // One shard group per `(tree, system)` for both phases below; `meta` keeps
     // the identifying `(rev, system)` per group (the rev supplies fetchGit's
-    // commit; the tree is its cache key), `labels` the display name.
+    // commit; the tree is its cache key), `labels` the error-message name.
     let meta: Vec<(&Rev, &str)> = todo
         .iter()
         .map(|&i| (&pairs[i].0, pairs[i].1.as_str()))
         .collect();
     let labels: Vec<String> = meta
         .iter()
-        .map(|(rev, system)| format!("{} {system}", short_label(&rev.label)))
+        .map(|(rev, system)| format!("{} {system}", rev.display))
         .collect();
+    let groups: Vec<(String, String)> = meta
+        .iter()
+        .map(|(rev, system)| (system.to_string(), rev.display.clone()))
+        .collect();
+    // Both phase subtrees are created up front, so `evaluate` shows as waiting
+    // (blue) under the same commit displays while `enumerate` runs (DESIGN §6).
+    let enum_nodes = add_phase(tree, "enumerate", &groups);
+    let eval_nodes = add_phase(tree, "evaluate", &groups);
 
     // Phase 1: enumerate each pair's top-level attr names — the space phase 2
     // shards. This runs through the *same scheduler*, one shard per pair (the
@@ -1020,16 +1009,15 @@ pub fn eval_pairs(repo: &Path, pairs: &[(Rev, String)], opts: EvalOpts) -> Resul
     let enumerated: Vec<Mutex<Vec<String>>> =
         (0..meta.len()).map(|_| Mutex::new(Vec::new())).collect();
     run_shards(
+        enum_nodes,
         labels.clone(),
         // One placeholder item per group ⇒ exactly one shard per pair.
         meta.iter().map(|_| vec![String::new()]).collect(),
         1,
         slots,
-        ShardWords {
-            unit: "attrs",
-            active: "enumerating",
-            done: "enumerated",
-        },
+        // Enumerate discovers its attr count, so there is no denominator to show.
+        false,
+        handle,
         |gi, _label, _slice, on_item| {
             let (rev, system) = meta[gi];
             let names = enumerate_names(repo, &rev.commit, system)?;
@@ -1048,15 +1036,15 @@ pub fn eval_pairs(repo: &Path, pairs: &[(Rev, String)], opts: EvalOpts) -> Resul
 
     // Phase 2: shard-evaluate every pair's enumerated names into its cached file.
     run_shards(
+        eval_nodes,
         labels,
         items,
         opts.shard_size.unwrap_or(NAMES_PER_SHARD),
         slots,
-        ShardWords {
-            unit: "attrs",
-            active: "evaluating",
-            done: "evaluated",
-        },
+        // One streamed job per enumerated name, so the enumerated count is the
+        // total the count climbs toward.
+        true,
+        handle,
         // Evaluate one shard by streaming its own one-worker `nix-eval-jobs`.
         |gi, label, names, on_item| {
             let (rev, system) = meta[gi];
@@ -1088,6 +1076,8 @@ pub fn eval_two(
     head: &Rev,
     systems: &[String],
     opts: EvalOpts,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
 ) -> Result<()> {
     let mut pairs: Vec<(Rev, String)> = Vec::with_capacity(systems.len() * 2);
     for s in systems {
@@ -1096,7 +1086,7 @@ pub fn eval_two(
     for s in systems {
         pairs.push((head.clone(), s.clone()));
     }
-    eval_pairs(repo, &pairs, opts)
+    eval_pairs(repo, &pairs, opts, tree, handle)
 }
 
 #[cfg(test)]

@@ -30,9 +30,21 @@
 /// working-tree/patch head — the report renders the latter as its anchor commit
 /// with a trailing `\*` ("this commit, plus a diff"), not the bare word.
 ///
+/// [`display`] is the *human* name of the side for the live progress tree
+/// ([`crate::live`]): the ref the user actually expressed (or the default's
+/// name) rather than a resolved sha — `master`, `HEAD`, a branch, `#431 base` —
+/// and, for a commit npd *derives*, an honest description of it: `merge(a, b)`
+/// for a synthetic merge, `merge-base(a, b)` for a `--no-merge` fork point,
+/// `HEAD *` for a working-tree/patch head. It describes the tree actually
+/// evaluated (DESIGN §6), so a sha appears only if the user typed one. Distinct
+/// from [`label`] precisely because `label` is a real committish the repro path
+/// feeds to `git`, and the report heading keeps showing it as a sha (GitHub
+/// auto-links it); the tree wants the friendly form.
+///
 /// [`tree`]: Rev::tree
 /// [`commit`]: Rev::commit
 /// [`label`]: Rev::label
+/// [`display`]: Rev::display
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rev {
     /// The git tree hash — the eval cache key.
@@ -42,6 +54,8 @@ pub struct Rev {
     /// Identity label: a commit sha, or `worktree` for a synthetic
     /// working-tree/patch head (rendered as its anchor commit + `\*`).
     pub label: String,
+    /// Human name of this side for the live progress tree (see type docs).
+    pub display: String,
 }
 
 /// Result of evaluating one attribute on one platform at one commit.

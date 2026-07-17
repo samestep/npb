@@ -22,14 +22,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::cache;
-use crate::live::{human_elapsed, spinner, with_live};
+use crate::live;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
 use crate::store::Store;
 
@@ -365,7 +363,7 @@ fn drvs_to_materialize_at(
 /// `nix-store`) the failures every time. Probes run concurrently
 /// (`cache::in_cache_many`). Idempotent: recorded facts make the next call a
 /// no-op.
-fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -> Result<()> {
+fn probe_candidates(store: &Store, targets: &[Target], policy: BuildPolicy) -> Result<Vec<String>> {
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
     let has_fact = |drv: &str| {
@@ -385,37 +383,17 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
             to_probe.push(t.drv_path.clone());
         }
     }
-    // The probe is HTTP-bound and, on a first run over a big changed set, can
-    // take a silent minute — so drive the shared live display (`with_live`) with
-    // a spinner + running count off the counter the probe workers bump.
-    let total = to_probe.len();
-    let probed = if to_probe.is_empty() {
-        HashMap::new()
-    } else {
-        let done = AtomicUsize::new(0);
-        let start = Instant::now();
-        let probed = with_live(
-            |tick| {
-                vec![format!(
-                    "{} ⏱ {} probing cache.nixos.org — {}/{total} drvs",
-                    spinner(tick),
-                    human_elapsed(start.elapsed()),
-                    done.load(Ordering::Relaxed),
-                )]
-            },
-            |_handle| cache::in_cache_many(&to_probe, &done),
-        );
-        // Keep a frozen summary on screen (like the eval's), so it's easy to see
-        // how long the probe took and how much of the set was already cached.
-        let cached = probed.values().filter(|&&v| v).count();
-        eprintln!(
-            "⏱ {} probed cache.nixos.org — {cached}/{total} already cached",
-            human_elapsed(start.elapsed()),
-        );
-        probed
-    };
+    Ok(to_probe)
+}
+
+/// Record a `Cache`/`Built` observation for each probed drv that was a hit.
+fn record_hits(
+    store: &mut Store,
+    to_probe: &[String],
+    probed: &HashMap<String, bool>,
+) -> Result<()> {
     let now = unix_now();
-    for drv in &to_probe {
+    for drv in to_probe {
         if probed.get(drv).copied().unwrap_or(false) {
             store.add_observation(&Observation {
                 drv_path: drv.clone(),
@@ -429,12 +407,55 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
     Ok(())
 }
 
+/// Gather any missing cache facts for `targets`, reporting each resolved drv via
+/// `progress`. Idempotent: a fully-known set probes nothing. The display-less
+/// form used by [`build_targets_at`] (facts are normally already probed by the
+/// tree phase below, so this is a no-op there).
+fn probe_and_record(
+    store: &mut Store,
+    targets: &[Target],
+    policy: BuildPolicy,
+    progress: &(dyn Fn(usize) + Sync),
+) -> Result<()> {
+    let to_probe = probe_candidates(store, targets, policy)?;
+    if to_probe.is_empty() {
+        return Ok(());
+    }
+    let probed = cache::in_cache_many(&to_probe, progress);
+    record_hits(store, &to_probe, &probed)
+}
+
+/// The narinfo probe as a phase of the live progress tree (DESIGN §7): a
+/// cross-cutting `probe` leaf whose count climbs over the union of drvs with no
+/// fact yet. Runs inside the tree, before the nom build, so the build set is
+/// fully decided from facts. A fully-known set adds no node and does nothing —
+/// which is what keeps a re-run of an unchanged report near-instant (no HTTP).
+pub fn probe_facts(targets: &[Target], policy: BuildPolicy, tree: &live::Tree) -> Result<()> {
+    let mut store = Store::open(&crate::paths::db_path()?)?;
+    let to_probe = probe_candidates(&store, targets, policy)?;
+    if to_probe.is_empty() {
+        return Ok(());
+    }
+    let node = tree.counter("probe", 0, to_probe.len() as i64);
+    node.set_running();
+    let bump = {
+        let n = node.clone();
+        move |k: usize| n.add_count(k as i64)
+    };
+    let probed = cache::in_cache_many(&to_probe, &bump);
+    record_hits(&mut store, &to_probe, &probed)?;
+    node.set_done();
+    Ok(())
+}
+
 fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
     let mut store = Store::open(db)?;
 
     // Gather any missing cache facts, then load every target's history in one
     // SQLite round-trip — an all-known set costs a single query, no network.
-    probe_new_facts(&mut store, targets, policy)?;
+    // (The tree's probe phase normally recorded these already, so this is a
+    // no-op; it stays for the test path that drives the build directly.)
+    probe_and_record(&mut store, targets, policy, &|_| {})?;
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
     let obs_of = |drv: &str| obs_by_drv.get(drv).map(Vec::as_slice).unwrap_or(&[]);
@@ -653,7 +674,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn target(drv: &str, skipped: bool) -> Target {
         Target {
