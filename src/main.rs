@@ -605,6 +605,23 @@ fn apply_merge(
     Ok((base_tip, merge))
 }
 
+/// Reject a review whose two sides resolve to the same git tree. The eval is
+/// tree-keyed (DESIGN §6), so identical trees mean an empty diff and a no-op
+/// build/report — reached only after a minute of cold eval. Equal trees is a
+/// mistake far more often than a deliberate cache-warm (a bare `npd` on a clean
+/// checkout, an unmoved `--pr`, a `--base`/`--head` typo), so bail loudly
+/// *before* evaluating rather than warm one base eval as a silent side effect.
+fn ensure_distinct_trees(base: &Rev, head: &Rev) -> Result<()> {
+    if base.tree == head.tree {
+        bail!(
+            "base and head are the same tree ({}) — nothing to review.\n\
+             (A clean checkout, an unmoved --pr, or a --base/--head typo?)",
+            &base.tree,
+        );
+    }
+    Ok(())
+}
+
 /// Mint a deterministic synthetic merge of `head` onto `base` (base as first
 /// parent), mirroring [`worktree_source`]: `git merge-tree` produces the merged
 /// tree without touching the working tree, and over it we `commit-tree` with a
@@ -1160,6 +1177,8 @@ fn run(cli: Cli) -> Result<()> {
                     )?,
                 };
 
+                ensure_distinct_trees(&base, &head)?;
+
                 let (per_system_changed, targets) = run_phases(
                     &repo, &base, &head, &systems, opts, policy, tests, no_skip, &tree, handle,
                 )?;
@@ -1356,6 +1375,37 @@ mod tests {
         assert!(skipped_of("/d/ab"));
         assert!(!skipped_of("/d/t0"));
         assert!(!skipped_of("/d/t1"));
+    }
+
+    #[test]
+    fn same_tree_is_rejected_but_a_real_change_is_not() {
+        // A repo with two commits that actually differ in content, so their
+        // trees differ (empty commits would share the one empty tree).
+        let repo = tempfile::tempdir().unwrap();
+        let d = repo.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("x"), "1\n").unwrap();
+        g(d, &["add", "x"]);
+        g(d, &["commit", "-m", "A"]);
+        std::fs::write(d.join("x"), "2\n").unwrap();
+        g(d, &["commit", "-am", "B"]);
+
+        // A bare `npd` on a clean master checkout: base = master, head = HEAD,
+        // fast-forward merge ⇒ one tree. That's the wasted no-op we reject.
+        let (base, head) = resolve_local(d, None, None, None, false, None).unwrap();
+        assert_eq!(base.tree, head.tree);
+        let err = ensure_distinct_trees(&base, &head).unwrap_err().to_string();
+        assert!(err.contains("same tree"), "{err}");
+        assert!(err.contains("nothing to review"), "{err}");
+
+        // An explicit base a commit back has a genuinely different tree, so the
+        // review proceeds.
+        let (base, head) =
+            resolve_local(d, Some("HEAD~1".into()), None, None, false, None).unwrap();
+        assert_ne!(base.tree, head.tree);
+        ensure_distinct_trees(&base, &head).unwrap();
     }
 
     /// Run git in `dir`, returning trimmed stdout; panics on failure.

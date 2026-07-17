@@ -529,6 +529,14 @@ tip, head)` pair, npd reports one of two deltas:
   against the same base-branch tip shares its base eval (per-PR fork points never
   did). A conflicted PR (no `merge` ref) or a conflicting local merge can't take
   this path, so it fails with a message pointing at `--no-merge`.
+
+  When the resolved `base` and `head` land on the **same tree** — a bare `npd`
+  on a clean checkout, an unmoved `--pr`, a `--base`/`--head` typo — there is
+  nothing to review: the eval is tree-keyed, so the diff is empty and the whole
+  build/report is a no-op reached only after a minute of cold eval. npd bails
+  with an error before evaluating rather than warm one base eval as a silent
+  side effect; equal trees is a mistake far more often than a deliberate
+  cache-warm, and erroring surfaces it loudly.
 - *`--no-merge`* — the older, cheaper shape: `merge-base(base, head) → head`,
   the fork point. Offline and instant (no merge to build), but blind to base
   drift since the fork point, and — in the default mode — it assumes `master`
