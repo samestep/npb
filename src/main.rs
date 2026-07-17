@@ -1080,6 +1080,7 @@ fn run(cli: Cli) -> Result<()> {
     let tree = live::Tree::new(
         live::plan_label_width(&systems, cli.pr, compare_literal),
         systems.len() > 1,
+        live::colors_enabled(),
     );
 
     // Resolution and every pre-build phase run inside one `with_live`, so the tree

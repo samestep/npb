@@ -36,16 +36,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use console::{Term, style, truncate_str};
+use console::{Term, truncate_str};
 
 /// Braille spinner frames (indicatif's default set).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// The cyan spinner glyph for tick `n` — the leading char of a timer line.
-/// Callers advance `n` once per redraw to animate it.
-pub fn spinner(n: usize) -> String {
-    style(SPINNER[n % SPINNER.len()]).cyan().to_string()
-}
 
 /// A block of lines redrawn in place. `drawn` is the number of rows the last
 /// frame occupied — equal to the line count, since every line is one row.
@@ -173,7 +167,7 @@ impl LiveHandle<'_> {
 /// (a steady 100 ms redraw that keeps the spinner + timer moving even while the
 /// work itself is silent) and tear down identically. `frame(tick)` returns the
 /// block's lines for tick `tick` — the caller composes its own spinner/timer via
-/// [`spinner`]/[`human_elapsed`] — and is only ever called from the refresher,
+/// [`human_elapsed`] — and is only ever called from the refresher,
 /// reading whatever atomics `body`'s workers bump (so those need no locking).
 /// When `body` returns, the block is erased (the caller then prints any frozen
 /// summary as ordinary output) and `body`'s value is returned; `body` gets a
@@ -393,18 +387,23 @@ pub struct Tree {
     start: Instant,
     min_label_w: usize,
     multi: bool,
-    /// Whether stderr is a terminal — gates coloring the frozen reprint.
+    /// Whether to colorize stderr — a TTY with `NO_COLOR`/`CLICOLOR` allowing it,
+    /// per `console` (DESIGN §11). Gates ALL color: the state-colored labels, the
+    /// dim `/ total` and `%` columns, the spinner, and the resting `.`. Note this
+    /// is orthogonal to *interactivity* (redraw-in-place), which is a plain TTY
+    /// check in [`with_live`] — `NO_COLOR` on a TTY still redraws, just monochrome.
     color: bool,
 }
 
 impl Tree {
-    pub fn new(min_label_w: usize, multi: bool) -> Self {
+    /// `color` gates all SGR; production passes [`colors_enabled`], tests force it.
+    pub fn new(min_label_w: usize, multi: bool, color: bool) -> Self {
         Self {
             nodes: Mutex::new(Vec::new()),
             start: Instant::now(),
             min_label_w,
             multi,
-            color: Term::stderr().is_term(),
+            color,
         }
     }
 
@@ -494,9 +493,10 @@ impl Tree {
         self.nodes.lock().unwrap().is_empty()
     }
 
-    /// The live frame for tick `t`: node lines plus a cyan spinner + clock footer.
+    /// The live frame for tick `t`: node lines plus a spinner + clock footer
+    /// (colorized only when [`Tree::color`]).
     pub fn render(&self, t: usize) -> Vec<String> {
-        self.lines(Some(t), true)
+        self.lines(Some(t), self.color)
     }
 
     /// The frozen reprint (permanent scrollback): the same node lines with a
@@ -595,11 +595,19 @@ impl Tree {
         }
 
         let clock = human_elapsed(self.start.elapsed());
-        out.push(match tick {
-            Some(t) => format!("{} {clock}", spinner(t)),
+        let footer = match tick {
+            Some(t) => {
+                let g = SPINNER[t % SPINNER.len()];
+                if color {
+                    format!("{CYAN}{g}{RESET} {clock}")
+                } else {
+                    format!("{g} {clock}")
+                }
+            }
             None if color => format!("{CYAN}.{RESET} {clock}"),
             None => format!(". {clock}"),
-        });
+        };
+        out.push(footer);
         out
     }
 }
@@ -698,6 +706,14 @@ pub fn plan_label_width(systems: &[String], pr: Option<u64>, compare: Option<&st
     w
 }
 
+/// Whether npd should emit color (SGR) on stderr — a TTY with `NO_COLOR` /
+/// `CLICOLOR` permitting it, per `console` (which also honors `CLICOLOR_FORCE`).
+/// The single source of truth for color; orthogonal to interactivity (a plain
+/// TTY check), so `NO_COLOR` on a TTY still redraws in place, just monochrome.
+pub fn colors_enabled() -> bool {
+    console::colors_enabled_stderr()
+}
+
 /// npd's one visual separator, on stderr, between each of its phases (the live
 /// tree, nom's build, the report): a blank line, a dim rule, a blank line — the
 /// spacing does the separating, the rule just marks it. Dimmed only on a
@@ -705,7 +721,7 @@ pub fn plan_label_width(systems: &[String], pr: Option<u64>, compare: Option<&st
 pub fn separator() {
     let rule = "---";
     eprintln!();
-    if Term::stderr().is_term() {
+    if console::colors_enabled_stderr() {
         eprintln!("{DIM}{rule}{RESET}");
     } else {
         eprintln!("{rule}");
@@ -745,7 +761,7 @@ mod tests {
         // Single system: phase → commit. Colors live only on the label; the count
         // is plain, the ` / total` dim, nothing bold. A done side collapses to a
         // bare count; a running side shows `count / total`.
-        let tree = Tree::new(0, false);
+        let tree = Tree::new(0, false, true);
         tree.node("evaluate", 0);
         let base = tree.counter("master", 1, -1);
         let head = tree.counter("HEAD", 1, -1);
@@ -771,11 +787,34 @@ mod tests {
     }
 
     #[test]
+    fn no_color_renders_no_sgr() {
+        // With color off (NO_COLOR, or a non-terminal), the same tree emits zero
+        // SGR — plain text, identical layout.
+        let tree = Tree::new(0, false, false);
+        tree.node("evaluate", 0);
+        let head = tree.counter("HEAD", 1, 114231);
+        head.set_running();
+        head.add_count(107347);
+        let lines = node_lines(&tree);
+        assert!(
+            lines.iter().all(|l| !l.contains('\x1b')),
+            "no ANSI escapes: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "evaluate".to_string(),
+                "  HEAD    107347 / 114231".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn percent_node_smooths_and_keeps_pct_when_done() {
         // evaluate: a plain drv count (middle) PLUS a dim shard `NN%` (right). The
         // shard total is known up front, so just turning yellow with shards
         // running reads its true small percent — NOT 100%.
-        let tree = Tree::new(0, false);
+        let tree = Tree::new(0, false, true);
         tree.node("evaluate", 0);
         let head = tree.percent("HEAD", 1);
         head.set_shards_total(10);
@@ -810,7 +849,7 @@ mod tests {
     fn waiting_counter_populates_its_number() {
         // A counter populates its number immediately — even while blue (waiting)
         // it reads `0`, rather than blank until it turns yellow.
-        let tree = Tree::new(0, false);
+        let tree = Tree::new(0, false, true);
         tree.node("tests", 0);
         tree.counter("HEAD", 1, -1); // left in WAIT
         assert_eq!(
@@ -827,7 +866,7 @@ mod tests {
         // `tests` systems appear as each becomes ready, but a later-ready system
         // that sorts earlier splices ABOVE an already-present one — the section
         // stays in fixed system order regardless of completion order.
-        let tree = Tree::new(0, true);
+        let tree = Tree::new(0, true, true);
         let phase = tree.node("tests", 0);
         for (label, key) in [("sysB", 1), ("sysA", 0), ("sysC", 2)] {
             let sys = tree.detached_node(label, 1, key);
@@ -848,7 +887,7 @@ mod tests {
 
     #[test]
     fn rollup_all_done_is_green() {
-        let tree = Tree::new(0, false);
+        let tree = Tree::new(0, false, true);
         tree.node("enumerate", 0);
         for c in ["master", "HEAD"] {
             let n = tree.counter(c, 1, -1);
@@ -861,7 +900,7 @@ mod tests {
 
     #[test]
     fn empty_tree_draws_nothing() {
-        let tree = Tree::new(11, false);
+        let tree = Tree::new(11, false, true);
         assert!(tree.is_empty());
         assert!(tree.render(0).is_empty());
         assert!(tree.render_frozen().is_empty());
