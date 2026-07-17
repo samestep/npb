@@ -890,6 +890,6 @@ The **build monitor** follows the same color axis: `nom` (which honors neither
 `batch_build` still parses nix's `internal-json` — that's what records each drv's
 outcome incrementally, the ^C-safety of §5, independent of nom — but renders a
 plain `building`/`built`/`failed` append log itself, matching the plain pre-build
-mode.
+mode — two columns, the event kind then the full `.drv` store path.
 
 [#129]: https://github.com/maralorn/nix-output-monitor/issues/129

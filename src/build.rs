@@ -48,16 +48,6 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// A drv's short human name for the plain (non-nom) build log: `hello-2.12`
-/// from `/nix/store/<hash>-hello-2.12.drv` — strip the store dir, the `.drv`
-/// suffix, and the leading `<hash>-` (the hash has no `-`, so the first one
-/// splits it off the name).
-fn drv_name(drv: &str) -> &str {
-    let base = drv.rsplit('/').next().unwrap_or(drv);
-    let stem = base.strip_suffix(".drv").unwrap_or(base);
-    stem.split_once('-').map(|(_, n)| n).unwrap_or(stem)
-}
-
 /// nix internal-json log event (only the fields we use).
 #[derive(Deserialize)]
 struct NixEvent {
@@ -72,14 +62,21 @@ struct NixEvent {
 /// The `actBuild` activity type in nix's internal-json log.
 const ACT_BUILD: i64 = 105;
 
+/// Width the plain build log's event-kind column is left-padded to, so the store
+/// paths that follow line up. The verbs are a fixed set — `building` (8, the
+/// widest), `built`, `failed` — so a constant suffices; the log streams events
+/// one at a time and can't compute a width from the batch.
+const VERB_W: usize = 8;
+
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
 /// together with its own parallelism — while acting as a middleman: nix emits
 /// `--log-format internal-json`, which we always parse for build (`type:105`)
 /// start/stop events, and — when colorizing (a TTY, `NO_COLOR` unset) — also
 /// forward to `nom --json` for the live tree. Off a TTY or under `NO_COLOR`
 /// (nom honors neither), nom is skipped and we render a plain append-only
-/// `building`/`built`/`failed` log ourselves from the same events.
-/// `--keep-going` so every drv is attempted.
+/// `building`/`built`/`failed` log ourselves from the same events — two columns,
+/// the event kind then the full `.drv` store path. `--keep-going` so every drv
+/// is attempted.
 ///
 /// `on_finish(drv)` fires as *every* build activity stops — the requested
 /// drvs and their transitive dependencies alike (the caller records a
@@ -157,7 +154,7 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
                         (ev.id, ev.fields.first().and_then(|v| v.as_str()))
                     {
                         if nom_in.is_none() {
-                            eprintln!("building {}", drv_name(drv));
+                            eprintln!("{:<VERB_W$}  {drv}", "building");
                         }
                         starts.insert(id, drv.to_string());
                     }
@@ -175,7 +172,7 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
                             } else {
                                 "failed"
                             };
-                            eprintln!("{verb} {}", drv_name(&drv));
+                            eprintln!("{verb:<VERB_W$}  {drv}");
                         }
                         on_finish(&drv)?;
                     }
@@ -732,16 +729,6 @@ mod tests {
             drv_path: drv.into(),
             skipped,
         }
-    }
-
-    #[test]
-    fn drv_name_strips_store_dir_hash_and_suffix() {
-        assert_eq!(
-            drv_name("/nix/store/abc123def456ghi789jkl012mno345pq-hello-2.12.1.drv"),
-            "hello-2.12.1"
-        );
-        // A hyphen-free stem degrades gracefully to the whole stem.
-        assert_eq!(drv_name("weird"), "weird");
     }
 
     fn planted(drv: &str, source: Source, outcome: Outcome) -> Observation {
