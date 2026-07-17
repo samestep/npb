@@ -45,6 +45,11 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// frame occupied — equal to the line count, since every line is one row.
 pub struct Live {
     term: Term,
+    /// Whether to actually drive the terminal (move the cursor, redraw). When
+    /// off, every method is a no-op and the caller uses the plain append-only
+    /// log instead. This is [`colors_enabled`], not a bare TTY check: `NO_COLOR`
+    /// takes the same plain path as a pipe (there's no monochrome-redraw mode).
+    interactive: bool,
     drawn: usize,
     /// Lines shown last frame, and the width they were truncated at — so a frame
     /// only rewrites the lines that changed (and forces a full redraw on resize).
@@ -53,9 +58,10 @@ pub struct Live {
 }
 
 impl Live {
-    pub fn new() -> Self {
+    pub fn new(interactive: bool) -> Self {
         Self {
             term: Term::stderr(),
+            interactive,
             drawn: 0,
             prev: Vec::new(),
             prev_width: 0,
@@ -69,7 +75,7 @@ impl Live {
     /// Redraw the block in place. A no-op on a non-terminal stderr (piped / CI):
     /// there is no cursor to move, and the caller's final summary still prints.
     pub fn draw(&mut self, lines: &[String]) {
-        if !self.term.is_term() {
+        if !self.interactive {
             return;
         }
         let w = self.width();
@@ -106,7 +112,7 @@ impl Live {
     /// e.g. a requeued shard). The block is erased and reappears on the next
     /// [`Live::draw`], below the now-permanent message.
     pub fn print_above(&mut self, msg: &str) {
-        if !self.term.is_term() {
+        if !self.interactive {
             eprintln!("{msg}");
             return;
         }
@@ -130,7 +136,7 @@ impl Live {
     /// Erase the block, leaving the cursor at its top. The caller then prints a
     /// clean, unpadded final summary as ordinary output.
     pub fn clear(&mut self) {
-        if self.term.is_term() && self.drawn > 0 {
+        if self.interactive && self.drawn > 0 {
             let _ = self
                 .term
                 .write_str(&format!("\x1b[{}A\r\x1b[J", self.drawn));
@@ -160,24 +166,25 @@ impl LiveHandle<'_> {
 
 /// Run `body` while a refresher thread reflects `tree`'s progress on stderr,
 /// then freeze it — npd's single progress-display primitive for the whole
-/// pre-build phase (resolution → probe). Two modes, on the one orthogonal axis
-/// `NO_COLOR` does *not* touch — interactivity:
+/// pre-build phase (resolution → probe). Two modes, keyed on [`colors_enabled`]
+/// (a TTY with color permitted) — so `NO_COLOR` takes the same plain path as a
+/// pipe, there being no monochrome-redraw middle ground:
 ///
-/// - **interactive** (stderr is a TTY): redraw the whole tree in place every
-///   100 ms ([`Tree::render`]); on teardown erase it and reprint it frozen as
-///   permanent scrollback.
-/// - **plain** (non-TTY — piped, CI, an AI agent): can't move the cursor, so
-///   emit an append-only log — each node's line once, the moment it completes
-///   ([`Tree::emit_completed`]) — with a resting footer at the end. This gives
-///   incremental output (and survives a mid-phase ^C) where the redraw would
-///   have been silent until the final dump.
+/// - **interactive** (a color TTY): redraw the whole tree in place every 100 ms
+///   ([`Tree::render`]); on teardown erase it and reprint it frozen as permanent
+///   scrollback.
+/// - **plain** (piped, CI, an AI agent, or `NO_COLOR`): can't / shouldn't move
+///   the cursor, so emit an append-only log — each node's line once, the moment
+///   it completes ([`Tree::emit_completed`]) — with a resting footer at the end.
+///   This gives incremental output (and survives a mid-phase ^C) where the
+///   redraw would have been silent until the final dump.
 ///
 /// The refresher only reads the atomics `body`'s workers bump (no locking on the
 /// hot path); `body` gets a [`LiveHandle`] for one-off notes above the block
-/// (which fall back to plain `eprintln` off a TTY).
+/// (which fall back to plain `eprintln` in the plain mode).
 pub fn with_live<R>(tree: &Tree, body: impl FnOnce(LiveHandle<'_>) -> R) -> R {
-    let interactive = Term::stderr().is_term();
-    let display = Mutex::new(Live::new());
+    let interactive = colors_enabled();
+    let display = Mutex::new(Live::new(interactive));
     let done = AtomicBool::new(false);
     let mut out = None;
     thread::scope(|s| {
@@ -800,8 +807,10 @@ pub fn plan_label_width(systems: &[String], pr: Option<u64>, compare: Option<&st
 
 /// Whether npd should emit color (SGR) on stderr — a TTY with `NO_COLOR` /
 /// `CLICOLOR` permitting it, per `console` (which also honors `CLICOLOR_FORCE`).
-/// The single source of truth for color; orthogonal to interactivity (a plain
-/// TTY check), so `NO_COLOR` on a TTY still redraws in place, just monochrome.
+/// The single source of truth for BOTH color and interactivity: color-off and
+/// plain (append-only, no cursor moves) are the same mode, so `NO_COLOR` behaves
+/// exactly like a pipe — there's no monochrome-redraw middle ground. (The build
+/// phase mirrors this: nom only when this is true, else a plain build log.)
 pub fn colors_enabled() -> bool {
     console::colors_enabled_stderr()
 }

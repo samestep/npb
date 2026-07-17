@@ -855,29 +855,27 @@ Recorded for context:
 ## 11. Progress display: color, interactivity, and the build monitor
 
 The pre-build progress tree (§6, `live::Tree`/`with_live`) and the build monitor
-(§5, `nom`) key off **two orthogonal axes**, each resolved once through the
-`console` crate:
+(§5, `nom`) key off **one** predicate, resolved once through the `console` crate:
+`live::colors_enabled` (→ `console::colors_enabled_stderr`, honoring `NO_COLOR`,
+`CLICOLOR`, `CLICOLOR_FORCE`, and the TTY). It gates **both** color *and*
+interactivity — the two are deliberately fused: rather than a third
+monochrome-redraw mode, `NO_COLOR` takes the exact same plain path as a pipe.
+(The informal `NO_COLOR` standard is strictly *color only*, so treating it as
+"non-interactive" is a small deliberate over-reach for simplicity — one fewer
+mode to carry, and a `NO_COLOR` user on a TTY still gets clean, readable output.)
 
-- **color** (`live::colors_enabled` → `console::colors_enabled_stderr`) — whether
-  to emit any ANSI color, honoring `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, and
-  the TTY. `NO_COLOR` means *color only* (the informal standard), **not** "no
-  ANSI" — so it never disables interactive redrawing, only color.
-- **interactive** (stderr is a TTY) — whether the cursor may be moved to redraw
-  in place. `NO_COLOR` does not affect this.
+So the pre-build tree has two modes, rendering the same node lines:
 
-So the pre-build tree has three modes, all rendering the same node lines:
+| stderr | mode |
+| --- | --- |
+| a color TTY | **interactive** — redraw in place, colored; frozen to scrollback at the end |
+| piped, CI, an AI agent, or `NO_COLOR` | **plain** — no color, no cursor moves; each node's line printed once the moment it completes (a leaf on green, its parent headers lazily just before it), a resting footer at the end |
 
-| stderr | color | mode |
-| --- | --- | --- |
-| TTY, `NO_COLOR` unset | yes | **interactive-color** — redraw in place, colored; frozen to scrollback at the end |
-| TTY, `NO_COLOR` set | no | **interactive-mono** — the same redraw, monochrome |
-| non-TTY (pipe, CI, an AI agent) | no | **plain-append** — no cursor moves; each node's line printed once the moment it completes (a leaf on green, its parent headers lazily just before it), a resting footer at the end |
-
-The plain-append log (`Tree::emit_completed`) exists so a non-TTY run gets
-*incremental* output — and survives a mid-phase `^C` — where the redraw would be
-silent until a final dump. It reads like the final interactive frame minus color
-and animation, in completion order (the phases finish in order, so the sections
-don't interleave).
+The plain append log (`Tree::emit_completed`) exists so a non-interactive run
+gets *incremental* output — and survives a mid-phase `^C` — where the redraw
+would be silent until a final dump. It reads like the final interactive frame
+minus color and animation, in completion order (the phases finish in order, so
+the sections don't interleave).
 
 The **build monitor** follows the same color axis: `nom` (which honors neither
 `NO_COLOR` — [#129] — nor a non-TTY) runs **only when colorizing**. Otherwise
