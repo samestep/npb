@@ -158,33 +158,40 @@ impl LiveHandle<'_> {
     }
 }
 
-/// Run `body` while a refresher thread animates a live progress block on stderr.
+/// Run `body` while a refresher thread reflects `tree`'s progress on stderr,
+/// then freeze it — npd's single progress-display primitive for the whole
+/// pre-build phase (resolution → probe). Two modes, on the one orthogonal axis
+/// `NO_COLOR` does *not* touch — interactivity:
 ///
-/// This is npd's single progress-display primitive: every phase that shows a
-/// live readout — the shard scheduler ([`crate::eval::run_shards`], which backs
-/// eval, `--tests`, enumeration, and instantiation) and the cache probe
-/// ([`crate::build`]) — drives it through here, so they all animate identically
-/// (a steady 100 ms redraw that keeps the spinner + timer moving even while the
-/// work itself is silent) and tear down identically. `frame(tick)` returns the
-/// block's lines for tick `tick` — the caller composes its own spinner/timer via
-/// [`human_elapsed`] — and is only ever called from the refresher,
-/// reading whatever atomics `body`'s workers bump (so those need no locking).
-/// When `body` returns, the block is erased (the caller then prints any frozen
-/// summary as ordinary output) and `body`'s value is returned; `body` gets a
-/// [`LiveHandle`] for notes above the block.
-pub fn with_live<R>(
-    frame: impl Fn(usize) -> Vec<String> + Sync,
-    body: impl FnOnce(LiveHandle<'_>) -> R,
-) -> R {
+/// - **interactive** (stderr is a TTY): redraw the whole tree in place every
+///   100 ms ([`Tree::render`]); on teardown erase it and reprint it frozen as
+///   permanent scrollback.
+/// - **plain** (non-TTY — piped, CI, an AI agent): can't move the cursor, so
+///   emit an append-only log — each node's line once, the moment it completes
+///   ([`Tree::emit_completed`]) — with a resting footer at the end. This gives
+///   incremental output (and survives a mid-phase ^C) where the redraw would
+///   have been silent until the final dump.
+///
+/// The refresher only reads the atomics `body`'s workers bump (no locking on the
+/// hot path); `body` gets a [`LiveHandle`] for one-off notes above the block
+/// (which fall back to plain `eprintln` off a TTY).
+pub fn with_live<R>(tree: &Tree, body: impl FnOnce(LiveHandle<'_>) -> R) -> R {
+    let interactive = Term::stderr().is_term();
     let display = Mutex::new(Live::new());
     let done = AtomicBool::new(false);
     let mut out = None;
     thread::scope(|s| {
-        let (display, done, frame) = (&display, &done, &frame);
+        let (display, done) = (&display, &done);
         s.spawn(move || {
             let mut tick = 0usize;
             while !done.load(Ordering::Relaxed) {
-                display.lock().unwrap().draw(&frame(tick));
+                if interactive {
+                    display.lock().unwrap().draw(&tree.render(tick));
+                } else {
+                    for l in tree.emit_completed() {
+                        eprintln!("{l}");
+                    }
+                }
                 thread::sleep(Duration::from_millis(100));
                 tick += 1;
             }
@@ -192,7 +199,21 @@ pub fn with_live<R>(
         out = Some(body(LiveHandle { display }));
         done.store(true, Ordering::Relaxed);
     });
-    display.lock().unwrap().clear();
+    // Teardown, with the workers joined (no concurrency). An empty tree (a
+    // fully-cached run) prints nothing either way.
+    if interactive {
+        display.lock().unwrap().clear();
+        for l in tree.render_frozen() {
+            eprintln!("{l}");
+        }
+    } else {
+        for l in tree.emit_completed() {
+            eprintln!("{l}");
+        }
+        if !tree.is_empty() {
+            eprintln!("{}", tree.frozen_footer());
+        }
+    }
     out.unwrap()
 }
 
@@ -278,6 +299,10 @@ pub struct Node {
     shards_done: AtomicI64,
     shards_running: AtomicI64,
     shards_total: AtomicI64,
+    /// Whether this node's line has already been printed by the non-interactive
+    /// append-only log ([`Tree::emit_completed`]) — so each node prints exactly
+    /// once. Unused (and untouched) in the interactive redraw path.
+    emitted: AtomicBool,
 }
 
 impl Node {
@@ -301,6 +326,7 @@ impl Node {
             shards_done: AtomicI64::new(0),
             shards_running: AtomicI64::new(0),
             shards_total: AtomicI64::new(0),
+            emitted: AtomicBool::new(false),
         }
     }
 
@@ -513,21 +539,7 @@ impl Tree {
         }
         // Snapshot the raw per-node fields, then roll parent states up from their
         // descendant leaves.
-        let snap: Vec<Row> = nodes
-            .iter()
-            .map(|n| Row {
-                depth: n.depth,
-                label: n.label.as_str(),
-                counter: n.counter,
-                state: n.state.load(Ordering::Relaxed),
-                count: n.count.load(Ordering::Relaxed),
-                total: n.total.load(Ordering::Relaxed),
-                percent: n.percent,
-                sdone: n.shards_done.load(Ordering::Relaxed),
-                srunning: n.shards_running.load(Ordering::Relaxed),
-                stotal: n.shards_total.load(Ordering::Relaxed),
-            })
-            .collect();
+        let snap: Vec<Row> = nodes.iter().map(node_row).collect();
         let eff: Vec<u8> = (0..snap.len()).map(|i| eff_state(&snap, i)).collect();
 
         // The number columns start past the widest label of ANY node, so a
@@ -537,62 +549,11 @@ impl Tree {
             left_w = left_w.max(INDENT.len() * r.depth + r.label.chars().count());
         }
 
-        let mut out = Vec::with_capacity(snap.len() + 1);
-        for (i, r) in snap.iter().enumerate() {
-            let (depth, label, counter, count, total, percent, sdone, srunning, stotal) = (
-                r.depth, r.label, r.counter, r.count, r.total, r.percent, r.sdone, r.srunning,
-                r.stotal,
-            );
-            let col = state_color(eff[i]);
-            let indent = INDENT.repeat(depth);
-            // A count populates immediately for any counter node — even while
-            // blue (waiting) it reads `0`, rather than appearing only once the
-            // node turns yellow. A count-less node (a phase, a system,
-            // `enumerate`) never shows a number, just a state color.
-            if !counter {
-                out.push(if color {
-                    format!("{col}{indent}{label}{RESET}")
-                } else {
-                    format!("{indent}{label}")
-                });
-                continue;
-            }
-            let left = format!("{indent}{label}");
-            let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
-            let count_s = format!("{count:>NUM_W$}");
-            // The rightmost column stays for the node's whole life (waiting →
-            // running → done, never dropped): a `percent` node's dim `NN%` (right-
-            // aligned in the number column, `%`, no slash), else a dim ` / total`
-            // when the item total is known. A running shard counts as half-done —
-            // the mean of finished and finished+running shards — so the percentage
-            // climbs smoothly instead of only stepping when a whole shard lands.
-            let right = if percent {
-                let denom = (2 * stotal).max(1);
-                let pct = ((2 * sdone + srunning) * 100 / denom).clamp(0, 100);
-                let p = format!("{pct:>NUM_W$}");
-                if color {
-                    format!("{DIM}   {p}%{RESET}")
-                } else {
-                    format!("   {p}%")
-                }
-            } else if total >= 0 {
-                let t = format!("{total:>NUM_W$}");
-                if color {
-                    format!("{DIM} / {t}{RESET}")
-                } else {
-                    format!(" / {t}")
-                }
-            } else {
-                String::new()
-            };
-            // Only the label carries the state color; the count is plain (like the
-            // clock), the ` / total` / percent columns dim.
-            if color {
-                out.push(format!("{col}{left}{pad}{RESET}  {count_s}{right}"));
-            } else {
-                out.push(format!("{left}{pad}  {count_s}{right}"));
-            }
-        }
+        let mut out: Vec<String> = snap
+            .iter()
+            .enumerate()
+            .map(|(i, r)| render_row(r, eff[i], left_w, color))
+            .collect();
 
         let clock = human_elapsed(self.start.elapsed());
         let footer = match tick {
@@ -604,11 +565,142 @@ impl Tree {
                     format!("{g} {clock}")
                 }
             }
-            None if color => format!("{CYAN}.{RESET} {clock}"),
-            None => format!(". {clock}"),
+            None => self.frozen_footer(),
         };
         out.push(footer);
         out
+    }
+
+    /// The resting footer — a `.` (cyan when colorized) and the final elapsed —
+    /// shown once a phase is done (the frozen interactive reprint, and the tail
+    /// of the non-interactive append log).
+    fn frozen_footer(&self) -> String {
+        let clock = human_elapsed(self.start.elapsed());
+        if self.color {
+            format!("{CYAN}.{RESET} {clock}")
+        } else {
+            format!(". {clock}")
+        }
+    }
+
+    /// The non-interactive (non-TTY) counterpart to [`render`]: instead of
+    /// redrawing in place, emit each node's line exactly once, the moment it's
+    /// done — a leaf when it turns green, a parent (phase / system) lazily just
+    /// before its first emitted descendant (ancestors top-down). Returns the
+    /// newly-emitted lines (empty when nothing new completed); the refresher
+    /// prints them and calls again next tick. The result reads like the final
+    /// interactive frame, minus color and animation, in completion order.
+    pub fn emit_completed(&self) -> Vec<String> {
+        let nodes = self.nodes.lock().unwrap();
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        let snap: Vec<Row> = nodes.iter().map(node_row).collect();
+        let mut left_w = self.min_label_w;
+        for r in &snap {
+            left_w = left_w.max(INDENT.len() * r.depth + r.label.chars().count());
+        }
+        let mut out = Vec::new();
+        for i in 0..snap.len() {
+            // A leaf: no deeper node follows. Emit only once it's actually done.
+            let is_leaf = i + 1 >= snap.len() || snap[i + 1].depth <= snap[i].depth;
+            if !is_leaf || snap[i].state != DONE {
+                continue;
+            }
+            // Its ancestors: the nearest node at each shallower depth, collected
+            // deepest-first then reversed so headers print top-down before the leaf.
+            let mut ancestors = Vec::new();
+            let mut want = snap[i].depth as i64 - 1;
+            let mut j = i as i64 - 1;
+            while want >= 0 && j >= 0 {
+                if snap[j as usize].depth as i64 == want {
+                    ancestors.push(j as usize);
+                    want -= 1;
+                }
+                j -= 1;
+            }
+            for &a in ancestors.iter().rev().chain(std::iter::once(&i)) {
+                if !nodes[a].emitted.swap(true, Ordering::Relaxed) {
+                    out.push(render_row(
+                        &snap[a],
+                        eff_state(&snap, a),
+                        left_w,
+                        self.color,
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Snapshot one node's fields for rendering — atomics read once so a frame is
+/// self-consistent and [`eff_state`] can roll parents up over a plain slice.
+fn node_row(n: &Arc<Node>) -> Row<'_> {
+    Row {
+        depth: n.depth,
+        label: n.label.as_str(),
+        counter: n.counter,
+        state: n.state.load(Ordering::Relaxed),
+        count: n.count.load(Ordering::Relaxed),
+        total: n.total.load(Ordering::Relaxed),
+        percent: n.percent,
+        sdone: n.shards_done.load(Ordering::Relaxed),
+        srunning: n.shards_running.load(Ordering::Relaxed),
+        stotal: n.shards_total.load(Ordering::Relaxed),
+    }
+}
+
+/// Render one node's line — the label (state-colored when `color`), then for a
+/// counter its plain middle count and dim right column (` / total` or `NN%`).
+/// Shared by the interactive frame and the append-only log so they match.
+fn render_row(r: &Row, eff: u8, left_w: usize, color: bool) -> String {
+    let col = state_color(eff);
+    let indent = INDENT.repeat(r.depth);
+    // A count-less node (a phase, a system, `enumerate`) is just a state color.
+    if !r.counter {
+        return if color {
+            format!("{col}{indent}{}{RESET}", r.label)
+        } else {
+            format!("{indent}{}", r.label)
+        };
+    }
+    // A count populates immediately for any counter node — even while blue
+    // (waiting) it reads `0`, not blank until it turns yellow.
+    let left = format!("{indent}{}", r.label);
+    let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
+    let count_s = format!("{:>NUM_W$}", r.count);
+    // The rightmost column stays for the node's whole life (waiting → running →
+    // done, never dropped): a `percent` node's dim `NN%` (right-aligned in the
+    // number column, `%`, no slash), else a dim ` / total` when the item total is
+    // known. A running shard counts as half-done — the mean of finished and
+    // finished+running shards — so the percentage climbs smoothly instead of only
+    // stepping when a whole shard lands.
+    let right = if r.percent {
+        let denom = (2 * r.stotal).max(1);
+        let pct = ((2 * r.sdone + r.srunning) * 100 / denom).clamp(0, 100);
+        let p = format!("{pct:>NUM_W$}");
+        if color {
+            format!("{DIM}   {p}%{RESET}")
+        } else {
+            format!("   {p}%")
+        }
+    } else if r.total >= 0 {
+        let t = format!("{:>NUM_W$}", r.total);
+        if color {
+            format!("{DIM} / {t}{RESET}")
+        } else {
+            format!(" / {t}")
+        }
+    } else {
+        String::new()
+    };
+    // Only the label carries the state color; the count is plain (like the clock),
+    // the ` / total` / percent columns dim.
+    if color {
+        format!("{col}{left}{pad}{RESET}  {count_s}{right}")
+    } else {
+        format!("{left}{pad}  {count_s}{right}")
     }
 }
 
@@ -883,6 +975,42 @@ mod tests {
             out.find("sysC").unwrap(),
         );
         assert!(a < b && b < c, "must render in sort-key order: {out:?}");
+    }
+
+    #[test]
+    fn emit_completed_prints_leaves_on_done_ancestors_first_once() {
+        // The non-interactive append log: a leaf prints only once it's done, its
+        // parent headers print once just before its first done child (ancestors
+        // top-down), and nothing re-prints on a later call.
+        let tree = Tree::new(0, true, false); // multi (system level), no color
+        let phase = tree.node("evaluate", 0);
+        let a1 = tree.detached_counter("base", 2, -1, 0);
+        let a2 = tree.detached_counter("head", 2, -1, 0);
+        tree.insert_sorted(
+            &phase,
+            vec![tree.detached_node("sysA", 1, 0), a1.clone(), a2.clone()],
+        );
+
+        assert!(tree.emit_completed().is_empty()); // nothing done yet
+
+        a1.set_running();
+        a1.add_count(5);
+        a1.set_done();
+        assert_eq!(
+            tree.emit_completed(),
+            vec![
+                "evaluate".to_string(),
+                "  sysA".to_string(),
+                "    base       5".to_string(),
+            ]
+        );
+        assert!(tree.emit_completed().is_empty()); // base emitted, head not done
+
+        a2.set_running();
+        a2.add_count(7);
+        a2.set_done();
+        // head only — its ancestors were already emitted.
+        assert_eq!(tree.emit_completed(), vec!["    head       7".to_string()]);
     }
 
     #[test]
