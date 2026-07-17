@@ -479,15 +479,20 @@ impl Tree {
         Arc::new(Node::new(label.into(), depth, false, false, -1, sort_key))
     }
 
-    /// Build a counting leaf WITHOUT appending it (for [`insert_sorted`]).
-    pub fn detached_counter(
+    /// Build a `NN%` shard-progress leaf WITHOUT appending it (for
+    /// [`insert_sorted`]) — the `tests` counterpart of [`percent`], for the same
+    /// reason: its count is streamed test *jobs* (a package has one or more
+    /// tests), so the package count isn't its denominator, but it drives the
+    /// shard progress the `%` shows.
+    ///
+    /// [`percent`]: Tree::percent
+    pub fn detached_percent(
         &self,
         label: impl Into<String>,
         depth: usize,
-        total: i64,
         sort_key: i64,
     ) -> Arc<Node> {
-        Arc::new(Node::new(label.into(), depth, true, false, total, sort_key))
+        Arc::new(Node::new(label.into(), depth, true, true, 0, sort_key))
     }
 
     /// Splice a subtree in among `phase`'s children, keeping them ordered by
@@ -559,7 +564,7 @@ impl Tree {
         let mut out: Vec<String> = snap
             .iter()
             .enumerate()
-            .map(|(i, r)| render_row(r, eff[i], left_w, color))
+            .map(|(i, r)| render_row(r, eff[i], left_w, color, true))
             .collect();
 
         let clock = human_elapsed(self.start.elapsed());
@@ -628,11 +633,14 @@ impl Tree {
             }
             for &a in ancestors.iter().rev().chain(std::iter::once(&i)) {
                 if !nodes[a].emitted.swap(true, Ordering::Relaxed) {
+                    // `progress: false` — the append log shows only the label and
+                    // final count, no resting `NN%` / ` / total`.
                     out.push(render_row(
                         &snap[a],
                         eff_state(&snap, a),
                         left_w,
                         self.color,
+                        false,
                     ));
                 }
             }
@@ -659,9 +667,11 @@ fn node_row(n: &Arc<Node>) -> Row<'_> {
 }
 
 /// Render one node's line — the label (state-colored when `color`), then for a
-/// counter its plain middle count and dim right column (` / total` or `NN%`).
-/// Shared by the interactive frame and the append-only log so they match.
-fn render_row(r: &Row, eff: u8, left_w: usize, color: bool) -> String {
+/// counter its plain middle count and, when `progress`, a dim right column
+/// (` / total` or `NN%`). Shared by the interactive frame and the append-only
+/// log so they match; the log passes `progress = false` because its lines only
+/// appear once a node is done, where a resting `100%` / `N / N` is just noise.
+fn render_row(r: &Row, eff: u8, left_w: usize, color: bool, progress: bool) -> String {
     let col = state_color(eff);
     let indent = INDENT.repeat(r.depth);
     // A count-less node (a phase, a system, `enumerate`) is just a state color.
@@ -678,12 +688,15 @@ fn render_row(r: &Row, eff: u8, left_w: usize, color: bool) -> String {
     let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
     let count_s = format!("{:>NUM_W$}", r.count);
     // The rightmost column stays for the node's whole life (waiting → running →
-    // done, never dropped): a `percent` node's dim `NN%` (right-aligned in the
-    // number column, `%`, no slash), else a dim ` / total` when the item total is
-    // known. A running shard counts as half-done — the mean of finished and
-    // finished+running shards — so the percentage climbs smoothly instead of only
-    // stepping when a whole shard lands.
-    let right = if r.percent {
+    // done, never dropped) in the interactive frame: a `percent` node's dim `NN%`
+    // (right-aligned in the number column, `%`, no slash), else a dim ` / total`
+    // when the item total is known. A running shard counts as half-done — the mean
+    // of finished and finished+running shards — so the percentage climbs smoothly
+    // instead of only stepping when a whole shard lands. The append-only log omits
+    // it entirely (`!progress`).
+    let right = if !progress {
+        String::new()
+    } else if r.percent {
         let denom = (2 * r.stotal).max(1);
         let pct = ((2 * r.sdone + r.srunning) * 100 / denom).clamp(0, 100);
         let p = format!("{pct:>NUM_W$}");
@@ -971,7 +984,7 @@ mod tests {
         let phase = tree.node("tests", 0);
         for (label, key) in [("sysB", 1), ("sysA", 0), ("sysC", 2)] {
             let sys = tree.detached_node(label, 1, key);
-            let leaf = tree.detached_counter("HEAD", 2, -1, key);
+            let leaf = tree.detached_percent("HEAD", 2, key);
             tree.insert_sorted(&phase, vec![sys, leaf]);
         }
         let lines = node_lines(&tree);
@@ -993,8 +1006,8 @@ mod tests {
         // top-down), and nothing re-prints on a later call.
         let tree = Tree::new(0, true, false); // multi (system level), no color
         let phase = tree.node("evaluate", 0);
-        let a1 = tree.detached_counter("base", 2, -1, 0);
-        let a2 = tree.detached_counter("head", 2, -1, 0);
+        let a1 = tree.detached_percent("base", 2, 0);
+        let a2 = tree.detached_percent("head", 2, 0);
         tree.insert_sorted(
             &phase,
             vec![tree.detached_node("sysA", 1, 0), a1.clone(), a2.clone()],

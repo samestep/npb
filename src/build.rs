@@ -469,18 +469,48 @@ fn probe_and_record(
     record_hits(store, &to_probe, &probed)
 }
 
-/// The narinfo probe as a phase of the live progress tree (DESIGN §7): a
-/// cross-cutting `probe` leaf whose count climbs over the union of drvs with no
-/// fact yet. Runs inside the tree, before the nom build, so the build set is
-/// fully decided from facts. A fully-known set adds no node and does nothing —
-/// which is what keeps a re-run of an unchanged report near-instant (no HTTP).
-pub fn probe_facts(targets: &[Target], policy: BuildPolicy, tree: &live::Tree) -> Result<()> {
-    let mut store = Store::open(&crate::paths::db_path()?)?;
+/// A prepared narinfo probe: its (blue) tree node, the drvs to probe, and the
+/// store to record hits into — from [`probe_prepare`], run by [`probe_execute`].
+pub struct Probe {
+    store: Store,
+    to_probe: Vec<String>,
+    node: std::sync::Arc<live::Node>,
+}
+
+/// Reveal the narinfo `probe` leaf (DESIGN §7) — a cross-cutting phase whose
+/// count climbs over the union of drvs with no fact yet — as a blue node, with
+/// its total, *before* it runs. The candidate set comes from the observation log
+/// alone (no `.drv` needed), so this can appear alongside `instantiate` while
+/// both are still blue; the actual HTTP HEADs ([`probe_execute`]) read each
+/// drv's output paths from its `.drv`, so they run only after `instantiate` has
+/// written them. A fully-known build set adds no node and returns `None` — which
+/// is what keeps a re-run of an unchanged report near-instant (no HTTP).
+pub fn probe_prepare(
+    targets: &[Target],
+    policy: BuildPolicy,
+    tree: &live::Tree,
+) -> Result<Option<Probe>> {
+    let store = Store::open(&crate::paths::db_path()?)?;
     let to_probe = probe_candidates(&store, targets, policy)?;
     if to_probe.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let node = tree.counter("probe", 0, to_probe.len() as i64);
+    Ok(Some(Probe {
+        store,
+        to_probe,
+        node,
+    }))
+}
+
+/// Run a prepared probe: HEAD each drv's outputs on `cache.nixos.org` and record
+/// the hits, driving its node (blue → yellow → green).
+pub fn probe_execute(probe: Probe) -> Result<()> {
+    let Probe {
+        mut store,
+        to_probe,
+        node,
+    } = probe;
     node.set_running();
     let bump = {
         let n = node.clone();

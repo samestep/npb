@@ -898,7 +898,12 @@ fn reveal_system_tests(
         subtree.push(tree.detached_node(sys.to_string(), 1, sys_index));
     }
     for (rev, misses) in pending {
-        let node = tree.detached_counter(rev.display.clone(), depth, -1, sys_index);
+        // A `NN%` shard-progress leaf (like `evaluate`): its count is streamed
+        // test jobs — a package yields one or more tests — so the package count
+        // isn't the count's denominator, but it *is* what the shard `%` tracks,
+        // which is exactly the "how many packages to look for tests for" figure
+        // we waited for the diff to learn.
+        let node = tree.detached_percent(rev.display.clone(), depth, sys_index);
         subtree.push(node.clone());
         acc.requests.push((rev, sys.to_string(), misses));
         acc.nodes.push(node);
@@ -1039,12 +1044,20 @@ fn run_phases(
         inst.push((base.clone(), sys.clone(), base_attrs));
         inst.push((head.clone(), sys.clone(), head_attrs));
     }
-    eval::instantiate(repo, &inst, tree, handle)?;
-
-    // Probe the cache for the drvs with no fact yet — the run's only network
-    // phase inside the tree (a cross-cutting `probe` leaf). Runs before the nom
-    // build so the build set is fully decided from facts.
-    build::probe_facts(&targets, policy, tree)?;
+    // Reveal both `instantiate` and `probe` as blue nodes up front — the probe
+    // candidate set (and thus its total) is known from the log the moment the
+    // changed set is, no `.drv` needed — so `probe` no longer waits for
+    // `instantiate` to finish before appearing (DESIGN §9). Prepare both (probe's
+    // node sorts below instantiate's), then run in order: the probe's HTTP HEADs
+    // read each drv's outputs from its `.drv`, so they must follow instantiation.
+    let inst = eval::instantiate_prepare(tree, &inst);
+    let probe = build::probe_prepare(&targets, policy, tree)?;
+    if let Some(inst) = inst {
+        eval::instantiate_execute(repo, inst, handle)?;
+    }
+    if let Some(probe) = probe {
+        build::probe_execute(probe)?;
+    }
 
     Ok((per_system_changed, targets))
 }

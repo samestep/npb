@@ -680,12 +680,47 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String]) -> String
     )
 }
 
-/// Write the changed set's `.drv` files to the store. npd's evals run with
-/// `--no-instantiate` (drvPath + outputs only — no `.drv` writes for the ~114k
-/// attrs it never builds), so the drvs the build and the narinfo probe actually
-/// touch — the small changed set — are materialized here, one `nix-eval-jobs`
-/// run per `(commit, system)` with instantiation on. Streamed rows are
-/// discarded; the store write is the point. Runs only when about to build.
+/// A prepared instantiate: its (blue) tree nodes and the non-empty requests they
+/// pair with, from [`instantiate_prepare`], ready for [`instantiate_execute`].
+pub struct Instantiate {
+    requests: Vec<(Rev, String, Vec<String>)>,
+    nodes: Vec<Arc<live::Node>>,
+}
+
+/// Create the `instantiate` phase's (blue) nodes for the requests with something
+/// to do, returning them paired with those requests. Split from execution so the
+/// caller can reveal the `probe` node — which sorts *below* `instantiate` — while
+/// this phase is still only blue, so both appear at once (DESIGN §9). `None` when
+/// there's nothing to instantiate.
+pub fn instantiate_prepare(
+    tree: &live::Tree,
+    requests: &[(Rev, String, Vec<String>)],
+) -> Option<Instantiate> {
+    // Drop the sides with nothing to instantiate (a diff side can have no
+    // buildable changed attrs) so they don't clutter the display.
+    let requests: Vec<(Rev, String, Vec<String>)> = requests
+        .iter()
+        .filter(|(_, _, p)| !p.is_empty())
+        .cloned()
+        .collect();
+    if requests.is_empty() {
+        return None;
+    }
+    let groups: Vec<(String, String)> = requests
+        .iter()
+        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
+        .collect();
+    let nodes = add_phase(tree, "instantiate", &groups, Leaf::Count);
+    Some(Instantiate { requests, nodes })
+}
+
+/// Write the changed set's `.drv` files to the store (DESIGN §6). npd's evals run
+/// with `--no-instantiate` (drvPath + outputs only — no `.drv` writes for the
+/// ~114k attrs it never builds), so the drvs the build and the narinfo probe
+/// actually touch — the small changed set — are materialized here, one
+/// `nix-eval-jobs` run per `(commit, system)` with instantiation on. Streamed
+/// rows are discarded; the store write is the point. Runs only when about to
+/// build.
 ///
 /// The per-pair runs go through the **same shard scheduler** as the two eval
 /// paths (`run_shards`) so they run concurrently and get the identical live
@@ -696,26 +731,13 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String]) -> String
 /// re-pay that import for no gain. Concurrency is what wins — the phase's
 /// wall-time drops from the *sum* of the imports to (roughly) the *slowest*
 /// one, up to `slots` at a time, at no extra total work.
-pub fn instantiate(
+pub fn instantiate_execute(
     repo: &Path,
-    requests: &[(Rev, String, Vec<String>)],
-    tree: &live::Tree,
+    inst: Instantiate,
     handle: live::LiveHandle<'_>,
 ) -> Result<()> {
-    // Drop the sides with nothing to instantiate (a diff side can have no
-    // buildable changed attrs) so they don't clutter the display.
-    let requests: Vec<&(Rev, String, Vec<String>)> =
-        requests.iter().filter(|(_, _, p)| !p.is_empty()).collect();
-    if requests.is_empty() {
-        return Ok(());
-    }
+    let Instantiate { requests, nodes } = inst;
     let slots = default_slots(None);
-
-    let groups: Vec<(String, String)> = requests
-        .iter()
-        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
-        .collect();
-    let nodes = add_phase(tree, "instantiate", &groups, Leaf::Count);
     let labels: Vec<String> = requests
         .iter()
         .map(|(rev, system, _)| format!("{} {system}", rev.display))
