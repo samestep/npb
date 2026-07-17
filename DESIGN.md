@@ -726,15 +726,19 @@ tree is recovered on another machine:
     it builds a binary-capable diff that reproduces offline (see the embed bullet).
     The compare form is kept for the common text-only PR, where it stays compact.
   - **a compare `--patch A...B`** → `--head <sha> --patch <shaA>...<shaB>`, the
-    same compare form, but with both endpoints resolved to shas *in the local
-    clone* (`pin_compare`) before either the review's download or the repro is
-    formed. A raw `A...B` echoed into the repro would name whatever `A`/`B` are
-    (e.g. `<sha>...master`), and re-fetching `compare/A...B.diff` later resolves
-    them against the *current* tips — a different diff, applied onto the same
-    pinned anchor, silently reviewing a different tree while still exiting zero.
-    Pinning both sides keeps the compare compact and re-fetchable yet immutable.
-    (Resolving the endpoints locally means they must exist in the clone — and,
-    being shas, on GitHub; a name the clone lacks is a hard error, not a drift.)
+    same compare form, but with both endpoints pinned to immutable shas
+    (`pin_compare`) before either the review's download or the repro is formed. A
+    raw `A...B` echoed into the repro would name whatever `A`/`B` are (e.g.
+    `<sha>...master`), and re-fetching `compare/A...B.diff` later resolves them
+    against the *current* tips — a different diff, applied onto the same pinned
+    anchor, silently reviewing a different tree while still exiting zero. Pinning
+    both sides keeps the compare compact and re-fetchable yet immutable. An
+    endpoint that is already a full 40-hex sha is content-addressed and immutable
+    on its own, so it passes through as-is *without* needing to exist in the local
+    clone (`pin_endpoint`) — a compare can thus name a commit the clone never
+    fetched (a fork's PR head, say) that GitHub still resolves in its fork
+    network. Any other name (a branch, tag, short sha) is resolved in the local
+    clone, so a name the clone lacks is a hard error, not a drift.
   - **working tree, or a file `--patch <path>`** → `--head <sha> --patch /dev/stdin`,
     where the diff has no durable re-fetchable identity (a local, unpushable
     working tree, or a diff file that won't exist elsewhere), so it rides along in

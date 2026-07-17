@@ -510,22 +510,43 @@ fn fetch_compare_diff(expr: &str) -> Result<String> {
         .with_context(|| format!("reading the diff from {url}"))
 }
 
-/// Pin a compare expression `A...B` to `<shaA>...<shaB>` by resolving *both*
-/// endpoints in the local clone (each `resolve_commit`ed exactly once). The
+/// Pin a compare expression `A...B` to `<shaA>...<shaB>` by pinning *both*
+/// endpoints to an immutable sha (each [`pin_endpoint`]ed exactly once). The
 /// resulting immutable expression is what npd hands GitHub — for this review's
 /// download *and* for the reproduction command — so re-fetching it later returns
 /// the identical diff no matter how `A`/`B` have moved since. The `...`
 /// (merge-base) form is preserved: GitHub still diffs `merge-base(shaA, shaB)`
-/// against `shaB`, just against fixed commits. Endpoints must therefore resolve
-/// locally (and, being shas, exist on GitHub); a name the clone lacks is a hard
-/// error here rather than a silently-drifting review later.
+/// against `shaB`, just against fixed commits.
 fn pin_compare(repo: &std::path::Path, expr: &str) -> Result<String> {
     let (a, b) = expr
         .split_once("...")
         .with_context(|| format!("compare expression must be `A...B`; got {expr:?}"))?;
-    let a = resolve_commit(repo, a)?;
-    let b = resolve_commit(repo, b)?;
+    let a = pin_endpoint(repo, a)?;
+    let b = pin_endpoint(repo, b)?;
     Ok(format!("{a}...{b}"))
+}
+
+/// True if `rev` is a full-length (40-hex) commit sha. Such a name is already
+/// immutable and content-addressed, so it needs no local resolution to be
+/// drift-proof — GitHub can resolve it in nixpkgs's fork network even when the
+/// endpoint isn't fetchable in the local clone.
+fn is_full_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Pin one compare endpoint to an immutable sha. A full sha is already immutable
+/// (and lives in GitHub's fork network), so it passes through as-is *without*
+/// needing to exist in the local clone — this lets a compare name a commit the
+/// clone never fetched (a PR head from a fork, say) that GitHub can still diff.
+/// Any other name (a branch, a tag, a short sha) is resolved in the local clone,
+/// so a name the clone lacks is a hard error here rather than a silently-drifting
+/// review later.
+fn pin_endpoint(repo: &std::path::Path, rev: &str) -> Result<String> {
+    if is_full_sha(rev) {
+        Ok(rev.to_ascii_lowercase())
+    } else {
+        resolve_commit(repo, rev)
+    }
 }
 
 /// Resolve a revision (ref, short/full sha, tag, `HEAD~1`, …) to a full commit
@@ -747,7 +768,7 @@ enum HeadRepro {
     /// fork network, so a pinned compare resolves even after a rebase. `expr` is
     /// always sha-pinned (`<shaA>...<shaB>`): `--pr` builds it from the PR's
     /// resolved endpoints, and a `--patch A...B` review pins both endpoints
-    /// locally via `pin_compare` — so re-fetching it can never drift.
+    /// via `pin_compare` — so re-fetching it can never drift.
     Compare { anchor: String, expr: String },
     /// Rebuild the head by applying an embedded `diff` onto `anchor`:
     /// `--head <anchor> --patch /dev/stdin <<'PATCH' … PATCH`. For a diff with no
@@ -1113,11 +1134,11 @@ fn run(cli: Cli) -> Result<()> {
     let (base, head, patch_anchor, patch_compare, patch_diff, per_system_changed, targets) =
         live::with_live(&tree, |handle| {
             // --patch: obtain the diff — a local file, or a GitHub compare
-            // download (`A...B`). `pin_compare` resolves both endpoints to
-            // shas *once* (locally), and that immutable `<shaA>...<shaB>` drives
-            // both the download and the reproduction command, so a moved branch
-            // can't hand back a different diff on reproduction. The download is
-            // a live network node.
+            // download (`A...B`). `pin_compare` pins both endpoints to shas
+            // *once*, and that immutable `<shaA>...<shaB>` drives both the
+            // download and the reproduction command, so a moved branch can't hand
+            // back a different diff on reproduction. The download is a live
+            // network node.
             let mut patch_compare: Option<String> = None;
             let patch_diff: Option<String> = match &cli.patch {
                 None => None,
@@ -1811,10 +1832,10 @@ mod tests {
     }
 
     #[test]
-    fn pin_compare_pins_both_endpoints_locally() {
-        // A compare `A...B` must be pinned to `<shaA>...<shaB>` against the local
-        // clone, so the expression handed to GitHub — for the download *and* the
-        // repro — is immutable and can't drift when `A`/`B` later move.
+    fn pin_compare_pins_both_endpoints() {
+        // A compare `A...B` must be pinned to `<shaA>...<shaB>`, so the expression
+        // handed to GitHub — for the download *and* the repro — is immutable and
+        // can't drift when `A`/`B` later move.
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         g(d, &["-c", "init.defaultBranch=master", "init", "."]);
@@ -1829,7 +1850,7 @@ mod tests {
         let b = resolve_commit(d, "HEAD").unwrap();
 
         // A branch endpoint pins to the sha it currently names; a sha endpoint
-        // passes through (resolving a full sha is idempotent).
+        // passes through (pinning a full sha is idempotent).
         assert_eq!(
             pin_compare(d, &format!("{a}...master")).unwrap(),
             format!("{a}...{b}")
@@ -1838,8 +1859,21 @@ mod tests {
             pin_compare(d, &format!("{a}...{b}")).unwrap(),
             format!("{a}...{b}")
         );
-        // A malformed expression and an unresolvable endpoint are hard errors,
-        // not a silently-mispinned compare.
+        // A full sha the clone never fetched still pins (GitHub resolves it in the
+        // fork network) — this is the whole point of `pin_endpoint`: it needn't be
+        // a local object, only immutable. An uppercase sha normalizes to lowercase.
+        let absent = "5f96e8fa57f8703504fe54b642bfcb4264aa9d4d";
+        assert!(resolve_commit(d, absent).is_err());
+        assert_eq!(
+            pin_compare(d, &format!("{a}...{absent}")).unwrap(),
+            format!("{a}...{absent}")
+        );
+        assert_eq!(
+            pin_compare(d, &format!("{a}...{}", absent.to_ascii_uppercase())).unwrap(),
+            format!("{a}...{absent}")
+        );
+        // A malformed expression and an unresolvable *non-sha* endpoint are hard
+        // errors, not a silently-mispinned compare.
         assert!(pin_compare(d, "only-one-side").is_err());
         assert!(pin_compare(d, &format!("{a}...no-such-ref")).is_err());
     }
