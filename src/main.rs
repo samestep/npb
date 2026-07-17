@@ -27,10 +27,20 @@ use clap::Parser;
 
 use crate::model::{BuildPolicy, Rev};
 
+/// The npd source tree this binary was built from, as a GitHub URL. `NPD_REV`
+/// is baked in by the Nix build (`self.rev`, or `main` for a dirty tree); it is
+/// what `--version` prints and what the report heading links `npd` to.
+pub const URL: &str = concat!(
+    "https://github.com/samestep/",
+    env!("CARGO_PKG_NAME"),
+    "/tree/",
+    env!("NPD_REV"),
+);
+
 #[derive(Parser)]
 #[command(
     name = "npd",
-    version,
+    version = URL,
     about = "A persistent fact store for iterating on nixpkgs changes"
 )]
 struct Cli {

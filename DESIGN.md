@@ -674,6 +674,12 @@ merge-base under `--no-merge` — §6) it **builds both sides of the changed
 set** (skipping anything already known or substitutable), so a fresh report has
 a real state for every row rather than a wall of `❔`.
 
+The heading links `npd` to the exact source tree the binary was built from —
+`https://github.com/samestep/npd/tree/<rev>`, from the `URL` const in
+`src/main.rs`, whose `<rev>` the Nix build bakes in as `NPD_REV` (`self.rev`, or
+`main` for a dirty tree). `--version` prints the same URL, so a report and the
+binary that produced it point at one commit. This is npc's `--version` scheme.
+
 **Every report opens with a copy-pasteable reproduction command** (a ```sh```
 block right under the heading, `repro_command` in `src/main.rs`) so anyone can
 re-run `npd` on the *exact same changeset* — not the ambiguous invocation the
