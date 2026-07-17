@@ -1106,11 +1106,12 @@ pub fn eval_two(
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<()> {
+    // System-major, base-then-head — the order the tree displays them (grouped
+    // by system, base above head), so the shard scheduler works through them in
+    // that same order rather than all bases first (DESIGN §6).
     let mut pairs: Vec<(Rev, String)> = Vec::with_capacity(systems.len() * 2);
     for s in systems {
         pairs.push((base.clone(), s.clone()));
-    }
-    for s in systems {
         pairs.push((head.clone(), s.clone()));
     }
     eval_pairs(repo, &pairs, opts, tree, handle)

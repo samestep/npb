@@ -445,9 +445,11 @@ impl Tree {
             );
             let col = state_color(eff[i]);
             let indent = INDENT.repeat(depth);
-            // A count shows for any counter node once active (running or done); a
-            // count-less node (a phase, a system, `enumerate`) never shows one.
-            if !(counter && eff[i] != WAIT) {
+            // A count populates immediately for any counter node — even while
+            // blue (waiting) it reads `0`, rather than appearing only once the
+            // node turns yellow. A count-less node (a phase, a system,
+            // `enumerate`) never shows a number, just a state color.
+            if !counter {
                 out.push(if color {
                     format!("{col}{indent}{label}{RESET}")
                 } else {
@@ -458,11 +460,11 @@ impl Tree {
             let left = format!("{indent}{label}");
             let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
             let count_s = format!("{count:>NUM_W$}");
-            // The rightmost column is a live progress hint, so it shows only while
-            // running (dropped once done): a `percent` node's dim `NN%` (right-
-            // aligned in the number column, `%`, no slash), else a dim ` / total`
-            // when the item total is known.
-            let right = if eff[i] != RUN {
+            // The rightmost column is a live progress hint, so it shows while
+            // waiting and running and collapses once done: a `percent` node's dim
+            // `NN%` (right-aligned in the number column, `%`, no slash), else a dim
+            // ` / total` when the item total is known.
+            let right = if eff[i] == DONE {
                 String::new()
             } else if percent {
                 let pct = (sdone * 100 / stotal.max(1)).clamp(0, 100);
@@ -689,8 +691,9 @@ mod tests {
     }
 
     #[test]
-    fn waiting_counter_shows_no_number() {
-        // A counter still in WAIT renders as a bare colored label — no `0`.
+    fn waiting_counter_populates_its_number() {
+        // A counter populates its number immediately — even while blue (waiting)
+        // it reads `0`, rather than blank until it turns yellow.
         let tree = Tree::new(0, false);
         tree.node("tests", 0);
         tree.counter("HEAD", 1, -1); // left in WAIT
@@ -698,7 +701,7 @@ mod tests {
             node_lines(&tree),
             vec![
                 "\x1b[34mtests\x1b[0m".to_string(),
-                "\x1b[34m  HEAD\x1b[0m".to_string(),
+                "\x1b[34m  HEAD\x1b[0m       0".to_string(),
             ]
         );
     }
