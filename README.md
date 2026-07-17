@@ -72,6 +72,8 @@ That command may not give you the same result if you run it yourself, but `npd`'
 
 - **causal.** Derivations are built on both sides of the change, so the report makes it clear which failures are regressions and which were preexisting.
 
+- **thorough.** By default, the tool finds and runs tests associated with the affected packages, and includes those test outcomes in the report.
+
 - **cached.** It takes a nontrivial amount of time to run Nix evaluations and failing builds, so the tool caches these; re-runs should always take less than one second.
 
 - **efficient.** Caching is not an excuse to be slow the first time, so on a cold run, the tool automatically chooses a point along the Pareto frontier to parallelize according to how much RAM is available.
