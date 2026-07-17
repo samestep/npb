@@ -648,7 +648,7 @@ like nixpkgs-review; a real build fact from a `--no-skip` run outranks the
 marking; a *missing* attr is `➖` absent, not this), `➖`
 absent (no such attr on that side, or it no longer evaluates — a *known* fact,
 never a `?`; in a delta view an eval breakage is visible as disappearance, so
-there is no separate eval-error state), `❓` unbuilt
+there is no separate eval-error state), `❔` unbuilt
 (has a drv but no fact yet — since builds always run, only the build phase's
 accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
@@ -664,7 +664,7 @@ An `npd` run is not merely read-only: with defaults (`head` = `HEAD` merged onto
 the `master` tip; or the PR merged onto its base branch under `--pr`; or the
 merge-base under `--no-merge` — §6) it **builds both sides of the changed
 set** (skipping anything already known or substitutable), so a fresh report has
-a real state for every row rather than a wall of `❓`.
+a real state for every row rather than a wall of `❔`.
 
 **Every report opens with a copy-pasteable reproduction command** (a ```sh```
 block right under the heading, `repro_command` in `src/main.rs`) so anyone can

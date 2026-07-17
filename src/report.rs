@@ -43,7 +43,7 @@ impl State {
             State::Blocked => "🚫",
             State::Skipped => "⏩",
             State::Absent => "➖",
-            State::Unknown => "❓",
+            State::Unknown => "❔",
         }
     }
 }
