@@ -326,6 +326,16 @@ impl Node {
         }
     }
 
+    /// The group's shard total, set up front (it's known at group creation) so a
+    /// `percent` node's `NN%` has a real denominator from the first frame —
+    /// otherwise a just-started shard divides by zero-clamped-to-one and reads
+    /// 100% until the first shard lands.
+    pub fn set_shards_total(&self, total: usize) {
+        if self.percent {
+            self.shards_total.store(total as i64, Ordering::Relaxed);
+        }
+    }
+
     /// A shard of this group started running (feeds a `percent` node's `NN%`,
     /// which counts a running shard as half-done for a smoother climb).
     pub fn shard_started(&self) {
@@ -342,11 +352,11 @@ impl Node {
         }
     }
 
-    /// A shard of this group *completed* (`done` of `total`). Feeds a `percent`
-    /// node's `NN%` column; every other kind ignores it.
-    pub fn shard_progress(&self, done: usize, total: usize) {
+    /// `done` shards of this group have now completed. Feeds a `percent` node's
+    /// `NN%` column (its total was set up front by [`set_shards_total`]); every
+    /// other kind ignores it.
+    pub fn shard_progress(&self, done: usize) {
         if self.percent {
-            self.shards_total.store(total as i64, Ordering::Relaxed);
             self.shards_done.store(done as i64, Ordering::Relaxed);
         }
     }
@@ -694,28 +704,33 @@ mod tests {
 
     #[test]
     fn percent_node_smooths_and_keeps_pct_when_done() {
-        // evaluate: a plain drv count (middle) PLUS a dim shard `NN%` (right). A
-        // running shard counts as half-done — mean(finished, finished+running) —
-        // so 3 done + 2 running of 10 reads (3 + 5) / 2 = 4 → 40%.
+        // evaluate: a plain drv count (middle) PLUS a dim shard `NN%` (right). The
+        // shard total is known up front, so just turning yellow with shards
+        // running reads its true small percent — NOT 100%.
         let tree = Tree::new(0, false);
         tree.node("evaluate", 0);
         let head = tree.percent("HEAD", 1);
+        head.set_shards_total(10);
         head.set_running();
         head.add_count(142001);
-        head.shard_progress(3, 10);
         head.shard_started();
         head.shard_started();
+        // 0 done + 2 running of 10 → (0 + 2) / 2 = 1 → 10% (not 100%).
         assert_eq!(
-            node_lines(&tree),
-            vec![
-                "\x1b[33mevaluate\x1b[0m".to_string(),
-                "\x1b[33m  HEAD  \x1b[0m  142001\x1b[90m       40%\x1b[0m".to_string(),
-            ]
+            node_lines(&tree)[1],
+            "\x1b[33m  HEAD  \x1b[0m  142001\x1b[90m       10%\x1b[0m"
+        );
+        // A running shard counts as half-done: 3 done + 2 running → (3 + 5)/2 = 4
+        // → 40%.
+        head.shard_progress(3);
+        assert_eq!(
+            node_lines(&tree)[1],
+            "\x1b[33m  HEAD  \x1b[0m  142001\x1b[90m       40%\x1b[0m"
         );
         // Done keeps the percent (now 100%) beside the pinned count — not dropped.
         head.shard_finished();
         head.shard_finished();
-        head.shard_progress(10, 10);
+        head.shard_progress(10);
         head.group_done(226117);
         assert_eq!(
             node_lines(&tree)[1],

@@ -813,9 +813,13 @@ fn run_shards<T: Send>(
             if known_total {
                 node.set_total(items.len() as i64);
             }
+            let shards_total = items.len().div_ceil(shard_size);
+            // Set the shard denominator up front so a percent node's `NN%` is
+            // correct from the first frame (not 100% until the first shard lands).
+            node.set_shards_total(shards_total);
             ShardGroup {
                 node,
-                shards_total: items.len().div_ceil(shard_size),
+                shards_total,
                 items,
                 shards_done: AtomicUsize::new(0),
                 rows: Mutex::new(Vec::new()),
@@ -903,7 +907,7 @@ fn run_shards<T: Send>(
                         let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
                         // Advance a percent node's shard-progress readout (a no-op
                         // for count-less / plain-count nodes).
-                        g.node.shard_progress(done, g.shards_total);
+                        g.node.shard_progress(done);
                         if done == g.shards_total {
                             let rows = std::mem::take(&mut *g.rows.lock().unwrap());
                             let n = rows.len() as i64;
