@@ -300,7 +300,11 @@ fn verify_failing(candidates: &HashSet<String>) -> Result<HashMap<String, Vec<St
 
 /// For each target, consult `policy` against the observation log; then build the
 /// whole build set at once.
-pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
+/// Build the changed set (skipping anything already known / substitutable /
+/// meta-blocked). Returns whether it actually ran a build — i.e. produced stderr
+/// output — so the caller only fences it with a separator when there's something
+/// to fence (an all-cached set is silent).
+pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<bool> {
     build_targets_at(&crate::paths::db_path()?, targets, policy)
 }
 
@@ -448,7 +452,7 @@ pub fn probe_facts(targets: &[Target], policy: BuildPolicy, tree: &live::Tree) -
     Ok(())
 }
 
-fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
+fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<bool> {
     let mut store = Store::open(db)?;
 
     // Gather any missing cache facts, then load every target's history in one
@@ -560,7 +564,11 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // is what makes ^C mid-batch safe: every fact observed so far is already
     // committed, so only in-flight and never-started builds cost anything on
     // the next run. (Nix keeps the build log itself; `nix log <drv>` gets it.)
-    if !to_build.is_empty() {
+    // Whether we run the nom build below — i.e. whether this call produces any
+    // stderr output. The caller uses it to fence the build off with a separator
+    // only when there's actually a build to fence (an all-cached set is silent).
+    let ran = !to_build.is_empty();
+    if ran {
         let drvs: Vec<&str> = to_build
             .iter()
             .map(|&i| targets[i].drv_path.as_str())
@@ -667,7 +675,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         }
     }
 
-    Ok(())
+    Ok(ran)
 }
 
 #[cfg(test)]

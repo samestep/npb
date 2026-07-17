@@ -1184,9 +1184,10 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // nom's build runs after the tree freezes; a trailing separator fences its
-    // output off from the report (the tree→build separator was printed above).
-    if !targets.is_empty() {
-        build::build_targets(&targets, policy)?;
+    // output off from the report — but only when the build actually produced
+    // output. An all-cached changed set (targets present, nothing to build) is
+    // silent, so fencing it would print two separators back-to-back.
+    if !targets.is_empty() && build::build_targets(&targets, policy)? {
         live::separator();
     }
 
