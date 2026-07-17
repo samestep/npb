@@ -255,22 +255,27 @@ const RUN: u8 = 1;
 const DONE: u8 = 2;
 
 /// A node in the progress [`Tree`]. Workers bump its atomics lock-free while the
-/// refresher reads them, so updates need no locking. The rightmost column depends
-/// on the node's kind: `counter` off → count-less (a phase, a system, a network
-/// ref, `enumerate` — a state color only); `counter` on, `percent` off → a plain
-/// count (`tests`) or `count / total` (`instantiate`, `probe`); `percent` on → a
-/// dim `NN%` shard-progress readout (`evaluate`, whose true drv total is unknown).
+/// refresher reads them, so updates need no locking. Two columns follow the
+/// label: a middle plain **count** (the streamed item/drv count), shown for any
+/// `counter` node once active; and a rightmost dim column shown only *while
+/// running* — either ` / total` (a known item total, e.g. `instantiate`/`probe`)
+/// or an `NN%` shard-progress readout (a `percent` node, e.g. `evaluate`, whose
+/// true drv total is unknowable). A count-less node (a phase, a system, a network
+/// ref, `enumerate`) has neither — just a state color.
 pub struct Node {
     label: String,
     depth: usize,
     counter: bool,
     percent: bool,
     state: AtomicU8,
-    /// Items done (a plain count), or shards done (a `percent` node).
+    /// Items/drvs streamed so far — the middle plain count.
     count: AtomicI64,
-    /// Progress denominator: item total, shard total (`percent`), or `-1`/`0`
-    /// when unknown. Rendered as ` / total` (count nodes) or the `%` base.
+    /// Item total for the ` / total` column, or `-1` when unknown / not a total
+    /// node. (A `percent` node leaves this `-1`; its `%` comes from the shards.)
     total: AtomicI64,
+    /// Shards done / total, for a `percent` node's `NN%` readout.
+    shards_done: AtomicI64,
+    shards_total: AtomicI64,
 }
 
 impl Node {
@@ -283,6 +288,8 @@ impl Node {
             state: AtomicU8::new(WAIT),
             count: AtomicI64::new(0),
             total: AtomicI64::new(total),
+            shards_done: AtomicI64::new(0),
+            shards_total: AtomicI64::new(0),
         }
     }
 
@@ -298,7 +305,7 @@ impl Node {
         self.state.store(DONE, Ordering::Relaxed);
     }
 
-    /// Add `n` to the running count (drives the live number).
+    /// Add `n` to the running count (drives the live middle number).
     pub fn add_count(&self, n: i64) {
         self.count.fetch_add(n, Ordering::Relaxed);
     }
@@ -307,28 +314,27 @@ impl Node {
         self.total.store(n, Ordering::Relaxed);
     }
 
-    /// A streamed item surfaced (drives a plain count). A `percent` node ignores
-    /// it — its progress is shard-based, not the unknowable drv total — and a
-    /// count-less node has no number.
+    /// A streamed item surfaced — drives the middle count for any counter node
+    /// (a count-less node has no number).
     pub fn stream(&self, n: i64) {
-        if self.counter && !self.percent {
+        if self.counter {
             self.count.fetch_add(n, Ordering::Relaxed);
         }
     }
 
-    /// A shard of this group finished (`done` of `total`). Only a `percent` node
-    /// uses it, as its `NN%` readout; every other kind ignores it.
+    /// A shard of this group finished (`done` of `total`). Feeds a `percent`
+    /// node's rightmost `NN%` column; every other kind ignores it.
     pub fn shard_progress(&self, done: usize, total: usize) {
         if self.percent {
-            self.total.store(total as i64, Ordering::Relaxed);
-            self.count.store(done as i64, Ordering::Relaxed);
+            self.shards_total.store(total as i64, Ordering::Relaxed);
+            self.shards_done.store(done as i64, Ordering::Relaxed);
         }
     }
 
-    /// The group's last shard landed with `rows` assembled items: pin a plain
+    /// The group's last shard landed with `rows` assembled items: pin the middle
     /// count to the exact total (the streamed tally can drift), then mark done.
     pub fn group_done(&self, rows: i64) {
-        if self.counter && !self.percent {
+        if self.counter {
             self.count.store(rows, Ordering::Relaxed);
         }
         self.set_done();
@@ -409,18 +415,18 @@ impl Tree {
         }
         // Snapshot the raw per-node fields, then roll parent states up from their
         // descendant leaves.
-        let snap: Vec<(usize, &str, bool, u8, i64, i64, bool)> = nodes
+        let snap: Vec<Row> = nodes
             .iter()
-            .map(|n| {
-                (
-                    n.depth,
-                    n.label.as_str(),
-                    n.counter,
-                    n.state.load(Ordering::Relaxed),
-                    n.count.load(Ordering::Relaxed),
-                    n.total.load(Ordering::Relaxed),
-                    n.percent,
-                )
+            .map(|n| Row {
+                depth: n.depth,
+                label: n.label.as_str(),
+                counter: n.counter,
+                state: n.state.load(Ordering::Relaxed),
+                count: n.count.load(Ordering::Relaxed),
+                total: n.total.load(Ordering::Relaxed),
+                percent: n.percent,
+                sdone: n.shards_done.load(Ordering::Relaxed),
+                stotal: n.shards_total.load(Ordering::Relaxed),
             })
             .collect();
         let eff: Vec<u8> = (0..snap.len()).map(|i| eff_state(&snap, i)).collect();
@@ -428,24 +434,20 @@ impl Tree {
         // The number columns start past the widest label of ANY node, so a
         // vertical line between the tree and the numbers clips neither.
         let mut left_w = self.min_label_w;
-        for (depth, label, ..) in &snap {
-            left_w = left_w.max(INDENT.len() * depth + label.chars().count());
+        for r in &snap {
+            left_w = left_w.max(INDENT.len() * r.depth + r.label.chars().count());
         }
 
         let mut out = Vec::with_capacity(snap.len() + 1);
-        for (i, &(depth, label, counter, _raw, count, total, percent)) in snap.iter().enumerate() {
+        for (i, r) in snap.iter().enumerate() {
+            let (depth, label, counter, count, total, percent, sdone, stotal) = (
+                r.depth, r.label, r.counter, r.count, r.total, r.percent, r.sdone, r.stotal,
+            );
             let col = state_color(eff[i]);
             let indent = INDENT.repeat(depth);
-            // The rightmost column shows only while active — and a percent readout
-            // (a live progress hint) only *while running*, collapsing to a bare
-            // label once done, like `enumerate`.
-            let show = counter
-                && match eff[i] {
-                    RUN => true,
-                    DONE => !percent,
-                    _ => false,
-                };
-            if !show {
+            // A count shows for any counter node once active (running or done); a
+            // count-less node (a phase, a system, `enumerate`) never shows one.
+            if !(counter && eff[i] != WAIT) {
                 out.push(if color {
                     format!("{col}{indent}{label}{RESET}")
                 } else {
@@ -455,41 +457,37 @@ impl Tree {
             }
             let left = format!("{indent}{label}");
             let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
-            // A percent node: a dim `NN%`, the shard-progress right-aligned in the
-            // same number column (no ` / total`). Any other counter: a plain count,
-            // with a dim ` / total` while running (dropped once done — no `N/N`).
-            let num = if percent {
-                let pct = if total > 0 {
-                    (count * 100 / total).clamp(0, 100)
-                } else {
-                    0
-                };
+            let count_s = format!("{count:>NUM_W$}");
+            // The rightmost column is a live progress hint, so it shows only while
+            // running (dropped once done): a `percent` node's dim `NN%` (right-
+            // aligned in the number column, `%`, no slash), else a dim ` / total`
+            // when the item total is known.
+            let right = if eff[i] != RUN {
+                String::new()
+            } else if percent {
+                let pct = (sdone * 100 / stotal.max(1)).clamp(0, 100);
                 let p = format!("{pct:>NUM_W$}");
                 if color {
-                    format!("{DIM}{p}%{RESET}")
+                    format!("{DIM}   {p}%{RESET}")
                 } else {
-                    format!("{p}%")
+                    format!("   {p}%")
+                }
+            } else if total >= 0 {
+                let t = format!("{total:>NUM_W$}");
+                if color {
+                    format!("{DIM} / {t}{RESET}")
+                } else {
+                    format!(" / {t}")
                 }
             } else {
-                let count_s = format!("{count:>NUM_W$}");
-                let tail = if total >= 0 && eff[i] == RUN {
-                    let t = format!("{total:>NUM_W$}");
-                    if color {
-                        format!("{DIM} / {t}{RESET}")
-                    } else {
-                        format!(" / {t}")
-                    }
-                } else {
-                    String::new()
-                };
-                format!("{count_s}{tail}")
+                String::new()
             };
             // Only the label carries the state color; the count is plain (like the
-            // clock), the ` / total` and percent dim.
+            // clock), the ` / total` / percent columns dim.
             if color {
-                out.push(format!("{col}{left}{pad}{RESET}  {num}"));
+                out.push(format!("{col}{left}{pad}{RESET}  {count_s}{right}"));
             } else {
-                out.push(format!("{left}{pad}  {num}"));
+                out.push(format!("{left}{pad}  {count_s}{right}"));
             }
         }
 
@@ -503,18 +501,32 @@ impl Tree {
     }
 }
 
+/// A rendered snapshot of one [`Node`] — its atomics read once, so the frame is
+/// consistent and [`eff_state`] can roll parents up over a plain slice.
+struct Row<'a> {
+    depth: usize,
+    label: &'a str,
+    counter: bool,
+    state: u8,
+    count: i64,
+    total: i64,
+    percent: bool,
+    sdone: i64,
+    stotal: i64,
+}
+
 /// A node's effective (rolled-up) state: any descendant leaf running → running;
 /// all done → done; some done but not all → running; else waiting. A node with
 /// no descendants uses its own state.
-fn eff_state(snap: &[(usize, &str, bool, u8, i64, i64, bool)], i: usize) -> u8 {
-    let d = snap[i].0;
+fn eff_state(snap: &[Row], i: usize) -> u8 {
+    let d = snap[i].depth;
     let (mut any_run, mut any_done, mut any_wait, mut any_leaf) = (false, false, false, false);
     let mut j = i + 1;
-    while j < snap.len() && snap[j].0 > d {
-        let is_leaf = j + 1 >= snap.len() || snap[j + 1].0 <= snap[j].0;
+    while j < snap.len() && snap[j].depth > d {
+        let is_leaf = j + 1 >= snap.len() || snap[j + 1].depth <= snap[j].depth;
         if is_leaf {
             any_leaf = true;
-            match snap[j].3 {
+            match snap[j].state {
                 RUN => any_run = true,
                 DONE => any_done = true,
                 _ => any_wait = true,
@@ -523,7 +535,7 @@ fn eff_state(snap: &[(usize, &str, bool, u8, i64, i64, bool)], i: usize) -> u8 {
         j += 1;
     }
     if !any_leaf {
-        return snap[i].3;
+        return snap[i].state;
     }
     if any_run {
         RUN
@@ -655,24 +667,25 @@ mod tests {
     }
 
     #[test]
-    fn percent_node_shows_dim_pct_while_running_only() {
-        // evaluate: a percent leaf shows a dim `NN%` (shard progress) right-aligned
-        // in the number column while running — no ` / total`.
+    fn percent_node_shows_count_plus_dim_pct_while_running() {
+        // evaluate: a plain drv count in the middle column, PLUS a dim shard `NN%`
+        // right-aligned in the rightmost column, while running.
         let tree = Tree::new(0, false);
         tree.node("evaluate", 0);
         let head = tree.percent("HEAD", 1);
         head.set_running();
+        head.add_count(142001);
         head.shard_progress(3, 8); // 37%
         assert_eq!(
             node_lines(&tree),
             vec![
                 "\x1b[33mevaluate\x1b[0m".to_string(),
-                "\x1b[33m  HEAD  \x1b[0m  \x1b[90m    37%\x1b[0m".to_string(),
+                "\x1b[33m  HEAD  \x1b[0m  142001\x1b[90m       37%\x1b[0m".to_string(),
             ]
         );
-        // Once done it collapses to a bare green label (no `100%`), like enumerate.
-        head.group_done(0);
-        assert_eq!(node_lines(&tree)[1], "\x1b[32m  HEAD\x1b[0m");
+        // Once done, the middle count stays (pinned) and the percent column drops.
+        head.group_done(226117);
+        assert_eq!(node_lines(&tree)[1], "\x1b[32m  HEAD  \x1b[0m  226117");
     }
 
     #[test]

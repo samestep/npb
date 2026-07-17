@@ -586,8 +586,10 @@ the per-side commit *display* (`Rev::display`, §6: the friendly name of the tre
 actually evaluated — `master`, `HEAD`, `merge(a, b)`, `#431 merge` — never a
 resolved sha unless the user typed one) — and cached/no-op work never appears at
 all, so a fully-cached run shows nothing. Nodes only change: blue *waiting* →
-yellow *running* → green *done* (nom's three colors, on the label; the count is
-plain, the ` / total` dim), never disappearing. When the tree finishes it freezes
+yellow *running* → green *done* (nom's three colors, on the label; a plain middle
+count where one applies, with a dim ` / total` or shard-`NN%` column alongside it
+while running — `enumerate` carries just a color, `evaluate` the `NN%` since its
+true drv total is unknowable), never disappearing. When the tree finishes it freezes
 into scrollback, a dim separator fences it from what follows (nom's build display,
 then the report — the same separator between each), and the build proceeds
 (§5, nom's own display, not this tree). Persistence stays path-specific (§4): the full eval assembles a flat
