@@ -12,7 +12,7 @@ use crate::model::{Observation, Outcome, Source};
 
 /// One side's build state, reduced from a drv's observations (or its absence).
 /// `Ord` (declaration order) only tie-breaks section order among pairs sharing
-/// a [`cell`] priority, so the report is deterministic.
+/// a [`priority`], so the report is deterministic.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum State {
     /// Output valid — built locally, or substitutable from the cache.
@@ -44,6 +44,24 @@ impl State {
             State::Skipped => "⏩",
             State::Absent => "➖",
             State::Unknown => "❔",
+        }
+    }
+
+    /// Goodness on the build-outcome axis, higher = better: `✅` built, `➖`
+    /// absent ("new" on the base side / "gone" on the head side) just under it,
+    /// then `⏩` skipped, `🚫` blocked, `❌` failed. `❔` unbuilt is off the axis
+    /// — no fact to compare against — so it has no goodness; [`priority`] tiers
+    /// it out before this is ever reached.
+    fn goodness(self) -> i32 {
+        match self {
+            State::Built => 4,
+            State::Absent => 3,
+            State::Skipped => 2,
+            State::Blocked => 1,
+            State::Failed => 0,
+            State::Unknown => {
+                unreachable!("Unknown is off the goodness axis; priority() tiers it out")
+            }
         }
     }
 }
@@ -85,113 +103,103 @@ pub struct Entry {
     pub head: State,
 }
 
-/// The section a `(base, head)` pair belongs to: an emission-priority index
-/// (lower = worse / more actionable, emitted first), a count noun, and a
-/// phrase. Exhaustive over all 36 pairs — no catch-all — so adding a [`State`]
-/// forces every new pair to be placed deliberately.
-fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
+/// Sort key for a `(base, head)` section, **worst-delta-first** (DESIGN §8).
+///
+/// A section with a fact on both sides sorts by the signed delta
+/// `goodness(head) − goodness(base)` ascending, so the steepest regression
+/// (`✅→❌`) leads and every improvement trails; equal deltas break by a worse
+/// current state (lower `goodness(head)`). A side still `Unknown` has no
+/// measured delta, so the pair drops to a final tier. `render` appends
+/// `(base, head)` as a last tie-break, making the whole order total — so the
+/// report is deterministic.
+fn priority(base: State, head: State) -> (u8, i32, i32) {
+    if base == State::Unknown || head == State::Unknown {
+        return (1, 0, 0);
+    }
+    (0, head.goodness() - base.goodness(), head.goodness())
+}
+
+/// The count noun and `before → after` phrase for a `(base, head)` section.
+/// Exhaustive over all 36 pairs — no catch-all — so adding a [`State`] forces
+/// every new pair to be described deliberately. Section *order* is computed from
+/// state goodness, separately; see [`priority`].
+fn describe(base: State, head: State) -> (&'static str, &'static str) {
     use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
     // Nouns are singular count-nouns (pluralized with a trailing "s" by the
     // renderer), so the phrase, not the noun, carries the before→after detail.
     // "Skipped" (meta-blocked: broken/unsupported/insecure) is nixpkgs-review's
     // term; rows failing/building *from* Skipped are only reachable via --no-skip.
     match (base, head) {
-        (Built, Failed) => (0, "regression", "build on the base, fail here"),
+        (Built, Failed) => ("regression", "build on the base, fail here"),
         (Built, Blocked) => (
-            1,
             "blocked package",
             "build on the base, a dependency fails here",
         ),
-        (Absent, Failed) => (2, "new failure", "added here, fail to build"),
+        (Absent, Failed) => ("new failure", "added here, fail to build"),
         (Absent, Blocked) => (
-            3,
             "new blocked package",
             "added here, blocked by a failed dependency",
         ),
-        (Unknown, Failed) => (4, "failure", "fail here; base status unknown"),
-        (Unknown, Blocked) => (5, "blocked package", "blocked here; base status unknown"),
-        (Skipped, Failed) => (6, "failure", "skipped on the base, fail here"),
+        (Unknown, Failed) => ("failure", "fail here; base status unknown"),
+        (Unknown, Blocked) => ("blocked package", "blocked here; base status unknown"),
+        (Skipped, Failed) => ("failure", "skipped on the base, fail here"),
         (Skipped, Blocked) => (
-            7,
             "blocked package",
             "skipped on the base, a dependency fails here",
         ),
-        (Failed, Failed) => (8, "pre-existing failure", "fail on the base and here"),
-        (Failed, Blocked) => (9, "pre-existing failure", "fail on the base, blocked here"),
-        (Blocked, Failed) => (10, "pre-existing failure", "blocked on the base, fail here"),
+        (Failed, Failed) => ("pre-existing failure", "fail on the base and here"),
+        (Failed, Blocked) => ("pre-existing failure", "fail on the base, blocked here"),
+        (Blocked, Failed) => ("pre-existing failure", "blocked on the base, fail here"),
         (Blocked, Blocked) => (
-            11,
             "pre-existing blocked package",
             "blocked on the base and here",
         ),
         (Built, Skipped) => (
-            12,
             "newly skipped package",
             "build on the base, skipped here (not attempted)",
         ),
         (Failed, Skipped) => (
-            13,
             "newly skipped package",
             "fail on the base, skipped here (not attempted)",
         ),
         (Blocked, Skipped) => (
-            14,
             "newly skipped package",
             "blocked on the base, skipped here (not attempted)",
         ),
         (Absent, Skipped) => (
-            15,
             "new skipped package",
             "added here, already skipped (not attempted)",
         ),
         (Unknown, Skipped) => (
-            16,
             "skipped package",
             "skipped here (not attempted); base status unknown",
         ),
         (Skipped, Skipped) => (
-            17,
             "pre-existing skipped package",
             "skipped on the base and here (not attempted)",
         ),
-        (Built, Absent) => (18, "dropped package", "build on the base, gone here"),
-        (Failed, Absent) => (19, "removed package", "failed on the base, gone here"),
-        (Blocked, Absent) => (20, "removed package", "blocked on the base, gone here"),
-        (Skipped, Absent) => (
-            21,
-            "removed skipped package",
-            "skipped on the base, gone here",
-        ),
-        (Failed, Built) => (22, "fixed package", "fail on the base, build here"),
-        (Blocked, Built) => (23, "fixed package", "blocked on the base, build here"),
-        (Skipped, Built) => (
-            24,
-            "newly enabled package",
-            "skipped on the base, build here",
-        ),
-        (Absent, Built) => (25, "new package", "new here, build"),
-        (Unknown, Built) => (26, "built package", "build here; base status unknown"),
-        (Built, Built) => (27, "unchanged package", "build on the base and here"),
+        (Built, Absent) => ("dropped package", "build on the base, gone here"),
+        (Failed, Absent) => ("removed package", "failed on the base, gone here"),
+        (Blocked, Absent) => ("removed package", "blocked on the base, gone here"),
+        (Skipped, Absent) => ("removed skipped package", "skipped on the base, gone here"),
+        (Failed, Built) => ("fixed package", "fail on the base, build here"),
+        (Blocked, Built) => ("fixed package", "blocked on the base, build here"),
+        (Skipped, Built) => ("newly enabled package", "skipped on the base, build here"),
+        (Absent, Built) => ("new package", "new here, build"),
+        (Unknown, Built) => ("built package", "build here; base status unknown"),
+        (Built, Built) => ("unchanged package", "build on the base and here"),
         // A head-side Unknown means the build phase left this drv unrecorded
         // (§5's accepted gap): the drv exists but has no fact yet.
-        (Built, Unknown) => (28, "unbuilt package", "build on the base; no fact here yet"),
-        (Failed, Unknown) => (29, "unbuilt package", "fail on the base; no fact here yet"),
-        (Blocked, Unknown) => (
-            30,
-            "unbuilt package",
-            "blocked on the base; no fact here yet",
-        ),
-        (Skipped, Unknown) => (
-            31,
-            "unbuilt package",
-            "skipped on the base; no fact here yet",
-        ),
-        (Absent, Unknown) => (32, "new unbuilt package", "added here; no fact yet"),
-        (Unknown, Unknown) => (33, "unbuilt package", "no facts on either side yet"),
-        (Unknown, Absent) => (34, "removed package", "gone here; base status unknown"),
+        (Built, Unknown) => ("unbuilt package", "build on the base; no fact here yet"),
+        (Failed, Unknown) => ("unbuilt package", "fail on the base; no fact here yet"),
+        (Blocked, Unknown) => ("unbuilt package", "blocked on the base; no fact here yet"),
+        (Skipped, Unknown) => ("unbuilt package", "skipped on the base; no fact here yet"),
+        (Absent, Unknown) => ("new unbuilt package", "added here; no fact yet"),
+        (Unknown, Unknown) => ("unbuilt package", "no facts on either side yet"),
+        (Unknown, Absent) => ("removed package", "gone here; base status unknown"),
         // Not producible by the diff (a changed row has a drv on at least one
         // side), but the renderer shouldn't panic if it ever appears.
-        (Absent, Absent) => (35, "package", "absent on both sides"),
+        (Absent, Absent) => ("package", "absent on both sides"),
     }
 }
 
@@ -209,7 +217,7 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     let groups = by_drv.len();
     let attrs_total = entries.len();
 
-    let (_, noun, phrase) = cell(base, head);
+    let (noun, phrase) = describe(base, head);
     let plural = if groups == 1 { "" } else { "s" };
     // Note the raw attr count too, but only when grouping actually collapsed rows.
     let note = if attrs_total != groups {
@@ -283,9 +291,9 @@ pub fn render(
             buckets.entry((e.base, e.head)).or_default().push(e);
         }
         let mut keys: Vec<(State, State)> = buckets.keys().copied().collect();
-        // The state pair tie-breaks equal priorities (several pairs share the
-        // generic last cell), keeping the output deterministic.
-        keys.sort_by_key(|&(b, h)| (cell(b, h).0, b, h));
+        // The state pair tie-breaks equal priorities (the whole Unknown tier
+        // shares one key), keeping the output deterministic.
+        keys.sort_by_key(|&(b, h)| (priority(b, h), b, h));
         for (b, h) in keys {
             out.push_str(&render_section(b, h, &buckets[&(b, h)]));
         }
@@ -366,20 +374,49 @@ mod tests {
     }
 
     #[test]
-    fn cell_priorities_are_distinct() {
-        // Every (base, head) pair has its own section slot; a duplicate
-        // priority would silently merge two sections' ordering.
+    fn priority_orders_worst_delta_first() {
         use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
         const ALL: [State; 6] = [Built, Failed, Blocked, Skipped, Absent, Unknown];
+        let mut pairs: Vec<(State, State)> = ALL
+            .iter()
+            .flat_map(|&b| ALL.iter().map(move |&h| (b, h)))
+            .collect();
+
+        // The full sort key (priority + the (base, head) tie-break render uses)
+        // is a total order: every pair gets a distinct slot, so section order is
+        // deterministic. Every pair also has a real noun and phrase.
         let mut seen = std::collections::HashSet::new();
-        for b in ALL {
-            for h in ALL {
-                let (priority, noun, phrase) = cell(b, h);
-                assert!(seen.insert(priority), "duplicate priority {priority}");
-                assert!(!noun.is_empty() && !phrase.is_empty());
-            }
+        for &(b, h) in &pairs {
+            assert!(
+                seen.insert((priority(b, h), b, h)),
+                "duplicate slot {b:?}→{h:?}"
+            );
+            let (noun, phrase) = describe(b, h);
+            assert!(!noun.is_empty() && !phrase.is_empty());
         }
         assert_eq!(seen.len(), 36);
+
+        pairs.sort_by_key(|&(b, h)| (priority(b, h), b, h));
+        let at = |p| pairs.iter().position(|&x| x == p).unwrap();
+        // The steepest fall leads; a regression outranks unchanged, which
+        // outranks any improvement.
+        assert_eq!(pairs[0], (Built, Failed));
+        assert!(at((Built, Skipped)) < at((Built, Built)));
+        assert!(at((Built, Built)) < at((Failed, Built)));
+        // Equal deltas break by a worse current state: Δ=-2 lands
+        // ⏩→❌ before ➖→🚫 before ✅→⏩.
+        assert!(at((Skipped, Failed)) < at((Absent, Blocked)));
+        assert!(at((Absent, Blocked)) < at((Built, Skipped)));
+        // No measured delta (either side Unknown) sinks to a final contiguous tier.
+        let first_unknown = pairs
+            .iter()
+            .position(|&(b, h)| b == Unknown || h == Unknown)
+            .unwrap();
+        assert!(
+            pairs[first_unknown..]
+                .iter()
+                .all(|&(b, h)| b == Unknown || h == Unknown)
+        );
     }
 
     fn entry(attr: &str, base: State, head: State, bd: Option<&str>, hd: Option<&str>) -> Entry {

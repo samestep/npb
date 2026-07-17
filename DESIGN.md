@@ -654,9 +654,17 @@ accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
-Sections are ordered worst-delta-first, each folded in a `<details>` (an
-earlier draft opened changed-state sections by default; all-collapsed read
-better). Attrs that share a derivation
+Sections are ordered **worst-delta-first**: each state has a goodness on the
+build-outcome axis (`✅` > `⏩` > `🚫` > `❌`, with `➖` absent slotted just under
+`✅` as *new*/*gone*), and a section sorts by the signed delta
+`goodness(head) − goodness(base)` ascending — so the steepest regression
+(`✅→❌`) leads, unchanged pairs sit in the middle, and every improvement trails;
+equal deltas break by a worse current state. `❔` unbuilt has no fact to compare,
+so any side still `❔` sinks to a final tier. This is a linear extension of the
+product order on `(base, head)` — the whole `worst→best` ordering is *computed*
+from state goodness (`priority` in `src/report.rs`), not a hand-kept table.
+Each section is folded in a `<details>` (an earlier draft opened changed-state
+sections by default; all-collapsed read better). Attrs that share a derivation
 are collapsed onto one line (`a = b = c`, shortest attr first), like
 `nixpkgs-review`'s aliases — npd gets this for free from its drvpath keying.
 
