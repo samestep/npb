@@ -851,3 +851,39 @@ Recorded for context:
   observation records the drvpath, so staleness can't affect correctness (§3).
 - *Remote facts* → narinfo on `cache.nixos.org` only; Hydra was dropped (§7).
 - *Storage* → SQLite (`npd.sqlite`) under `dirs::cache_dir()/nix-npd`; all re-derivable cache (§4).
+
+## 11. Progress display: color, interactivity, and the build monitor
+
+The pre-build progress tree (§6, `live::Tree`/`with_live`) and the build monitor
+(§5, `nom`) key off **two orthogonal axes**, each resolved once through the
+`console` crate:
+
+- **color** (`live::colors_enabled` → `console::colors_enabled_stderr`) — whether
+  to emit any ANSI color, honoring `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, and
+  the TTY. `NO_COLOR` means *color only* (the informal standard), **not** "no
+  ANSI" — so it never disables interactive redrawing, only color.
+- **interactive** (stderr is a TTY) — whether the cursor may be moved to redraw
+  in place. `NO_COLOR` does not affect this.
+
+So the pre-build tree has three modes, all rendering the same node lines:
+
+| stderr | color | mode |
+| --- | --- | --- |
+| TTY, `NO_COLOR` unset | yes | **interactive-color** — redraw in place, colored; frozen to scrollback at the end |
+| TTY, `NO_COLOR` set | no | **interactive-mono** — the same redraw, monochrome |
+| non-TTY (pipe, CI, an AI agent) | no | **plain-append** — no cursor moves; each node's line printed once the moment it completes (a leaf on green, its parent headers lazily just before it), a resting footer at the end |
+
+The plain-append log (`Tree::emit_completed`) exists so a non-TTY run gets
+*incremental* output — and survives a mid-phase `^C` — where the redraw would be
+silent until a final dump. It reads like the final interactive frame minus color
+and animation, in completion order (the phases finish in order, so the sections
+don't interleave).
+
+The **build monitor** follows the same color axis: `nom` (which honors neither
+`NO_COLOR` — [#129] — nor a non-TTY) runs **only when colorizing**. Otherwise
+`batch_build` still parses nix's `internal-json` — that's what records each drv's
+outcome incrementally, the ^C-safety of §5, independent of nom — but renders a
+plain `building`/`built`/`failed` append log itself, matching the plain pre-build
+mode.
+
+[#129]: https://github.com/maralorn/nix-output-monitor/issues/129

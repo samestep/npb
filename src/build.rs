@@ -48,6 +48,16 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+/// A drv's short human name for the plain (non-nom) build log: `hello-2.12`
+/// from `/nix/store/<hash>-hello-2.12.drv` — strip the store dir, the `.drv`
+/// suffix, and the leading `<hash>-` (the hash has no `-`, so the first one
+/// splits it off the name).
+fn drv_name(drv: &str) -> &str {
+    let base = drv.rsplit('/').next().unwrap_or(drv);
+    let stem = base.strip_suffix(".drv").unwrap_or(base);
+    stem.split_once('-').map(|(_, n)| n).unwrap_or(stem)
+}
+
 /// nix internal-json log event (only the fields we use).
 #[derive(Deserialize)]
 struct NixEvent {
@@ -64,8 +74,11 @@ const ACT_BUILD: i64 = 105;
 
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
 /// together with its own parallelism — while acting as a middleman: nix emits
-/// `--log-format internal-json`, we forward it to `nom --json` for the live
-/// tree and simultaneously parse build (`type:105`) start/stop events.
+/// `--log-format internal-json`, which we always parse for build (`type:105`)
+/// start/stop events, and — when colorizing (a TTY, `NO_COLOR` unset) — also
+/// forward to `nom --json` for the live tree. Off a TTY or under `NO_COLOR`
+/// (nom honors neither), nom is skipped and we render a plain append-only
+/// `building`/`built`/`failed` log ourselves from the same events.
 /// `--keep-going` so every drv is attempted.
 ///
 /// `on_finish(drv)` fires as *every* build activity stops — the requested
@@ -103,21 +116,35 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning nix build")?;
-    let mut nom = Command::new("nom")
-        .arg("--json")
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("spawning nom --json (nix-output-monitor)")?;
+    // nom renders the colored, redrawn build tree — but only when we'd colorize
+    // at all (it honors neither NO_COLOR (#129) nor a non-TTY). Otherwise we parse
+    // the same internal-json stream (unchanged — that's what records outcomes and
+    // keeps ^C-safety) and render a plain append-only log ourselves.
+    let mut nom = if live::colors_enabled() {
+        Some(
+            Command::new("nom")
+                .arg("--json")
+                .stdin(Stdio::piped())
+                .spawn()
+                .context("spawning nom --json (nix-output-monitor)")?,
+        )
+    } else {
+        None
+    };
+    let mut nom_in = nom
+        .as_mut()
+        .map(|n| n.stdin.take().expect("stdin is piped"));
 
     let log = BufReader::new(nix.stderr.take().expect("stderr is piped"));
-    let mut nom_in = nom.stdin.take().expect("stdin is piped");
     let mut starts: HashMap<u64, String> = HashMap::new();
 
     let streamed = (|| -> Result<()> {
         for line in log.lines() {
             let line = line.context("reading nix build log")?;
-            // Forward the raw internal-json line to nom, which renders the tree.
-            let _ = writeln!(nom_in, "{line}");
+            if let Some(nom_in) = nom_in.as_mut() {
+                // Forward the raw internal-json line to nom, which renders the tree.
+                let _ = writeln!(nom_in, "{line}");
+            }
             let Some(rest) = line.strip_prefix("@nix ") else {
                 continue;
             };
@@ -129,6 +156,9 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
                     if let (Some(id), Some(drv)) =
                         (ev.id, ev.fields.first().and_then(|v| v.as_str()))
                     {
+                        if nom_in.is_none() {
+                            eprintln!("building {}", drv_name(drv));
+                        }
                         starts.insert(id, drv.to_string());
                     }
                 }
@@ -136,6 +166,17 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
                     if let Some(id) = ev.id
                         && let Some(drv) = starts.remove(&id)
                     {
+                        if nom_in.is_none() {
+                            // Nix registers a success's outputs *before* this stop
+                            // event, so output validity right now is the build's
+                            // own result — the same signal `on_finish` records.
+                            let verb = if drv_built(&drv).unwrap_or(false) {
+                                "built"
+                            } else {
+                                "failed"
+                            };
+                            eprintln!("{verb} {}", drv_name(&drv));
+                        }
                         on_finish(&drv)?;
                     }
                 }
@@ -144,7 +185,7 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
         }
         Ok(())
     })();
-    drop(nom_in); // EOF -> nom finishes rendering and exits
+    drop(nom_in); // EOF -> nom (if any) finishes rendering and exits
     if streamed.is_err() {
         // An on_finish (store) error abandons the stream mid-batch; a Child is
         // not killed on drop, so without this nix keeps building into a closed
@@ -154,7 +195,9 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
     // Reap nix (and nom) regardless. A build failing is normal (npd records the
     // per-drv outcome above), so the exit status is intentionally discarded.
     let _ = nix.wait().context("waiting for nix build")?;
-    let _ = nom.wait();
+    if let Some(mut nom) = nom {
+        let _ = nom.wait();
+    }
     streamed?;
     Ok(())
 }
@@ -689,6 +732,16 @@ mod tests {
             drv_path: drv.into(),
             skipped,
         }
+    }
+
+    #[test]
+    fn drv_name_strips_store_dir_hash_and_suffix() {
+        assert_eq!(
+            drv_name("/nix/store/abc123def456ghi789jkl012mno345pq-hello-2.12.1.drv"),
+            "hello-2.12.1"
+        );
+        // A hyphen-free stem degrades gracefully to the whole stem.
+        assert_eq!(drv_name("weird"), "weird");
     }
 
     fn planted(drv: &str, source: Source, outcome: Outcome) -> Observation {
