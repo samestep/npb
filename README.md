@@ -70,11 +70,11 @@ That command may not give you the same result if you run it yourself, but `npd`'
 
 `npd` strives to be
 
-- **causal.** Derivations are built both on both sides of the change, so the report makes it clear which failures are regressions and which were preexisting.
+- **causal.** Derivations are built on both sides of the change, so the report makes it clear which failures are regressions and which were preexisting.
 
 - **cached.** It takes a nontrivial amount of time to run Nix evaluations and failing builds, so the tool caches these; re-runs should always take less than one second.
 
-- **efficient.** Caching is not an excuse to be slow the first time, so on a cold run, the tool automatically chooses a point along the Pareto frontier to parallelize proportionally to how much RAM is available.
+- **efficient.** Caching is not an excuse to be slow the first time, so on a cold run, the tool automatically chooses a point along the Pareto frontier to parallelize according to how much RAM is available.
 
 - **reproducible.** Often a change may be on a branch that gets force-pushed later, or there may be uncommitted local changes, so the report always includes a command to reproduce the exact same Git tree on both sides.
 
