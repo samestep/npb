@@ -255,27 +255,31 @@ const RUN: u8 = 1;
 const DONE: u8 = 2;
 
 /// A node in the progress [`Tree`]. Workers bump its atomics lock-free while the
-/// refresher reads them, so updates need no locking. `counter` marks a node that
-/// shows a running count once active (an eval side, the probe); a count-less
-/// node (a phase, a system, a network ref) carries only a state color.
+/// refresher reads them, so updates need no locking. The rightmost column depends
+/// on the node's kind: `counter` off → count-less (a phase, a system, a network
+/// ref, `enumerate` — a state color only); `counter` on, `percent` off → a plain
+/// count (`tests`) or `count / total` (`instantiate`, `probe`); `percent` on → a
+/// dim `NN%` shard-progress readout (`evaluate`, whose true drv total is unknown).
 pub struct Node {
     label: String,
     depth: usize,
     counter: bool,
+    percent: bool,
     state: AtomicU8,
-    /// Items done. Only rendered for a `counter` node that has left `WAIT`.
+    /// Items done (a plain count), or shards done (a `percent` node).
     count: AtomicI64,
-    /// Progress denominator, or `-1` when unknown (e.g. `enumerate`, which
-    /// discovers its count). Rendered only while `RUN`.
+    /// Progress denominator: item total, shard total (`percent`), or `-1`/`0`
+    /// when unknown. Rendered as ` / total` (count nodes) or the `%` base.
     total: AtomicI64,
 }
 
 impl Node {
-    fn new(label: String, depth: usize, counter: bool, total: i64) -> Self {
+    fn new(label: String, depth: usize, counter: bool, percent: bool, total: i64) -> Self {
         Self {
             label,
             depth,
             counter,
+            percent,
             state: AtomicU8::new(WAIT),
             count: AtomicI64::new(0),
             total: AtomicI64::new(total),
@@ -299,14 +303,35 @@ impl Node {
         self.count.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Pin the count to an exact value (e.g. the assembled row count on
-    /// completion, in case the streamed tally drifted).
-    pub fn set_count(&self, n: i64) {
-        self.count.store(n, Ordering::Relaxed);
-    }
-
     pub fn set_total(&self, n: i64) {
         self.total.store(n, Ordering::Relaxed);
+    }
+
+    /// A streamed item surfaced (drives a plain count). A `percent` node ignores
+    /// it — its progress is shard-based, not the unknowable drv total — and a
+    /// count-less node has no number.
+    pub fn stream(&self, n: i64) {
+        if self.counter && !self.percent {
+            self.count.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// A shard of this group finished (`done` of `total`). Only a `percent` node
+    /// uses it, as its `NN%` readout; every other kind ignores it.
+    pub fn shard_progress(&self, done: usize, total: usize) {
+        if self.percent {
+            self.total.store(total as i64, Ordering::Relaxed);
+            self.count.store(done as i64, Ordering::Relaxed);
+        }
+    }
+
+    /// The group's last shard landed with `rows` assembled items: pin a plain
+    /// count to the exact total (the streamed tally can drift), then mark done.
+    pub fn group_done(&self, rows: i64) {
+        if self.counter && !self.percent {
+            self.count.store(rows, Ordering::Relaxed);
+        }
+        self.set_done();
     }
 }
 
@@ -339,16 +364,24 @@ impl Tree {
         self.multi
     }
 
-    /// Append a count-less node (a phase, a system, a network ref).
+    /// Append a count-less node (a phase, a system, a network ref, `enumerate`).
     pub fn node(&self, label: impl Into<String>, depth: usize) -> Arc<Node> {
-        let n = Arc::new(Node::new(label.into(), depth, false, -1));
+        let n = Arc::new(Node::new(label.into(), depth, false, false, -1));
         self.nodes.lock().unwrap().push(n.clone());
         n
     }
 
     /// Append a counting leaf; `total` is `-1` when the denominator is unknown.
     pub fn counter(&self, label: impl Into<String>, depth: usize, total: i64) -> Arc<Node> {
-        let n = Arc::new(Node::new(label.into(), depth, true, total));
+        let n = Arc::new(Node::new(label.into(), depth, true, false, total));
+        self.nodes.lock().unwrap().push(n.clone());
+        n
+    }
+
+    /// Append a leaf that shows a dim `NN%` shard-progress readout — for a phase
+    /// whose true item total is unknowable ahead of time (`evaluate`).
+    pub fn percent(&self, label: impl Into<String>, depth: usize) -> Arc<Node> {
+        let n = Arc::new(Node::new(label.into(), depth, true, true, 0));
         self.nodes.lock().unwrap().push(n.clone());
         n
     }
@@ -376,7 +409,7 @@ impl Tree {
         }
         // Snapshot the raw per-node fields, then roll parent states up from their
         // descendant leaves.
-        let snap: Vec<(usize, &str, bool, u8, i64, i64)> = nodes
+        let snap: Vec<(usize, &str, bool, u8, i64, i64, bool)> = nodes
             .iter()
             .map(|n| {
                 (
@@ -386,6 +419,7 @@ impl Tree {
                     n.state.load(Ordering::Relaxed),
                     n.count.load(Ordering::Relaxed),
                     n.total.load(Ordering::Relaxed),
+                    n.percent,
                 )
             })
             .collect();
@@ -399,11 +433,19 @@ impl Tree {
         }
 
         let mut out = Vec::with_capacity(snap.len() + 1);
-        for (i, &(depth, label, counter, _raw, count, total)) in snap.iter().enumerate() {
+        for (i, &(depth, label, counter, _raw, count, total, percent)) in snap.iter().enumerate() {
             let col = state_color(eff[i]);
             let indent = INDENT.repeat(depth);
-            // A count shows only for a counter node that has started running.
-            if !(counter && eff[i] != WAIT) {
+            // The rightmost column shows only while active — and a percent readout
+            // (a live progress hint) only *while running*, collapsing to a bare
+            // label once done, like `enumerate`.
+            let show = counter
+                && match eff[i] {
+                    RUN => true,
+                    DONE => !percent,
+                    _ => false,
+                };
+            if !show {
                 out.push(if color {
                     format!("{col}{indent}{label}{RESET}")
                 } else {
@@ -413,25 +455,41 @@ impl Tree {
             }
             let left = format!("{indent}{label}");
             let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
-            let count_s = format!("{count:>NUM_W$}");
-            // The total is a progress denominator, so it shows only while running;
-            // a done node collapses the redundant N/N to a bare count.
-            let tail = if total >= 0 && eff[i] == RUN {
-                let t = format!("{total:>NUM_W$}");
-                if color {
-                    format!("{DIM} / {t}{RESET}")
+            // A percent node: a dim `NN%`, the shard-progress right-aligned in the
+            // same number column (no ` / total`). Any other counter: a plain count,
+            // with a dim ` / total` while running (dropped once done — no `N/N`).
+            let num = if percent {
+                let pct = if total > 0 {
+                    (count * 100 / total).clamp(0, 100)
                 } else {
-                    format!(" / {t}")
+                    0
+                };
+                let p = format!("{pct:>NUM_W$}");
+                if color {
+                    format!("{DIM}{p}%{RESET}")
+                } else {
+                    format!("{p}%")
                 }
             } else {
-                String::new()
+                let count_s = format!("{count:>NUM_W$}");
+                let tail = if total >= 0 && eff[i] == RUN {
+                    let t = format!("{total:>NUM_W$}");
+                    if color {
+                        format!("{DIM} / {t}{RESET}")
+                    } else {
+                        format!(" / {t}")
+                    }
+                } else {
+                    String::new()
+                };
+                format!("{count_s}{tail}")
             };
             // Only the label carries the state color; the count is plain (like the
-            // clock), the ` / total` dim.
+            // clock), the ` / total` and percent dim.
             if color {
-                out.push(format!("{col}{left}{pad}{RESET}  {count_s}{tail}"));
+                out.push(format!("{col}{left}{pad}{RESET}  {num}"));
             } else {
-                out.push(format!("{left}{pad}  {count_s}{tail}"));
+                out.push(format!("{left}{pad}  {num}"));
             }
         }
 
@@ -448,7 +506,7 @@ impl Tree {
 /// A node's effective (rolled-up) state: any descendant leaf running → running;
 /// all done → done; some done but not all → running; else waiting. A node with
 /// no descendants uses its own state.
-fn eff_state(snap: &[(usize, &str, bool, u8, i64, i64)], i: usize) -> u8 {
+fn eff_state(snap: &[(usize, &str, bool, u8, i64, i64, bool)], i: usize) -> u8 {
     let d = snap[i].0;
     let (mut any_run, mut any_done, mut any_wait, mut any_leaf) = (false, false, false, false);
     let mut j = i + 1;
@@ -576,7 +634,7 @@ mod tests {
         let base = tree.counter("master", 1, -1);
         let head = tree.counter("HEAD", 1, -1);
         base.set_running();
-        base.set_count(114230);
+        base.add_count(114230);
         base.set_done();
         head.set_running();
         head.set_total(114231);
@@ -594,6 +652,27 @@ mod tests {
                 "\x1b[33m  HEAD  \x1b[0m  107347\x1b[90m / 114231\x1b[0m".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn percent_node_shows_dim_pct_while_running_only() {
+        // evaluate: a percent leaf shows a dim `NN%` (shard progress) right-aligned
+        // in the number column while running — no ` / total`.
+        let tree = Tree::new(0, false);
+        tree.node("evaluate", 0);
+        let head = tree.percent("HEAD", 1);
+        head.set_running();
+        head.shard_progress(3, 8); // 37%
+        assert_eq!(
+            node_lines(&tree),
+            vec![
+                "\x1b[33mevaluate\x1b[0m".to_string(),
+                "\x1b[33m  HEAD  \x1b[0m  \x1b[90m    37%\x1b[0m".to_string(),
+            ]
+        );
+        // Once done it collapses to a bare green label (no `100%`), like enumerate.
+        head.group_done(0);
+        assert_eq!(node_lines(&tree)[1], "\x1b[32m  HEAD\x1b[0m");
     }
 
     #[test]
@@ -618,7 +697,7 @@ mod tests {
         for c in ["master", "HEAD"] {
             let n = tree.counter(c, 1, -1);
             n.set_running();
-            n.set_count(100);
+            n.add_count(100);
             n.set_done();
         }
         assert_eq!(node_lines(&tree)[0], "\x1b[32menumerate\x1b[0m");

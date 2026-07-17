@@ -379,7 +379,7 @@ pub fn eval_tests_many(
         .iter()
         .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
         .collect();
-    let nodes = add_phase(tree, "tests", &groups);
+    let nodes = add_phase(tree, "tests", &groups, Leaf::Count);
     let labels: Vec<String> = requests
         .iter()
         .map(|(rev, system, _)| format!("tests {} ({system})", rev.display))
@@ -570,13 +570,35 @@ fn default_slots(user: Option<u64>) -> usize {
     eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, user)
 }
 
+/// What a phase's commit leaves show in the number column: nothing (a state
+/// color only, e.g. `enumerate`, which has no meaningful count to tick), a plain
+/// count (`tests`; or `count / total` when [`run_shards`] is told the total, e.g.
+/// `instantiate`), or a dim `NN%` shard-progress readout (`evaluate`).
+#[derive(Clone, Copy)]
+enum Leaf {
+    None,
+    Count,
+    Percent,
+}
+
 /// Build a phase subtree in `tree`: the phase node, then (for a multi-system
 /// run) a system level, then the per-side commit `display` leaves — returning
 /// the leaf handles in `groups` order (parallel to the scheduler's groups, one
 /// `(system, display)` each). The single-system run elides the system level, so
-/// the commits sit directly under the phase (DESIGN §6).
-fn add_phase(tree: &live::Tree, phase: &str, groups: &[(String, String)]) -> Vec<Arc<live::Node>> {
+/// the commits sit directly under the phase (DESIGN §6). `leaf` picks the leaves'
+/// number-column kind.
+fn add_phase(
+    tree: &live::Tree,
+    phase: &str,
+    groups: &[(String, String)],
+    leaf: Leaf,
+) -> Vec<Arc<live::Node>> {
     tree.node(phase, 0);
+    let make = |disp: String, depth: usize| match leaf {
+        Leaf::None => tree.node(disp, depth),
+        Leaf::Count => tree.counter(disp, depth, -1),
+        Leaf::Percent => tree.percent(disp, depth),
+    };
     let mut handles: Vec<Option<Arc<live::Node>>> = vec![None; groups.len()];
     if tree.multi() {
         // Distinct systems in first-seen order; each side's commit nests under it.
@@ -590,13 +612,13 @@ fn add_phase(tree: &live::Tree, phase: &str, groups: &[(String, String)]) -> Vec
             tree.node(s.to_string(), 1);
             for (gi, (gs, disp)) in groups.iter().enumerate() {
                 if gs == s {
-                    handles[gi] = Some(tree.counter(disp.clone(), 2, -1));
+                    handles[gi] = Some(make(disp.clone(), 2));
                 }
             }
         }
     } else {
         for (gi, (_s, disp)) in groups.iter().enumerate() {
-            handles[gi] = Some(tree.counter(disp.clone(), 1, -1));
+            handles[gi] = Some(make(disp.clone(), 1));
         }
     }
     handles.into_iter().map(Option::unwrap).collect()
@@ -694,7 +716,7 @@ pub fn instantiate(
         .iter()
         .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
         .collect();
-    let nodes = add_phase(tree, "instantiate", &groups);
+    let nodes = add_phase(tree, "instantiate", &groups, Leaf::Count);
     let labels: Vec<String> = requests
         .iter()
         .map(|(rev, system, _)| format!("{} {system}", rev.display))
@@ -877,17 +899,20 @@ fn run_shards<T: Send>(
                     g.node.set_running();
                     g.shards_running.fetch_add(1, Ordering::Relaxed);
                     let outcome = (|| -> Result<()> {
-                        let on_item = |n: usize| g.node.add_count(n as i64);
+                        let on_item = |n: usize| g.node.stream(n as i64);
                         let rows = eval_shard(shard.group, &labels[shard.group], slice, &on_item)?;
                         g.rows.lock().unwrap().extend(rows);
                         let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Advance a percent node's shard-progress readout (a no-op
+                        // for count-less / plain-count nodes).
+                        g.node.shard_progress(done, g.shards_total);
                         if done == g.shards_total {
                             let rows = std::mem::take(&mut *g.rows.lock().unwrap());
-                            // Pin the count to the assembled rows in case the
-                            // streamed tallies drifted.
-                            g.node.set_count(rows.len() as i64);
+                            let n = rows.len() as i64;
                             on_group_complete(shard.group, rows)?;
-                            g.node.set_done();
+                            // Pin a plain count to the assembled total (the streamed
+                            // tally can drift), then mark the group done.
+                            g.node.group_done(n);
                         }
                         Ok(())
                     })();
@@ -991,8 +1016,8 @@ pub fn eval_pairs(
         .collect();
     // Both phase subtrees are created up front, so `evaluate` shows as waiting
     // (blue) under the same commit displays while `enumerate` runs (DESIGN §6).
-    let enum_nodes = add_phase(tree, "enumerate", &groups);
-    let eval_nodes = add_phase(tree, "evaluate", &groups);
+    let enum_nodes = add_phase(tree, "enumerate", &groups, Leaf::None);
+    let eval_nodes = add_phase(tree, "evaluate", &groups, Leaf::Percent);
 
     // Phase 1: enumerate each pair's top-level attr names — the space phase 2
     // shards. This runs through the *same scheduler*, one shard per pair (the
