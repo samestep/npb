@@ -580,12 +580,11 @@ enum Leaf {
     Percent,
 }
 
-/// Build a phase subtree in `tree`: the phase node, then (for a multi-system
-/// run) a system level, then the per-side commit `display` leaves — returning
-/// the leaf handles in `groups` order (parallel to the scheduler's groups, one
-/// `(system, display)` each). The single-system run elides the system level, so
-/// the commits sit directly under the phase (DESIGN §6). `leaf` picks the leaves'
-/// number-column kind.
+/// Build a phase subtree in `tree`: the phase node, then a system level, then the
+/// per-side commit `display` leaves — returning the leaf handles in `groups` order
+/// (parallel to the scheduler's groups, one `(system, display)` each). The system
+/// level is always present, one system or many (DESIGN §6). `leaf` picks the
+/// leaves' number-column kind.
 fn add_phase(
     tree: &live::Tree,
     phase: &str,
@@ -599,25 +598,19 @@ fn add_phase(
         Leaf::Percent => tree.percent(disp, depth),
     };
     let mut handles: Vec<Option<Arc<live::Node>>> = vec![None; groups.len()];
-    if tree.multi() {
-        // Distinct systems in first-seen order; each side's commit nests under it.
-        let mut order: Vec<&str> = Vec::new();
-        for (s, _) in groups {
-            if !order.contains(&s.as_str()) {
-                order.push(s);
-            }
+    // Distinct systems in first-seen order; each side's commit nests under it.
+    let mut order: Vec<&str> = Vec::new();
+    for (s, _) in groups {
+        if !order.contains(&s.as_str()) {
+            order.push(s);
         }
-        for s in order {
-            tree.node(s.to_string(), 1);
-            for (gi, (gs, disp)) in groups.iter().enumerate() {
-                if gs == s {
-                    handles[gi] = Some(make(disp.clone(), 2));
-                }
+    }
+    for s in order {
+        tree.node(s.to_string(), 1);
+        for (gi, (gs, disp)) in groups.iter().enumerate() {
+            if gs == s {
+                handles[gi] = Some(make(disp.clone(), 2));
             }
-        }
-    } else {
-        for (gi, (_s, disp)) in groups.iter().enumerate() {
-            handles[gi] = Some(make(disp.clone(), 1));
         }
     }
     handles.into_iter().map(Option::unwrap).collect()

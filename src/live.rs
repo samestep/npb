@@ -250,8 +250,8 @@ pub fn human_elapsed(d: Duration) -> String {
 // network or nontrivial work becomes a node the moment npd learns it needs it,
 // nothing is ever removed, and cached/no-op work never appears at all. Phases
 // (`enumerate`, `evaluate`, `tests`, `instantiate`, `probe`, and the network
-// `fetch`/`download`) are top-level nodes; under them a system level (elided for
-// a single-system run) and the per-side commit `display`s. State is one of three
+// `fetch`/`download`) are top-level nodes; under them a system level and the
+// per-side commit `display`s. State is one of three
 // nom colors — blue waiting, yellow running, green done — carried by the label;
 // counts are plain, the `/ total` denominator dim, nothing bold. See the
 // rendering spec in `scratch/tree_demo.py`.
@@ -419,7 +419,6 @@ pub struct Tree {
     nodes: Mutex<Vec<Arc<Node>>>,
     start: Instant,
     min_label_w: usize,
-    multi: bool,
     /// Whether to colorize stderr — a TTY with `NO_COLOR`/`CLICOLOR` allowing it,
     /// per `console` (DESIGN §11). Gates ALL color: the state-colored labels, the
     /// dim `/ total` and `%` columns, the spinner, and the resting `.`. Note this
@@ -430,19 +429,13 @@ pub struct Tree {
 
 impl Tree {
     /// `color` gates all SGR; production passes [`colors_enabled`], tests force it.
-    pub fn new(min_label_w: usize, multi: bool, color: bool) -> Self {
+    pub fn new(min_label_w: usize, color: bool) -> Self {
         Self {
             nodes: Mutex::new(Vec::new()),
             start: Instant::now(),
             min_label_w,
-            multi,
             color,
         }
-    }
-
-    /// Whether the run spans more than one system (so phases nest a system level).
-    pub fn multi(&self) -> bool {
-        self.multi
     }
 
     /// Append a count-less node (a phase, a system, a network ref, `enumerate`).
@@ -804,10 +797,8 @@ pub fn plan_label_width(systems: &[String], pr: Option<u64>, compare: Option<&st
     // commit nodes atomically (as WAIT) before any of them shows a number, so the
     // column already clears them by the first frame with a count — nothing shifts,
     // and they need not be known here (they aren't until resolution finishes).
-    if systems.len() > 1 {
-        for s in systems {
-            w = w.max(ind + s.chars().count());
-        }
+    for s in systems {
+        w = w.max(ind + s.chars().count());
     }
     if let Some(n) = pr {
         w = w.max(ind + format!("refs/pull/{n}/merge").len());
@@ -872,10 +863,10 @@ mod tests {
 
     #[test]
     fn renders_states_counts_and_totals() {
-        // Single system: phase → commit. Colors live only on the label; the count
-        // is plain, the ` / total` dim, nothing bold. A done side collapses to a
-        // bare count; a running side shows `count / total`.
-        let tree = Tree::new(0, false, true);
+        // A phase with two commit leaves directly under it. Colors live only on
+        // the label; the count is plain, the ` / total` dim, nothing bold. A done
+        // side collapses to a bare count; a running side shows `count / total`.
+        let tree = Tree::new(0, true);
         tree.node("evaluate", 0);
         let base = tree.counter("master", 1, -1);
         let head = tree.counter("HEAD", 1, -1);
@@ -904,7 +895,7 @@ mod tests {
     fn no_color_renders_no_sgr() {
         // With color off (NO_COLOR, or a non-terminal), the same tree emits zero
         // SGR — plain text, identical layout.
-        let tree = Tree::new(0, false, false);
+        let tree = Tree::new(0, false);
         tree.node("evaluate", 0);
         let head = tree.counter("HEAD", 1, 114231);
         head.set_running();
@@ -928,7 +919,7 @@ mod tests {
         // evaluate: a plain drv count (middle) PLUS a dim shard `NN%` (right). The
         // shard total is known up front, so just turning yellow with shards
         // running reads its true small percent — NOT 100%.
-        let tree = Tree::new(0, false, true);
+        let tree = Tree::new(0, true);
         tree.node("evaluate", 0);
         let head = tree.percent("HEAD", 1);
         head.set_shards_total(10);
@@ -963,7 +954,7 @@ mod tests {
     fn waiting_counter_populates_its_number() {
         // A counter populates its number immediately — even while blue (waiting)
         // it reads `0`, rather than blank until it turns yellow.
-        let tree = Tree::new(0, false, true);
+        let tree = Tree::new(0, true);
         tree.node("tests", 0);
         tree.counter("HEAD", 1, -1); // left in WAIT
         assert_eq!(
@@ -980,7 +971,7 @@ mod tests {
         // `tests` systems appear as each becomes ready, but a later-ready system
         // that sorts earlier splices ABOVE an already-present one — the section
         // stays in fixed system order regardless of completion order.
-        let tree = Tree::new(0, true, true);
+        let tree = Tree::new(0, true);
         let phase = tree.node("tests", 0);
         for (label, key) in [("sysB", 1), ("sysA", 0), ("sysC", 2)] {
             let sys = tree.detached_node(label, 1, key);
@@ -1004,7 +995,7 @@ mod tests {
         // The non-interactive append log: a leaf prints only once it's done, its
         // parent headers print once just before its first done child (ancestors
         // top-down), and nothing re-prints on a later call.
-        let tree = Tree::new(0, true, false); // multi (system level), no color
+        let tree = Tree::new(0, false); // no color
         let phase = tree.node("evaluate", 0);
         let a1 = tree.detached_percent("base", 2, 0);
         let a2 = tree.detached_percent("head", 2, 0);
@@ -1037,7 +1028,7 @@ mod tests {
 
     #[test]
     fn rollup_all_done_is_green() {
-        let tree = Tree::new(0, false, true);
+        let tree = Tree::new(0, true);
         tree.node("enumerate", 0);
         for c in ["master", "HEAD"] {
             let n = tree.counter(c, 1, -1);
@@ -1050,7 +1041,7 @@ mod tests {
 
     #[test]
     fn empty_tree_draws_nothing() {
-        let tree = Tree::new(11, false, true);
+        let tree = Tree::new(11, true);
         assert!(tree.is_empty());
         assert!(tree.render(0).is_empty());
         assert!(tree.render_frozen().is_empty());
@@ -1058,9 +1049,12 @@ mod tests {
 
     #[test]
     fn plan_width_clears_every_label() {
-        // Single system: the longest phase name (`instantiate`, 11) is the floor.
-        assert_eq!(plan_label_width(&["aarch64-linux".into()], None, None), 11);
-        // Multi-system: a system name at depth 1 is widest (2 + 13).
+        // With no system label to place, the longest phase name (`instantiate`,
+        // 11) is the floor.
+        assert_eq!(plan_label_width(&[], None, None), 11);
+        // A single system's name at depth 1 (2 + 13) — always shown — beats it.
+        assert_eq!(plan_label_width(&["aarch64-linux".into()], None, None), 15);
+        // Multi-system: the widest system name at depth 1 governs (2 + 13).
         assert_eq!(
             plan_label_width(&["aarch64-linux".into(), "x86_64-linux".into()], None, None),
             15

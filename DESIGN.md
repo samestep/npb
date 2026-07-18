@@ -593,7 +593,7 @@ npd shares **one persistent progress tree** (`live::Tree`/`live::with_live` in
 a steady 100 ms off lock-free per-node atomics that the workers bump. It is a
 tree: each piece of network or nontrivial work (`fetch`/`download`, `enumerate`,
 `evaluate`, `tests`, `instantiate`, `probe`) is a top-level node the moment npd
-learns it needs it — nesting a system level (elided when there's one system) and
+learns it needs it — nesting a system level (always, one system or many) and
 the per-side commit *display* (`Rev::display`, §6: the friendly name of the tree
 actually evaluated — `master`, `HEAD`, `merge(a, b)`, `#431 merge` — never a
 resolved sha unless the user typed one) — and cached/no-op work never appears at

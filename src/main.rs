@@ -921,13 +921,11 @@ fn reveal_system_tests(
         .get_or_insert_with(|| tree.node("tests", 0))
         .clone();
 
-    // Build this system's subtree (system spine for multi, then its miss leaves)
-    // and splice it into fixed system order.
-    let depth = if tree.multi() { 2 } else { 1 };
+    // Build this system's subtree (system spine, then its miss leaves) and splice
+    // it into fixed system order.
+    let depth = 2;
     let mut subtree: Vec<Arc<live::Node>> = Vec::new();
-    if tree.multi() {
-        subtree.push(tree.detached_node(sys.to_string(), 1, sys_index));
-    }
+    subtree.push(tree.detached_node(sys.to_string(), 1, sys_index));
     for (rev, misses) in pending {
         // A `NN%` shard-progress leaf (like `evaluate`): its count is streamed
         // test jobs — a package yields one or more tests — so the package count
@@ -1123,7 +1121,6 @@ fn run(cli: Cli) -> Result<()> {
     let compare_literal = cli.patch.as_deref().filter(|v| v.contains("..."));
     let tree = live::Tree::new(
         live::plan_label_width(&systems, cli.pr, compare_literal),
-        systems.len() > 1,
         live::colors_enabled(),
     );
 
