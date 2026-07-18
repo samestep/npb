@@ -280,8 +280,7 @@ pub fn render(
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
     // `npd` links to the exact source tree this binary was built from (§8).
     let url = crate::URL;
-    let mut out =
-        format!("## [`npd`]({url}) report: {base} → {head}\n\n{fence}sh\n{command}\n{fence}\n");
+    let mut out = format!("## [`npd`]({url}) · {base} → {head}\n\n{fence}sh\n{command}\n{fence}\n");
     for (system, entries) in per_system {
         out.push_str(&format!("\n### `{system}`\n"));
         if entries.is_empty() {

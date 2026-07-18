@@ -13,7 +13,7 @@ npd --pr 542936
 
 That command may not give you the same result if you run it yourself, but `npd`'s report includes a _reproducible_ command that will:
 
-> ## [`npd`](README.md) report: [`dce745c`](https://github.com/NixOS/nixpkgs/commit/dce745ce155ce35a8121ee7280e7ae53559cead3) → [`5f96e8f`](https://github.com/NixOS/nixpkgs/commit/5f96e8fa57f8703504fe54b642bfcb4264aa9d4d)
+> ## [`npd`](README.md) · [`dce745c`](https://github.com/NixOS/nixpkgs/commit/dce745ce155ce35a8121ee7280e7ae53559cead3) → [`5f96e8f`](https://github.com/NixOS/nixpkgs/commit/5f96e8fa57f8703504fe54b642bfcb4264aa9d4d)
 >
 > ```sh
 > npd --base dce745ce155ce35a8121ee7280e7ae53559cead3 --head 840dbf16cf78ddd86383d55a3beefa44df86cfd9 --patch 840dbf16cf78ddd86383d55a3beefa44df86cfd9...5f96e8fa57f8703504fe54b642bfcb4264aa9d4d -s x86_64-linux
