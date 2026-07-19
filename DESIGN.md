@@ -515,20 +515,58 @@ tip, head)` pair, npd reports one of two deltas:
 - *Merge (default)* — a **synthetic merge** of the head onto the base (base as
   first parent), reported as `base → merge`. This reflects the head applied on
   the *current* base — base drift included — exactly what a merge would produce,
-  the same shape ofborg/Hydra and `nixpkgs-review pr` evaluate. For a mergeable
-  PR the merge is already computed: `merge(merge^1, merge^2)` **is**
-  `refs/pull/N/merge`, so npd reuses GitHub's commit verbatim (no local merge,
-  byte-identical to what CI built). Otherwise (default/explicit) npd mints it
-  locally with `git merge-tree --write-tree` + `commit-tree` — a deterministic,
-  content-addressed commit (pinned identity + epoch dates, pinned under
-  `refs/npd/merge` against `git gc`), exactly like the working-tree capture
-  (§6). When the head already descends from the base the merge is a
+  the same shape ofborg/Hydra and `nixpkgs-review pr` evaluate. npd **always
+  mints the merge itself** with `git merge-tree --write-tree` + `commit-tree` — a
+  deterministic, content-addressed commit (pinned identity + epoch dates, pinned
+  under `refs/npd/merge` against `git gc`), exactly like the working-tree capture
+  (§6) — *including under `--pr`*, where GitHub already publishes a test-merge at
+  `refs/pull/N/merge`. npd deliberately does **not** adopt GitHub's merge, and
+  this is a **soundness** requirement, not a preference. A report's reproduction
+  command can only *re-merge*: it rebuilds the head from a diff, which carries no
+  ancestry (§8). GitHub's test-merge, by contrast, was computed by whatever git
+  ran when the PR last changed — for an idle PR, an old git whose 3-way
+  resolution can differ from a fresh one. So reviewing GitHub's merge while the
+  repro re-merges would break the invariant that *the repro evaluates the same
+  trees or fails loudly* — it could silently evaluate a different tree.
+  (Confirmed in the wild: nixpkgs#21303's 2017 test-merge swaps two option
+  defaults vs. a current `git merge-tree` — one of 1 in ~525 sampled mergeable
+  PRs.) Running both the review and its repro through `merge_source` makes them
+  identical by construction.
+
+  **The merge uses one *explicit* merge base.** `git merge-tree` on a head that
+  carries real ancestry builds ort's recursive *virtual* base over every merge
+  base of the pair; a repro rebuilds the head as a single-parent synthetic
+  commit, so its merge has exactly one base. `merge_source` pins that single base
+  (`--merge-base=<merge-base>`), so review and repro agree even across a
+  criss-cross history — empirically vanishing in nixpkgs (0 of ~1100 sampled PRs;
+  the contribution workflow discourages merge commits), but real. npd also runs
+  git with the user's global/system config neutralized (`git_command`), so a
+  stray `~/.gitconfig` merge driver or `merge.conflictStyle` can't perturb the
+  result; `.gitattributes` drivers (nixpkgs' `module-list.nix merge=union`) still
+  apply, since they are content under review, not environment (`git merge-tree`
+  honors them). What remains — and is accepted, the same class as "eval
+  reproducibility assumes a pinned Nix" (§4) — is a *git-version* dependence: two
+  machines on incompatible git could resolve the same 3-way differently.
+
+  When the head already descends from the base the merge is a
   fast-forward, so its tree equals the head's and this collapses to a plain
   `base → head` at no extra eval; a distinct merged tree appears only under
   genuine base drift — precisely when you want to see it. A bonus: every review
   against the same base-branch tip shares its base eval (per-PR fork points never
   did). A conflicted PR (no `merge` ref) or a conflicting local merge can't take
   this path, so it fails with a message pointing at `--no-merge`.
+
+  > **Alternative considered, equally reasonable.** Keep reviewing GitHub's exact
+  > test-merge (byte-identical to what CI built) and make the *repro* reconstruct
+  > it by pinning a compare to the merge commit itself (`--patch merge^1...merge`)
+  > rather than to the PR head. That preserves CI fidelity but rides on GitHub
+  > still serving a *superseded* merge commit's sha after the PR moves — a
+  > base-repo synthesis, orphaned on update, unlike the fork-network-durable PR
+  > head — which we could not confirm (the durability question is inherently
+  > longitudinal; only the live-merge happy path is observable). npd-owns-the-
+  > merge needs no such guarantee, keeps the compact PR-head compare in the repro
+  > (§8, unchanged), and the fidelity it gives up is exactly the stale-git quirks
+  > (nixpkgs#21303) we would rather shed than faithfully reproduce.
 
   When the resolved `base` and `head` land on the **same tree** — a bare `npd`
   on a clean checkout, an unmoved `--pr`, a `--base`/`--head` typo — there is
@@ -772,8 +810,8 @@ The spine is implemented (✓).
 1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`), evals run
    in parallel with an OOM-recovery ladder (§6).
 2. ✓ the two-way diff: a base-branch tip vs the head merged onto it (a synthetic
-   merge — GitHub's test-merge commit under `--pr`, else minted locally), or the
-   merge-base under `--no-merge` (§6).
+   merge npd always mints locally — even under `--pr`, so a review and its repro
+   compute the identical merge; §6), or the merge-base under `--no-merge` (§6).
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,
    `DepFailed`/cascade detection.

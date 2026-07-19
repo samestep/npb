@@ -120,10 +120,27 @@ const UPSTREAM: &str = "https://github.com/NixOS/nixpkgs";
 /// Spawn `git -C repo ARGS` and return its completed output — the shared spawn
 /// behind [`git`], [`fetch_ref`], and [`resolve_commit`], each of which applies
 /// its own exit-code handling to the result.
-fn git_output(repo: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
-    Proc::new("git")
-        .arg("-C")
+/// A `git -C <repo>` command with the invoking user's global and system config
+/// neutralized (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` → `/dev/null`), so npd's
+/// merges, `apply`s, and merge-base choices are a pure function of the repository
+/// and npd's own git — never the user's `~/.gitconfig` (a custom merge driver,
+/// `merge.conflictStyle`, `merge.renormalize`, …). Repository config and
+/// `.gitattributes` (e.g. nixpkgs' `nixos/modules/module-list.nix merge=union`)
+/// still apply: those are content under review, not the user's environment. This
+/// is part of what keeps a review reproducible byte-for-byte on another machine
+/// (DESIGN §6): npd *owns* the merge, so the environment it runs git in must not
+/// perturb the result.
+fn git_command(repo: &std::path::Path) -> Proc {
+    let mut cmd = Proc::new("git");
+    cmd.arg("-C")
         .arg(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    cmd
+}
+
+fn git_output(repo: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    git_command(repo)
         .args(args)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))
@@ -239,21 +256,22 @@ fn resolve_pr(
         }
         bail!("PR #{pr} not found on {upstream}");
     }
-    // Merge shape: reuse GitHub's test-merge commit. base = `merge^1` (the real
-    // base-branch tip), head = the merge itself; its label is the PR tip
-    // (`merge^2`), the commit a human reviews.
-    let merge = resolve_commit(repo, &merge_ref)?;
+    // Merge shape: npd computes its *own* merge of the base tip and the PR head,
+    // rather than adopting GitHub's test-merge commit. GitHub's `merge` was
+    // computed by whatever git ran when the PR last changed — for an idle PR, an
+    // old git whose 3-way resolution can differ from a fresh re-merge (seen in
+    // the wild on nixpkgs#21303: two option defaults silently swapped). The
+    // reproduction command can only *re-merge* (a diff carries no ancestry), so
+    // reviewing GitHub's merge would make `npd --pr N` and its repro disagree.
+    // Running both sides through `merge_source` makes them identical by
+    // construction (DESIGN §6). We still fetched `merge` — but only to read the
+    // real base tip (`merge^1`) and PR head (`merge^2`); its tree we discard.
     let base = resolve_commit(repo, &format!("{merge_ref}^1"))?;
     let head_tip = resolve_commit(repo, &format!("{merge_ref}^2"))?;
-    Ok((
-        commit_source(repo, base, format!("#{pr} base"))?,
-        Rev {
-            tree: tree_of(repo, &merge)?,
-            commit: merge,
-            label: head_tip,
-            display: format!("#{pr} merge"),
-        },
-    ))
+    let base_tip = commit_source(repo, base, format!("#{pr} base"))?;
+    let head = commit_source(repo, head_tip, format!("#{pr} head"))?;
+    let merge = merge_source(repo, &base_tip, &head)?;
+    Ok((base_tip, merge))
 }
 
 /// `git -C repo ARGS` with extra environment set — the spawn behind the
@@ -261,8 +279,8 @@ fn resolve_pr(
 /// `GIT_INDEX_FILE` and pinned author/committer identity+dates. Trimmed stdout,
 /// or an error carrying stderr (like [`git`]).
 fn git_env(repo: &std::path::Path, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
-    let mut cmd = Proc::new("git");
-    cmd.arg("-C").arg(repo).args(args);
+    let mut cmd = git_command(repo);
+    cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -613,10 +631,26 @@ fn ensure_distinct_trees(base: &Rev, head: &Rev) -> Result<()> {
 /// The merge Rev's label is the head's — the report shows `base → the head`,
 /// the change under review, with the merge itself implicit. A merge conflict is
 /// a hard error pointing at `--no-merge` (a conflicted tree would only miseval).
+///
+/// The merge uses one **explicit** merge base, not git's default. Left to itself,
+/// `merge-tree` on a head that carries real ancestry builds ort's *recursive
+/// virtual base* over every merge base of the pair; but a reproduction rebuilds
+/// the head as a synthetic commit with a single parent (the fork), so its merge
+/// has exactly one base. Pinning that same single base here makes a review and
+/// its repro compute the identical merge even across a criss-cross history — and
+/// makes npd's merge one well-defined thing across every input mode (DESIGN §6).
 fn merge_source(repo: &std::path::Path, base: &Rev, head: &Rev) -> Result<Rev> {
+    let merge_base = git_merge_base(repo, &base.commit, &head.commit)
+        .context("computing the merge base for the synthetic merge")?;
     let out = git_output(
         repo,
-        &["merge-tree", "--write-tree", &base.commit, &head.commit],
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={merge_base}"),
+            &base.commit,
+            &head.commit,
+        ],
     )?;
     if !out.status.success() {
         bail!(
@@ -1457,12 +1491,29 @@ mod tests {
                 .success()
         );
         let upstream = up.path().to_str().unwrap();
-        // Merge shape (default): reuse GitHub's merge. base = merge^1 (master
-        // tip B), head = merge (M), whose label is the PR tip merge^2 (C).
+        // Merge shape (default): base = merge^1 (master tip B), head = npd's OWN
+        // merge of (B, PR tip C) — *not* GitHub's merge commit M — labelled with
+        // the PR tip C. The merge is npd's synthetic (pinned under refs/npd/merge,
+        // ≠ M), though for this clean fixture its tree equals M's.
         let (base, head) = resolve_pr(local.path(), upstream, 1, false).unwrap();
         assert_eq!(base.commit, s["b"]);
-        assert_eq!(head.commit, s["m"]);
         assert_eq!(head.label, s["c"]);
+        assert_ne!(
+            head.commit, s["m"],
+            "npd reviews its own merge, not GitHub's"
+        );
+        assert_eq!(
+            head.commit,
+            g(local.path(), &["rev-parse", "refs/npd/merge"])
+        );
+        assert_eq!(
+            head.tree,
+            g(
+                local.path(),
+                &["rev-parse", &format!("{}^{{tree}}", s["m"])]
+            ),
+            "a clean merge still matches GitHub's tree",
+        );
         // --no-merge shape: fork point on the PR's real base branch —
         // merge-base(merge^1 = B, PR tip = C) = A, and head = the PR tip C.
         let (nb, nh) = resolve_pr(local.path(), upstream, 1, true).unwrap();
@@ -1496,6 +1547,80 @@ mod tests {
         let (base, head) = resolve_pr(local.path(), upstream, 2, true).unwrap();
         assert_eq!(head.commit, s["d"]);
         assert_eq!(base.commit, s["a"]);
+    }
+
+    /// The soundness fix (DESIGN §6): a `--pr` review and the reproduction command
+    /// it prints must evaluate the *same* head tree. npd must therefore review its
+    /// own re-mergeable merge, never GitHub's test-merge — whose tree a diff-based
+    /// repro cannot reconstruct when it disagrees with a fresh merge (a stale-git
+    /// resolution, a criss-cross virtual base; nixpkgs#21303 in the wild). Modelled
+    /// with an "evil" merge ref whose tree is *not* the clean 3-way result.
+    #[test]
+    fn pr_reviews_own_merge_so_repro_matches() {
+        let up = tempfile::tempdir().unwrap();
+        let d = up.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        // fork A (file `base`); base tip B adds `m`; PR head C (off A) adds `p`.
+        std::fs::write(d.join("base"), "base\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "A"]);
+        let fork = g(d, &["rev-parse", "HEAD"]);
+        std::fs::write(d.join("m"), "m\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "B"]);
+        let base_tip = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["checkout", "-q", "-b", "pr", &fork]);
+        std::fs::write(d.join("p"), "p\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "C"]);
+        let pr_head = g(d, &["rev-parse", "HEAD"]);
+        g(d, &["checkout", "-q", "master"]);
+        // GitHub's "evil" test-merge: parents (base_tip, pr_head) but a tree that
+        // drops the PR's `p` — i.e. it resolved differently from a clean merge.
+        let evil_tree = g(d, &["rev-parse", &format!("{base_tip}^{{tree}}")]);
+        let m = g(
+            d,
+            &[
+                "commit-tree",
+                &evil_tree,
+                "-p",
+                &base_tip,
+                "-p",
+                &pr_head,
+                "-m",
+                "M",
+            ],
+        );
+        g(d, &["update-ref", "refs/pull/9/head", &pr_head]);
+        g(d, &["update-ref", "refs/pull/9/merge", &m]);
+
+        let local = tempfile::tempdir().unwrap();
+        Proc::new("git")
+            .args(["clone", "-q"])
+            .arg(up.path())
+            .arg(local.path())
+            .status()
+            .unwrap();
+        let upstream = up.path().to_str().unwrap();
+        let (_, head) = resolve_pr(local.path(), upstream, 9, false).unwrap();
+
+        // npd reviewed its OWN merge, not GitHub's evil one.
+        assert_ne!(
+            head.tree, evil_tree,
+            "npd must not adopt GitHub's merge tree"
+        );
+        // And that tree is exactly what the reproduction rebuilds: apply the
+        // fork→head diff onto the fork (as `--patch` does), then re-merge.
+        let diff = git_diff_binary(local.path(), &fork, &pr_head).unwrap();
+        let repro_head = patch_source(local.path(), &fork, &diff, "fork").unwrap();
+        let base_rev = commit_source(local.path(), base_tip.clone(), "base".into()).unwrap();
+        let repro_merge = merge_source(local.path(), &base_rev, &repro_head).unwrap();
+        assert_eq!(
+            head.tree, repro_merge.tree,
+            "the --pr review and its repro must evaluate the same tree",
+        );
     }
 
     #[test]
