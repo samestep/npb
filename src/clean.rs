@@ -223,9 +223,8 @@ fn gather(root: &std::path::Path) -> Result<Vec<Eval>> {
 /// Evict eval files per `spec`, purge each evicted `(tree, system)`'s `--tests`
 /// rows, and vacuum the DB once. This is the whole `--clean` action — it reviews
 /// nothing. It first prints exactly what it *would* remove and asks for
-/// confirmation on stdin, deleting only on a yes (`assume_yes` — the `-y` flag —
-/// skips the prompt, for scripts). Nothing is touched until confirmed.
-pub fn clean(spec: &CleanSpec, assume_yes: bool) -> Result<()> {
+/// confirmation on stdin, deleting only on a yes. Nothing is touched until confirmed.
+pub fn clean(spec: &CleanSpec) -> Result<()> {
     let root = cache_root()?;
     let files = gather(&root)?;
     let total: u64 = files.iter().map(|f| f.size).sum();
@@ -252,7 +251,7 @@ pub fn clean(spec: &CleanSpec, assume_yes: bool) -> Result<()> {
         human_bytes(total - freed),
     );
 
-    if !assume_yes && !confirm("Delete these? [y/N] ")? {
+    if !confirm("Delete these? [y/N] ")? {
         println!("Aborted; nothing deleted.");
         return Ok(());
     }

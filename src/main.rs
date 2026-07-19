@@ -41,87 +41,47 @@ pub const URL: &str = concat!(
 #[command(
     name = "npd",
     version = URL,
-    about = "A persistent fact store for iterating on nixpkgs changes"
+    about = "Nixpkgs build outcome diff CLI"
 )]
 struct Cli {
-    /// nixpkgs clone to resolve the commits in (default: current directory).
-    /// Like git's `-C`, a relative `--patch` file path resolves against this
-    /// directory too.
-    #[arg(short = 'C')]
-    path: Option<PathBuf>,
-    /// Base-branch tip to review the head against (default: `master`). The
-    /// report compares this against the head merged onto it (see `--no-merge`).
-    #[arg(long, conflicts_with = "pr")]
-    base: Option<String>,
-    /// Head revision to review (default: `HEAD`, or the uncommitted working
-    /// tree if it has changes).
-    #[arg(long, conflicts_with = "pr")]
-    head: Option<String>,
-    /// Review a diff applied on top of an anchor, instead of a plain revision —
-    /// the head becomes a synthetic content-addressed commit (like the
-    /// uncommitted-working-tree capture). The anchor is `--head` if given, else
-    /// the default head — the working tree if it has uncommitted changes, else
-    /// `HEAD` — so `--patch` composes with work in progress; pass `--head HEAD` to
-    /// apply onto the committed tree instead. The value is either a **path** to a
-    /// diff file (Nix path syntax: it must contain a `/`, so use `./x.diff`;
-    /// resolved against `-C`) or a GitHub **compare expression** `A...B`, whose
-    /// endpoints npd resolves locally to shas and fetches as `compare/A...B.diff`.
-    /// This is what a report's reproduction command uses to rebuild a PR head
-    /// (durably, past the force-pushes PRs rebase through) or an uncommitted
-    /// working tree, without needing the original commit fetchable.
-    #[arg(long, value_name = "PATH|A...B", conflicts_with = "pr")]
-    patch: Option<String>,
-    /// Review NixOS/nixpkgs PR #N: shorthand for `--head` = the PR's head,
-    /// `--base` = its base-branch tip (GitHub's test-merge commit's first
-    /// parent) — the same delta ofborg/Hydra and nixpkgs-review evaluate. The
-    /// PR's refs are re-fetched from GitHub every run so the review always
-    /// reflects the current PR (a deliberate network fetch, like `--patch A...B`;
-    /// hard-errors if GitHub is unreachable, rather than reviewing a stale
-    /// snapshot).
-    #[arg(long, value_name = "N")]
-    pr: Option<u64>,
-    /// Diff from the merge-base of base and head, instead of the default —
-    /// building a synthetic merge of the head onto the base and diffing the
-    /// base against that. The merge-base shape ignores drift on the base since
-    /// the fork point; the merge shape reflects the head applied on the current
-    /// base (what a merge would actually produce), like a PR's test-merge.
-    #[arg(long)]
-    no_merge: bool,
-    /// Systems to report on (repeatable); defaults to the host system.
-    #[arg(short, long)]
-    system: Vec<String>,
-    /// Re-attempt a previously-failed drv (expect it might pass now).
-    #[arg(long)]
-    retry: bool,
-    /// Skip each changed package's `passthru.tests`. By default npd also
-    /// evaluates and builds those tests (on both sides), classifying each
-    /// test's `base → head` delta like any other attr — the behaviour ported
-    /// from nixpkgs-review's `--tests` (#397).
-    #[arg(long)]
-    no_tests: bool,
-    /// Build the packages npd would otherwise skip — those marked
-    /// broken/unsupported/insecure in meta (reported as ⏩ by default, like
-    /// nixpkgs-review's "skipped").
-    #[arg(long)]
-    no_skip: bool,
-    /// Maintenance: evict cached eval files to bound the cache, then exit
-    /// without reviewing (DESIGN.md §4). Takes a size budget (`4GiB`, `500MB` —
-    /// keep the most-recently-used evals that fit, drop the least-recently-used
-    /// rest), a date (`2026-07-15`), or a duration (`2mo`, `1yr`, `30d` — drop
-    /// evals unused for longer). Each evicted eval also purges its `--tests` rows.
+    /// Nixpkgs clone
+    #[arg(short = 'C', default_value = ".", conflicts_with = "clean")]
+    path: PathBuf,
+    /// Revision before the change
     #[arg(
         long,
-        value_name = "SIZE|DATE|DURATION",
-        conflicts_with_all = ["pr", "base", "head", "patch", "no_merge", "retry", "no_tests", "no_skip"]
+        value_name = "REV",
+        default_value = "master",
+        conflicts_with = "clean"
     )]
+    base: String,
+    /// Revision after the change [default: working tree]
+    #[arg(long, value_name = "REV", conflicts_with = "clean")]
+    head: Option<String>,
+    /// Set --base and --head to a pull request
+    #[arg(long, value_name = "NUMBER", conflicts_with_all = ["base", "head", "patch", "clean"])]
+    pr: Option<u64>,
+    /// Apply a diff on top of --head
+    #[arg(long, value_name = "PATH|REV...REV", conflicts_with = "clean")]
+    patch: Option<String>,
+    /// Compare merge-base to --head, instead of --base to merge
+    #[arg(long, conflicts_with = "clean")]
+    no_merge: bool,
+    /// Don't add passthru.tests
+    #[arg(long, conflicts_with = "clean")]
+    no_tests: bool,
+    /// Try to build unsupported/broken/insecure packages
+    #[arg(long, conflicts_with = "clean")]
+    no_skip: bool,
+    /// Try to build derivations that have failed before
+    #[arg(long, conflicts_with = "clean")]
+    retry: bool,
+    /// Every system to evaluate [default: just this system]
+    #[arg(short, long, conflicts_with = "clean")]
+    system: Vec<String>,
+    /// Delete least recently used cache entries
+    #[arg(long, value_name = "SIZE|DATE|DURATION")]
     clean: Option<String>,
-    /// Skip `--clean`'s confirmation prompt and delete immediately (for scripts).
-    #[arg(short = 'y', long, requires = "clean")]
-    yes: bool,
-    /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
-    /// cores and total RAM (see `eval::eval_slots`).
-    #[command(flatten)]
-    eval: eval::EvalOpts,
 }
 
 /// The host Nix system double, e.g. `aarch64-linux`.
@@ -139,12 +99,7 @@ fn host_system() -> String {
 /// because a relative `--nixpkgs` that `git -C` accepts would be embedded
 /// verbatim in the eval expression, where `builtins.fetchGit` needs an
 /// absolute path.
-fn resolve_repo(nixpkgs: Option<PathBuf>) -> Result<PathBuf> {
-    let p = match nixpkgs {
-        Some(p) => p,
-        None => std::env::current_dir()
-            .context("could not determine the current directory; pass --nixpkgs <path>")?,
-    };
+fn resolve_repo(p: PathBuf) -> Result<PathBuf> {
     p.canonicalize()
         .with_context(|| format!("resolving nixpkgs path {}", p.display()))
 }
@@ -571,7 +526,7 @@ fn resolve_commit(repo: &std::path::Path, rev: &str) -> Result<String> {
 /// derives the final pair.
 fn resolve_local(
     repo: &std::path::Path,
-    base: Option<String>,
+    base: String,
     head: Option<String>,
     // The human `display` for the head anchor — for `--patch` it names the
     // commit the diff sits on (`HEAD`, a branch), since the `head` arg there is
@@ -598,11 +553,7 @@ fn resolve_local(
         }
         (None, None) => head_source(repo)?,
     };
-    let base_tip = match base {
-        Some(b) => commit_source(repo, resolve_commit(repo, &b)?, b)?,
-        None => commit_source(repo, resolve_commit(repo, "master")?, "master".into())
-            .context("no base given and no `master` branch to default to; pass --base")?,
-    };
+    let base_tip = commit_source(repo, resolve_commit(repo, &base)?, base)?;
     apply_merge(repo, base_tip, head, no_merge)
 }
 
@@ -1095,7 +1046,7 @@ fn run(cli: Cli) -> Result<()> {
     // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
     // files and exit, reviewing nothing. It conflicts with every review knob.
     if let Some(spec) = &cli.clean {
-        return clean::clean(&clean::CleanSpec::parse(spec)?, cli.yes);
+        return clean::clean(&clean::CleanSpec::parse(spec)?);
     }
 
     // Tests run by default; --no-tests opts out.
@@ -1105,7 +1056,7 @@ fn run(cli: Cli) -> Result<()> {
         retry: cli.retry,
         no_skip,
     };
-    let opts = cli.eval;
+    let opts = eval::EvalOpts::default();
     let repo = resolve_repo(cli.path)?;
 
     let systems = resolve_systems(cli.system);
@@ -1431,7 +1382,7 @@ mod tests {
 
         // A bare `npd` on a clean master checkout: base = master, head = HEAD,
         // fast-forward merge ⇒ one tree. That's the wasted no-op we reject.
-        let (base, head) = resolve_local(d, None, None, None, false, None).unwrap();
+        let (base, head) = resolve_local(d, "master".into(), None, None, false, None).unwrap();
         assert_eq!(base.tree, head.tree);
         let err = ensure_distinct_trees(&base, &head).unwrap_err().to_string();
         assert!(err.contains("same tree"), "{err}");
@@ -1439,8 +1390,7 @@ mod tests {
 
         // An explicit base a commit back has a genuinely different tree, so the
         // review proceeds.
-        let (base, head) =
-            resolve_local(d, Some("HEAD~1".into()), None, None, false, None).unwrap();
+        let (base, head) = resolve_local(d, "HEAD~1".into(), None, None, false, None).unwrap();
         assert_ne!(base.tree, head.tree);
         ensure_distinct_trees(&base, &head).unwrap();
     }
