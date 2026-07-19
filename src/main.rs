@@ -1116,6 +1116,22 @@ fn run_phases(
     Ok((per_system_changed, targets))
 }
 
+/// The heading label for a `--patch A...B` compare head (DESIGN §8). When the
+/// anchor *is* the compare's first endpoint — npd's own `--pr`/compare repro
+/// shape, `--head <A> --patch <A>...<B>`, where `A` is the merge-base — applying
+/// `A...B` onto `A` reconstructs exactly `tree(B)`, so the side under review is
+/// `B` (merged onto the base), just as the original `--pr` run labelled it. Name
+/// it `B`: matching that run, and more accurate than `<anchor> *`, since the head
+/// is a real commit's content, not a synthetic working-tree edit. A compare
+/// applied onto a *different* anchor is genuinely synthetic → `<anchor> *`. This
+/// only affects the heading; the reproduction command is identical either way.
+fn compare_head_display(anchor: &str, expr: &str) -> String {
+    match expr.split_once("...") {
+        Some((a, b)) if a == anchor => b.to_string(),
+        _ => format!("{anchor}\\*"),
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
     // files and exit, reviewing nothing. It conflicts with every review knob.
@@ -1332,8 +1348,9 @@ fn run(cli: Cli) -> Result<()> {
             // sha-pinned compare npd downloaded (`pin_compare` resolved both
             // endpoints once, locally). Immutable, so re-fetching returns the
             // identical diff — no re-resolution, and no embed to bloat the report.
+            // Its heading label ([`compare_head_display`]) names the reviewed side.
             (
-                format!("{}\\*", anchor.commit),
+                compare_head_display(&anchor.commit, &expr),
                 HeadRepro::Compare {
                     anchor: anchor.commit,
                     expr,
@@ -1689,6 +1706,17 @@ mod tests {
         assert_eq!(head.tree, head_tree);
         assert_eq!(head.label, "worktree");
         assert_eq!(tree_of(d, &head.commit).unwrap(), head_tree);
+    }
+
+    #[test]
+    fn compare_head_display_names_the_reviewed_side() {
+        // npd's --pr repro shape (`--head <A> --patch <A>...<B>`): the head is B's
+        // content, so the heading names B — matching the original --pr run.
+        assert_eq!(compare_head_display("aaa", "aaa...bbb"), "bbb");
+        // A compare applied onto a *different* anchor is a genuine synthetic edit.
+        assert_eq!(compare_head_display("ccc", "aaa...bbb"), "ccc\\*");
+        // Malformed (no `...`) falls back to the synthetic form, never panics.
+        assert_eq!(compare_head_display("ccc", "aaa"), "ccc\\*");
     }
 
     #[test]

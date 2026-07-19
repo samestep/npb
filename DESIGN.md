@@ -758,7 +758,16 @@ tree is recovered on another machine:
     PR (a net diff, not per-commit patches). A fetch failure at reproduction —
     an unreachable sha — is fatal, rather than a silent mis-review. (npd re-mints
     the merge from `--base merge^1` and the rebuilt head, so base drift is still
-    reflected exactly as in the review.) **Exception — binary changes:** GitHub's
+    reflected exactly as in the review.) **Heading label:** because the anchor
+    `<fork>` *is* the compare's first endpoint and the merge-base, applying
+    `<fork>...<head>` onto it reconstructs exactly `tree(head)` — so the reviewed
+    side is `head`, and the report names it `head` (not `<fork> \*`), byte-for-byte
+    matching what the original `--pr` run's heading showed (`compare_head_display`
+    in `src/main.rs`). The `\*` synthetic-head marker is kept only for a compare
+    applied onto a *different* anchor (a user's `--patch A...B` onto `HEAD`), where
+    the head really is a rebased edit rather than a real commit's content. The
+    reproduction *command* is identical either way — only the heading text differs.
+    **Exception — binary changes:** GitHub's
     text `.diff` can't carry a binary blob, so a PR that touches binary files
     would emit a repro that fails at `git apply`. npd detects this (`git diff
     --numstat` shows `-\t-` for a binary file) and falls back to an embedded
