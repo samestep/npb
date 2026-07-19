@@ -381,8 +381,15 @@ fn worktree_source(repo: &std::path::Path, head: &str) -> Result<Option<Rev>> {
         repo,
         tree_of(repo, &stash)?,
         head,
-        "HEAD*".into(),
+        dirty_display("HEAD"),
     )?))
+}
+
+/// Display name for a synthetic "anchor plus a diff" head: the base's name with
+/// npd's `*` dirty-marker appended. Single-sourced so the marker can't drift
+/// between the working-tree, `--patch`, and `--compare` heads that all use it.
+fn dirty_display(base: &str) -> String {
+    format!("{base}*")
 }
 
 /// Mint npd's deterministic synthetic head commit over `tree` with parent
@@ -460,7 +467,7 @@ fn patch_source(
     let tree = git_env(repo, &env, &["write-tree"])?;
     // The patched head is `anchor` plus a diff, shown with the same `*` marker
     // the report and the working-tree capture use.
-    worktree_commit(repo, tree, &anchor, format!("{anchor_display}*"))
+    worktree_commit(repo, tree, &anchor, dirty_display(anchor_display))
 }
 
 /// A path as a UTF-8 `&str`, or an error (paths npd makes are always UTF-8).
@@ -585,7 +592,7 @@ fn resolve_compare_head(
     literal: &str,
     tree: &live::Tree,
 ) -> Result<Rev> {
-    let display = format!("{}*", anchor.display);
+    let display = dirty_display(&anchor.display);
     if let Some(cached) = cache.patch_tree(&anchor.commit, expr)? {
         // Re-mint the synthetic head over the cached tree — succeeds iff its
         // objects are still in the repo (no network). If `git gc` reclaimed the
