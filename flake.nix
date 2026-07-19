@@ -62,8 +62,18 @@
           pkgs.git
           pkgs.nettools # `hostname`
         ];
+        # crane's default source filter keeps only Cargo/`.rs` files, which would
+        # drop `src/schema.sql` (embedded via `include_str!`) and break the build.
+        # Widen it to also keep `.sql` — crane's documented idiom for exactly this.
+        sqlOrCargo =
+          path: type:
+          (pkgs.lib.hasSuffix ".sql" path) || (craneLib.filterCargoSources path type);
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = sqlOrCargo;
+            name = "source"; # keep the store path stable regardless of the dir name
+          };
           strictDeps = true;
           # ring (via ureq's TLS) needs perl at build; rusqlite bundles sqlite (cc).
           # git: the `--pr` resolution tests shell out to it against a fixture repo.
