@@ -546,24 +546,16 @@ fn resolve_local(
     repo: &std::path::Path,
     base: String,
     head: Option<String>,
-    // The human `display` for the head anchor — for `--patch` it names the
-    // commit the diff sits on (`HEAD`, a branch), since the `head` arg there is
-    // the resolved anchor sha rather than something the user typed.
+    // The human `display` for an explicit `--head <ref>` (the ref the user typed).
     head_display: Option<String>,
     no_merge: bool,
-    patch: Option<&str>,
+    // For `--patch`, the head already reconstructed from the diff onto the anchor
+    // (a synthetic content-addressed commit shown as `<anchor> *`), built by the
+    // caller so it can consult the patch-tree cache before any download (§8).
+    patch_head: Option<Rev>,
 ) -> Result<(Rev, Rev)> {
-    let head = match (head, patch) {
-        // --patch: the head is the given diff applied on top of the anchor commit
-        // (resolved by the caller — an explicit `--head`, else the default head,
-        // which may be the working tree), yielding a synthetic content-addressed
-        // commit shown as `<anchor> *`.
-        (anchor, Some(diff)) => patch_source(
-            repo,
-            anchor.as_deref().unwrap_or("HEAD"),
-            diff,
-            head_display.as_deref().unwrap_or("HEAD"),
-        )?,
+    let head = match (head, patch_head) {
+        (_, Some(ph)) => ph,
         // An explicit `--head <ref>` is echoed as the ref the user typed.
         (Some(h), None) => {
             let disp = head_display.unwrap_or_else(|| h.clone());
@@ -573,6 +565,47 @@ fn resolve_local(
     };
     let base_tip = commit_source(repo, resolve_commit(repo, &base)?, base)?;
     apply_merge(repo, base_tip, head, no_merge)
+}
+
+/// Resolve a `--patch <A...B>` compare head, using the patch-tree cache so a warm
+/// re-run of a reproduction command needs no network (DESIGN §8). The cache
+/// (`Store::patch_tree`) maps `(anchor, sha-pinned expr) → the reconstructed head
+/// tree`. On a hit npd re-mints the synthetic head over that tree when its git
+/// objects survive — they do right after the review that wrote them, since
+/// `refs/npd/worktree` held them — skipping the download entirely; on a miss, or
+/// once `git gc` has reclaimed the tree, it downloads the compare diff, applies
+/// it, and records the resulting tree. It stores only a tree hash, never the diff,
+/// and keys on the command's own `(anchor, expr)` — so it needs no knowledge of
+/// the original `--pr` run that produced the reproduction command.
+fn resolve_compare_head(
+    repo: &std::path::Path,
+    cache: &mut store::Store,
+    anchor: &Rev,
+    expr: &str,
+    literal: &str,
+    tree: &live::Tree,
+) -> Result<Rev> {
+    let display = format!("{} *", anchor.display);
+    if let Some(cached) = cache.patch_tree(&anchor.commit, expr)? {
+        // Re-mint the synthetic head over the cached tree — succeeds iff its
+        // objects are still in the repo (no network). If `git gc` reclaimed the
+        // tree, `worktree_commit`'s `commit-tree` errors and we fall through to a
+        // fresh download, which is exactly the intended graceful degradation.
+        if let Ok(head) = worktree_commit(repo, cached, &anchor.commit, display.clone()) {
+            return Ok(head);
+        }
+    }
+    // Miss (or the tree was reclaimed): download the compare diff and apply it.
+    let dl = tree.node("download", 0);
+    let child = tree.node(literal.to_string(), 1);
+    dl.set_running();
+    child.set_running();
+    let diff = fetch_compare_diff(expr)?;
+    child.set_done();
+    dl.set_done();
+    let head = patch_source(repo, &anchor.commit, &diff, &anchor.display)?;
+    cache.put_patch_tree(&anchor.commit, expr, &head.tree)?;
+    Ok(head)
 }
 
 /// Turn a `(base-branch tip, head)` pair into the report's `(base, head)`.
@@ -1115,61 +1148,59 @@ fn run(cli: Cli) -> Result<()> {
     // command needs downstream.
     let (base, head, patch_anchor, patch_compare, patch_diff, per_system_changed, targets) =
         live::with_live(&tree, |handle| {
-            // --patch: obtain the diff — a local file, or a GitHub compare
-            // download (`A...B`). `pin_compare` pins both endpoints to shas
-            // *once*, and that immutable `<shaA>...<shaB>` drives both the
-            // download and the reproduction command, so a moved branch can't hand
-            // back a different diff on reproduction. The download is a live
-            // network node.
-            let mut patch_compare: Option<String> = None;
-            let patch_diff: Option<String> = match &cli.patch {
-                None => None,
-                Some(value) if value.contains('/') => {
-                    // A relative diff path resolves against the `-C` directory
-                    // (like git's `-C`), not npd's cwd; a default run's `repo`
-                    // is cwd. A local file, so no network node.
-                    let p = std::path::Path::new(value);
-                    let p = if p.is_absolute() {
-                        p.to_path_buf()
-                    } else {
-                        repo.join(p)
-                    };
-                    Some(
-                        std::fs::read_to_string(&p)
-                            .with_context(|| format!("reading the --patch file {}", p.display()))?,
-                    )
-                }
-                Some(value) if value.contains("...") => {
-                    let expr = pin_compare(&repo, value)?;
-                    // A live network node, labeled with the literal expression
-                    // the user typed — not the sha-pinned form npd fetches.
-                    let dl = tree.node("download", 0);
-                    let child = tree.node(value.clone(), 1);
-                    dl.set_running();
-                    child.set_running();
-                    let diff = fetch_compare_diff(&expr)?;
-                    child.set_done();
-                    dl.set_done();
-                    patch_compare = Some(expr);
-                    Some(diff)
-                }
-                Some(value) => bail!(
-                    "--patch must be a path (containing a `/`, e.g. `./x.diff`) or a \
-                         compare expression `A...B`; got {value:?}"
-                ),
-            };
-
-            // Resolve the --patch anchor *once* (a mutable ref read twice could
+            // Resolve the --patch anchor first (a mutable ref read twice could
             // move between lookups): an explicit `--head`, else the default head
             // (the working tree if dirty, else HEAD), so `--patch` composes with
-            // uncommitted work. A dirty-tree anchor is a synthetic commit the
-            // repro embeds.
+            // uncommitted work. Both the patch-tree cache key and `patch_source`
+            // need it, so it comes before the diff.
             let patch_anchor: Option<Rev> = match &cli.patch {
                 Some(_) => Some(match &cli.head {
                     Some(h) => commit_source(&repo, resolve_commit(&repo, h)?, h.clone())?,
                     None => head_source(&repo)?,
                 }),
                 None => None,
+            };
+
+            // --patch: build the head by applying a diff onto the anchor. A local
+            // file is read and applied; a GitHub compare (`A...B`) goes through the
+            // patch-tree cache (§8) — re-minted from the cached head tree when its
+            // objects survive, downloaded only on a miss — so a warm re-run of a
+            // reproduction command needs no network. `pin_compare` pins both
+            // endpoints once, and that immutable `<shaA>...<shaB>` drives both the
+            // cache/download and the reproduction command. Only the file case keeps
+            // the raw diff (its repro embeds it; a compare re-emits the expression).
+            let mut patch_compare: Option<String> = None;
+            let mut patch_diff: Option<String> = None;
+            let patch_head: Option<Rev> = match (&cli.patch, &patch_anchor) {
+                (None, _) => None,
+                (Some(value), Some(anchor)) if value.contains('/') => {
+                    // A relative diff path resolves against the `-C` directory
+                    // (like git's `-C`), not npd's cwd; a default run's `repo` is
+                    // cwd. A local file, so no network.
+                    let p = std::path::Path::new(value);
+                    let p = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        repo.join(p)
+                    };
+                    let diff = std::fs::read_to_string(&p)
+                        .with_context(|| format!("reading the --patch file {}", p.display()))?;
+                    let head = patch_source(&repo, &anchor.commit, &diff, &anchor.display)?;
+                    patch_diff = Some(diff);
+                    Some(head)
+                }
+                (Some(value), Some(anchor)) if value.contains("...") => {
+                    let expr = pin_compare(&repo, value)?;
+                    let mut cache = store::Store::open(&paths::db_path()?)?;
+                    let head =
+                        resolve_compare_head(&repo, &mut cache, anchor, &expr, value, &tree)?;
+                    patch_compare = Some(expr);
+                    Some(head)
+                }
+                (Some(value), _) => bail!(
+                    "--patch must be a path (containing a `/`, e.g. `./x.diff`) or a \
+                         compare expression `A...B`; got {value:?}"
+                ),
             };
 
             let (base, head) = match cli.pr {
@@ -1188,17 +1219,10 @@ fn run(cli: Cli) -> Result<()> {
                 None => resolve_local(
                     &repo,
                     cli.base,
-                    // For a --patch run the head arg *is* the resolved anchor
-                    // commit (patch_source applies the diff onto it); otherwise
-                    // it's `--head` verbatim.
-                    patch_anchor
-                        .as_ref()
-                        .map(|r| r.commit.clone())
-                        .or_else(|| cli.head.clone()),
-                    // …its live-tree name is the anchor's `display` (the typed ref).
+                    cli.head.clone(),
                     patch_anchor.as_ref().map(|r| r.display.clone()),
                     cli.no_merge,
-                    patch_diff.as_deref(),
+                    patch_head,
                 )?,
             };
 
@@ -1621,6 +1645,43 @@ mod tests {
             head.tree, repro_merge.tree,
             "the --pr review and its repro must evaluate the same tree",
         );
+    }
+
+    /// A populated patch-tree cache resolves a `--patch <A...B>` compare head with
+    /// **no network** — npd re-mints the synthetic head over the cached tree
+    /// (DESIGN §8). This is what makes a warm re-run of a reproduction command
+    /// offline, keyed only on `(anchor, expr)` from the command itself.
+    #[test]
+    fn compare_head_cache_hits_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a"), "x\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "anchor"]);
+        let anchor = commit_source(d, resolve_commit(d, "HEAD").unwrap(), "HEAD".into()).unwrap();
+        // A distinct head tree that already exists as an object in the repo.
+        std::fs::write(d.join("a"), "y\n").unwrap();
+        g(d, &["commit", "-am", "head"]);
+        let head_tree = tree_of(d, "HEAD").unwrap();
+        assert_ne!(head_tree, anchor.tree);
+
+        let mut cache = store::Store::open(&d.join("npd.sqlite")).unwrap();
+        let expr = "1111111111111111111111111111111111111111\
+                    ...2222222222222222222222222222222222222222";
+        cache
+            .put_patch_tree(&anchor.commit, expr, &head_tree)
+            .unwrap();
+
+        // The compare URL is never reached (a download would fail): the cache hit
+        // re-mints the synthetic head over the local tree object.
+        let live_tree = live::Tree::new(0, false);
+        let head = resolve_compare_head(d, &mut cache, &anchor, expr, "a...b", &live_tree).unwrap();
+        assert_eq!(head.tree, head_tree);
+        assert_eq!(head.label, "worktree");
+        assert_eq!(tree_of(d, &head.commit).unwrap(), head_tree);
     }
 
     #[test]

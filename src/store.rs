@@ -79,6 +79,21 @@ CREATE TABLE IF NOT EXISTS test_drv (
     PRIMARY KEY (key_id, test_attr)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (key_id, pkg_attr);
+
+-- The patch-tree cache (DESIGN.md §8): maps a `--patch <A...B>` compare — its
+-- anchor commit and sha-pinned expression — to the head *tree* npd reconstructed
+-- by applying that compare's diff onto the anchor. It lets a *reproduction*
+-- command's warm re-run skip the GitHub compare download: npd re-mints the
+-- synthetic head over the cached tree (when its git objects survive) instead of
+-- re-fetching. `anchor` and `expr` come straight from the command, so this needs
+-- no knowledge of the original `--pr` run; the value is a tree hash, never the
+-- diff. Re-derivable like everything else — a miss just re-downloads.
+CREATE TABLE IF NOT EXISTS patch_tree (
+    anchor TEXT NOT NULL,
+    expr   TEXT NOT NULL,
+    tree   TEXT NOT NULL,
+    PRIMARY KEY (anchor, expr)
+) STRICT, WITHOUT ROWID;
 ";
 
 // `source`/`outcome` persist as small integer enum codes, not English labels.
@@ -443,6 +458,31 @@ impl Store {
         self.conn.execute_batch("VACUUM").context("vacuuming")?;
         Ok(())
     }
+
+    // --- the patch-tree cache (DESIGN.md §8) --------------------------------
+
+    /// The head tree a `--patch <A...B>` compare reconstructs onto `anchor`, if
+    /// npd has recorded it. `None` on a miss (the caller then downloads).
+    pub fn patch_tree(&self, anchor: &str, expr: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tree FROM patch_tree WHERE anchor = ?1 AND expr = ?2",
+                params![anchor, expr],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record that applying compare `expr`'s diff onto `anchor` yields head `tree`.
+    /// Idempotent (`INSERT OR REPLACE`) — the mapping is a pure function of its key.
+    pub fn put_patch_tree(&mut self, anchor: &str, expr: &str, tree: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO patch_tree (anchor, expr, tree) VALUES (?1, ?2, ?3)",
+            params![anchor, expr, tree],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -683,6 +723,32 @@ mod tests {
         // Purging an unknown key is a no-op, and VACUUM after a batch is fine.
         assert_eq!(s.purge_tests("treeA", sys).unwrap(), 0);
         s.vacuum().unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_tree_round_trip() {
+        let dir = std::env::temp_dir().join(format!("npd-patchtree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+
+        // Miss before anything is recorded.
+        assert_eq!(s.patch_tree("anchorsha", "a...b").unwrap(), None);
+        // Record and read back; a different (anchor, expr) is independent.
+        s.put_patch_tree("anchorsha", "a...b", "treesha").unwrap();
+        assert_eq!(
+            s.patch_tree("anchorsha", "a...b").unwrap(),
+            Some("treesha".to_string())
+        );
+        assert_eq!(s.patch_tree("anchorsha", "a...c").unwrap(), None);
+        assert_eq!(s.patch_tree("other", "a...b").unwrap(), None);
+        // The mapping is a pure function of its key: overwrite is idempotent.
+        s.put_patch_tree("anchorsha", "a...b", "treesha").unwrap();
+        assert_eq!(
+            s.patch_tree("anchorsha", "a...b").unwrap(),
+            Some("treesha".to_string())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

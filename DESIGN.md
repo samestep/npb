@@ -185,7 +185,7 @@ table, so its per-row bytes are what compound over time (~15% off it, measured).
 
 ```
 ~/.cache/nix-npd/
-  npd.sqlite                    # observation log (tiny) + --tests cache (the bulk)
+  npd.sqlite                    # observation log (tiny) + --tests cache (the bulk) + patch-tree cache (§8)
   <sys>/<tree>.tsv.zst          # attr→drv maps (zstd), one file per eval — evicted by --clean
 ```
 
@@ -498,8 +498,9 @@ The pair comes from one of three modes:
   **no GitHub API and no token**: the refs come over anonymous git, unlike
   `nixpkgs-review`, which calls the REST API to learn the merge sha (and nags for
   `GITHUB_TOKEN`/`gh`). `--pr` is a deliberate exception to "no network when
-  cached" (§1) — as is a `--patch <A...B>` compare download (§8); every other
-  path is offline. The merge ref is a *moving pointer* GitHub regenerates on a
+  cached" (§1) — as is a `--patch <A...B>` compare download on a *cache miss*
+  (§8); every other path, and a warm compare re-run, is offline. The merge ref is
+  a *moving pointer* GitHub regenerates on a
   rebase or base move, so npd re-fetches it every run and resolves the fresh
   pointer — a repeat `--pr` always reflects the current PR, never a stale
   snapshot. This doesn't defeat the caches that matter: an unchanged PR is a
@@ -785,6 +786,30 @@ tree is recovered on another machine:
     reads — no `-` special case). (For the working tree, fully-untracked files are
     excluded, the same `git stash create` limitation the live capture has — §6.)
 
+**The compare download is cached, so a warm re-run is offline.** The scenario
+that matters: person A posts a `--pr` report; person B pastes its repro command
+(`… --head <fork> --patch <fork>...<head>`), runs it, then runs it *again* — the
+second run should touch no network. The `patch_tree` table (`src/store.rs`) maps
+`(anchor, sha-pinned expr) → the head tree` npd reconstructed by applying that
+compare onto the anchor. On a re-run npd looks it up (`resolve_compare_head`) and
+**re-mints the synthetic head over the cached tree** instead of downloading — the
+tree's git objects are still in the clone, held by the `refs/npd/worktree` the
+first run wrote. Everything downstream (the merge, the tree-keyed eval, the
+drvpath-keyed facts) is already cached, so the re-run is fully offline. Three
+properties make this the right shape: it keys only on `(anchor, expr)`, both of
+which are *in the reproduction command itself*, so it needs **no knowledge of the
+original `--pr` run**; it stores **only a tree hash, never the diff** (no patches
+in `~/.cache/nix-npd`, mirroring the no-patch-in-the-command choice above); and it
+is re-derivable — if `git gc` has meanwhile reclaimed the tree, `commit-tree`
+fails and npd simply downloads again (`--clean`/eviction likewise just costs a
+re-download). It does *not* cover a re-run that must **build** a drv it doesn't
+yet know: building `fetchGit`s the head, which needs the tree *objects*, and a
+hash isn't the objects — that path reconstructs from the diff (a download). But
+that is new work, not re-running a finished review, and needs the network anyway.
+(An embedded-diff repro would make even that offline, and a fresh machine's *first*
+run too, but at the cost of a long diff in every `--pr` report — deliberately not
+chosen.)
+
 **Resolve mutable refs once.** A branch or `HEAD` can move mid-run, so npd
 resolves each such ref to an immutable sha exactly once and thereafter passes only
 that sha: the `--patch` anchor is resolved a single time, up front, then reused
@@ -799,9 +824,10 @@ Making `--patch` a real flag (rather than emitting the throwaway-index/`apply`/
 `commit-tree` dance as shell) keeps the commands to a single `npd` call with no
 external binary, and `--patch` is independently useful — "review a diff, or a
 GitHub compare range, on top of a base." Its compare form is a deliberate
-network fetch, so npd's network use is now: narinfo probes (§7), the `--pr` ref
-fetch, and a `--patch <A...B>` download — all explicit; the path form and every
-other flag stay offline.
+network fetch — but a *cached* one (above): npd's network use is now narinfo
+probes (§7), the `--pr` ref fetch, and a `--patch <A...B>` download *on a cache
+miss* — all explicit; the path form, a warm compare re-run, and every other flag
+stay offline.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
