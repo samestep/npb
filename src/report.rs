@@ -26,13 +26,13 @@ pub enum State {
     /// `Absent`, not this). `--no-skip` builds it anyway, and any real build
     /// fact then outranks this state.
     Skipped,
-    /// No derivation on this side (the attr doesn't exist there).
-    Absent,
     /// Has a derivation but no build fact yet. Builds always run, so this is
     /// only the build phase's accepted gap (§5): a target nix never reached,
     /// with nothing verifiably failing in its closure, left unrecorded to be
     /// re-attempted next run.
     Unknown,
+    /// No derivation on this side (the attr doesn't exist there).
+    Absent,
 }
 
 impl State {
@@ -42,8 +42,8 @@ impl State {
         State::Failed,
         State::Blocked,
         State::Skipped,
-        State::Absent,
         State::Unknown,
+        State::Absent,
     ];
 
     fn glyph(self) -> &'static str {
@@ -64,8 +64,8 @@ impl State {
             State::Failed => "failed to build",
             State::Blocked => "dependency failed to build",
             State::Skipped => "didn't try to build",
-            State::Absent => "doesn't exist",
             State::Unknown => "couldn't try to build",
+            State::Absent => "doesn't exist",
         }
     }
 

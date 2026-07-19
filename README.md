@@ -20,6 +20,7 @@ That command may not give you the same result if you run it yourself, but `npd`'
 > ```sh
 > npd --base dce745ce155ce35a8121ee7280e7ae53559cead3 --head 840dbf16cf78ddd86383d55a3beefa44df86cfd9 --patch 840dbf16cf78ddd86383d55a3beefa44df86cfd9...5f96e8fa57f8703504fe54b642bfcb4264aa9d4d -s x86_64-linux
 > ```
+>
 > </details>
 >
 > <details><summary>Expand this for a legend of all symbols below.</summary>
@@ -28,8 +29,8 @@ That command may not give you the same result if you run it yourself, but `npd`'
 > - ❌ = failed to build
 > - 🚫 = dependency failed to build
 > - ⏩ = didn't try to build
-> - ➖ = doesn't exist
 > - ❔ = couldn't try to build
+> - ➖ = doesn't exist
 > </details>
 >
 > ### `x86_64-linux`
