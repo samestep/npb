@@ -75,7 +75,8 @@ That command may not give you the same result if you run it yourself, but `npd`'
 
 <!-- toc -->
 
-- [Values](#values)
+- [Goals](#goals)
+- [Non-goals](#non-goals)
 - [Installation](#installation)
   - [Temporary](#temporary)
 - [Usage](#usage)
@@ -83,7 +84,7 @@ That command may not give you the same result if you run it yourself, but `npd`'
 
 <!-- tocstop -->
 
-## Values
+## Goals
 
 `npd` strives to be
 
@@ -98,6 +99,15 @@ That command may not give you the same result if you run it yourself, but `npd`'
 - **reproducible.** Often a change may be on a branch that gets force-pushed later, or there may be uncommitted local changes, so the report always includes a command to reproduce the exact same Git tree on both sides.
 
 - **friendly.** Users running the tool in a rich terminal should get nice colors and live progress indicators, and users running it over a pipe should get lean but informative progress lines.
+
+## Non-goals
+
+`npd` does _not_
+
+- fetch remote evaluations.
+- manage Git worktrees.
+- provide sandboxing.
+- post to GitHub.
 
 ## Installation
 
