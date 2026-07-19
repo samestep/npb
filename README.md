@@ -1,6 +1,6 @@
 # `npd`
 
-A CLI tool to generate reports of the differences in build outcomes between pairs of Nixpkgs commits.
+A CLI tool to generate reports of the differences in build outcomes between pairs of [Nixpkgs](https://github.com/NixOS/nixpkgs) commits.
 
 > [!WARNING]
 > `npd` is not quite out of the prototyping phase yet. Expect breaking changes until this warning is removed.
