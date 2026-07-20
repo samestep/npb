@@ -639,7 +639,12 @@ all, so a fully-cached run shows nothing. Nodes only change: blue *waiting* →
 yellow *running* → green *done* (nom's three colors, on the label; a plain middle
 count where one applies, with a dim ` / total` or shard-`NN%` column alongside it
 while running — `enumerate` carries just a color, `evaluate` the `NN%` since its
-true drv total is unknowable), never disappearing. When the tree finishes it freezes
+true drv total is unknowable), never disappearing. Each line is truncated to the terminal width (one line, one
+row) and the live frame is windowed to the terminal *height* — when the tree
+outgrows the screen the last rows are kept (the running frontier and the phases
+ahead of it, since earlier phases finish first) and the folded head collapses to
+a dim `⋯ N more`, so the relative-cursor redraw never desyncs; the frozen reprint
+is plain scrollback and not windowed. When the tree finishes it freezes
 into scrollback, a dim separator fences it from what follows (nom's build display,
 then the report — the same separator between each), and the build proceeds
 (§5, nom's own display, not this tree). Persistence stays path-specific (§4): the full eval assembles a flat
@@ -959,7 +964,7 @@ So the pre-build tree has two modes, rendering the same node lines:
 
 | stderr | mode |
 | --- | --- |
-| a color TTY | **interactive** — redraw in place, colored; frozen to scrollback at the end |
+| a color TTY | **interactive** — redraw in place, colored, windowed to the terminal height (overflow folds to a dim `⋯ N more`, §6); frozen to scrollback at the end |
 | piped, CI, an AI agent, or `NO_COLOR` | **plain** — no color, no cursor moves; each node's line printed once the moment it completes (a leaf on green, its parent headers lazily just before it), a resting footer at the end |
 
 The plain append log (`Tree::emit_completed`) exists so a non-interactive run

@@ -7,6 +7,16 @@
 //! the moment the width changes (its cursor math is fixed at the *previous*
 //! width). Truncated content leaves nothing to reflow.
 //!
+//! The **height** dual of that invariant: the block must never be taller than
+//! the screen. `\x1b[{n}A` clamps at row 0, so once a frame overflows the
+//! window its top scrolls into scrollback and the up-move can no longer reach
+//! it — every later frame then redraws against the wrong row. So a frame is
+//! windowed to the terminal's rows ([`Live::draw`] via [`window_tail`]): the
+//! last lines are kept (the running frontier and the phases ahead of it —
+//! earlier phases finish first and scroll off the top) and the folded head
+//! collapses to a single dim `⋯ N more`. The frozen end-of-run reprint is
+//! *not* windowed — it is ordinary scrollback, free to be as tall as it likes.
+//!
 //! **Flicker-free, especially over a laggy SSH link.** A frame is built as one
 //! string and written once (one packet, not one per line), and:
 //! - content is *overwritten in place* then the tail cleared (`content` + `\x1b[K`),
@@ -68,8 +78,17 @@ impl Live {
         }
     }
 
+    /// The terminal as `(rows, cols)`. When the size can't be read (not a real
+    /// terminal), cols falls back to 80 and rows to "unbounded" — so height
+    /// windowing simply never kicks in rather than clamping to a guessed height.
+    fn size(&self) -> (usize, usize) {
+        self.term
+            .size_checked()
+            .map_or((usize::MAX, 80), |(h, w)| (h as usize, w as usize))
+    }
+
     fn width(&self) -> usize {
-        self.term.size_checked().map_or(80, |(_, w)| w as usize)
+        self.size().1
     }
 
     /// Redraw the block in place. A no-op on a non-terminal stderr (piped / CI):
@@ -78,7 +97,19 @@ impl Live {
         if !self.interactive {
             return;
         }
-        let w = self.width();
+        let (rows, w) = self.size();
+        // Window to the screen height (the dual of the per-line width truncation;
+        // see the module note). The block plus the trailing cursor row must both
+        // stay on screen or the next frame's `\x1b[{drawn}A` clamps at row 0 and
+        // desyncs — so cap at `rows - 1`, folding any overflow into a marker.
+        let cap = rows.saturating_sub(1).max(1);
+        let windowed;
+        let lines = if lines.len() > cap {
+            windowed = window_tail(lines, cap);
+            &windowed[..]
+        } else {
+            lines
+        };
         // A resize changes every line's truncation, so redraw all lines then.
         let full = w != self.prev_width || lines.len() != self.prev.len();
 
@@ -145,6 +176,27 @@ impl Live {
         self.drawn = 0;
         self.prev.clear();
     }
+}
+
+/// Fold `lines` down to at most `cap` rows for [`Live::draw`] so the block never
+/// outgrows the screen (see the height note on the module). Keeps the last
+/// `cap - 1` lines — the running frontier and the phases ahead of it, since
+/// earlier phases finish first and scroll off the top — and prefixes a single
+/// dim `⋯ N more` standing in for the folded head. `cap` is assumed `>= 1`; at
+/// `cap == 1` there's no room for the marker, so only the final line (the
+/// spinner/clock footer) survives. Only ever reached in interactive mode, where
+/// color is on (there is no monochrome redraw, §11), so the marker is dim.
+fn window_tail(lines: &[String], cap: usize) -> Vec<String> {
+    if cap <= 1 {
+        // Just the footer — better than a lone marker with no context.
+        return lines[lines.len() - 1..].to_vec();
+    }
+    let keep = cap - 1;
+    let hidden = lines.len() - keep;
+    let mut out = Vec::with_capacity(cap);
+    out.push(format!("{DIM}⋯ {hidden} more{RESET}"));
+    out.extend_from_slice(&lines[lines.len() - keep..]);
+    out
 }
 
 /// A handle into a running [`with_live`] block, handed to the worker body so it
@@ -1045,6 +1097,43 @@ mod tests {
         assert!(tree.is_empty());
         assert!(tree.render(0).is_empty());
         assert!(tree.render_frozen().is_empty());
+    }
+
+    #[test]
+    fn window_tail_keeps_the_footer_and_folds_the_head() {
+        // A block of six lines (five nodes + a footer) into four rows: the last
+        // three survive — crucially the footer — and the folded head (three
+        // lines) becomes one dim `⋯ 3 more`, for four rows total.
+        let block: Vec<String> = [
+            "enumerate",
+            "evaluate",
+            "tests",
+            "instantiate",
+            "probe",
+            "footer",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = window_tail(&block, 4);
+        assert_eq!(
+            out,
+            vec![
+                format!("{DIM}⋯ 3 more{RESET}"),
+                "instantiate".to_string(),
+                "probe".to_string(),
+                "footer".to_string(),
+            ]
+        );
+        assert_eq!(out.len(), 4, "never more rows than the cap");
+    }
+
+    #[test]
+    fn window_tail_at_one_row_keeps_only_the_footer() {
+        // A degenerate one-row cap has no room for both a marker and content, so
+        // the final line (the footer) wins — no lone, contextless marker.
+        let block: Vec<String> = ["a", "b", "footer"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(window_tail(&block, 1), vec!["footer".to_string()]);
     }
 
     #[test]
