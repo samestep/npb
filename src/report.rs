@@ -232,7 +232,7 @@ pub fn render(
     for (system, entries) in per_system {
         out.push_str(&format!("\n### `{system}`\n"));
         if entries.is_empty() {
-            out.push_str("\n_No changed attrs._\n");
+            out.push_str("\nNo changes.\n");
             continue;
         }
         // Bucket by (base, head) state, then emit buckets in priority order.
