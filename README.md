@@ -160,7 +160,7 @@ Note that, just like [Git's `-C`](https://git-scm.com/docs/git#Documentation/git
 By default, `npd` compares against `master`. To compare against a different base:
 
 ```sh
-npd --base release-26.05
+npd --base origin/release-26.05
 ```
 
 ### `--head`
@@ -168,7 +168,7 @@ npd --base release-26.05
 By default, `npd` evaluates on the current working tree. To evaluate on a different revision:
 
 ```sh
-npd --head some-branch
+npd --head origin/staging
 ```
 
 ### `--pr`
