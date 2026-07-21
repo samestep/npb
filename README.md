@@ -94,6 +94,7 @@ That command may not give you the same result if you run it yourself, but `npd`'
   - [`--clean`](#--clean)
   - [`-V`, `--version`](#-v---version)
 - [Acknowledgments](#acknowledgments)
+- [License](#license)
 
 <!-- tocstop -->
 
@@ -221,3 +222,9 @@ npd --version
 ## Acknowledgments
 
 This project owes its existence to its primary inspiration, Jörg Thalheim's [nixpkgs-review](https://github.com/Mic92/nixpkgs-review), which serves a similar purpose but makes different design tradeoffs.
+
+The development of this project was AI-assisted. This README and `npd --help` contain no AI-generated text.
+
+## License
+
+`npd` is licensed under the [MIT License](LICENSE).
