@@ -221,6 +221,33 @@ npd -s x86_64-linux -s aarch64-linux -s aarch64-darwin
 
 ### `--clean`
 
+Whenever `npd` encounters a Git tree it hasn't seen before, it evaluates Nixpkgs on that tree and saves the result to disk, roughly 3.5 megabytes each. To free up disk space by deleting the least recently used evaluation results:
+
+```sh
+npd --clean 100MB
+```
+
+The value passed to this argument must be either a [`YYYY-MM-DD` date](https://en.wikipedia.org/wiki/ISO_8601) or an integer with a suffix, which determines its meaning as follows.
+
+- Delete entries not used for at least some amount of time:
+  - `s`/`sec` = seconds
+  - `m`/`min` = minutes
+  - `h`/`hr` = hours
+  - `d` = days
+  - `w` = weeks
+  - `mo` = months
+  - `y`/`yr` = years
+- Delete least recently used entry until cache is small enough:
+  - `B` = bytes
+  - `kB` = kilobytes
+  - `KiB` = kibibytes
+  - `MB` = megabytes
+  - `MiB` = mebibytes
+  - `GB` = gigabytes
+  - `GiB` = gibibytes
+  - `TB` = terabytes
+  - `TiB` = tebibytes
+
 ### `-V`, `--version`
 
 To print the version:
