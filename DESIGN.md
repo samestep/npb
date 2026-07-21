@@ -29,18 +29,20 @@ you expect to just repeat).
   `nix-eval-jobs`; building goes through `nix build` + the existing remote
   builders. `npd` owns the **memory** and the **orchestration**, not the plumbing.
 
-### No backward compatibility, ever
+### No backward compatibility in the code, ever
 
-`npd` has exactly one user, no releases, and no deployments, and everything it
-stores is a re-derivable cache (§4). So there is no such thing as "legacy data"
-or an "old format" to support:
+`npd` has exactly one user, no releases, and no deployments. So there is no
+such thing as "legacy data" or an "old format" for the *code* to support:
 
-- **Never write migration code** — no schema upgrades, no purges of rows an
-  older version wrote, no readers for previous file formats, no "this column
-  may linger" tolerance. Change the current format in place.
-- If a format change would make existing cached data wrong to read, the remedy
-  is invalidation, not compatibility: delete `~/.cache/nix-npd` (it is all
-  re-derivable) and let the next run regenerate it.
+- **Never write migration code into npd** — no schema upgrades, no purges of
+  rows an older version wrote, no readers for previous file formats, no "this
+  column may linger" tolerance. Change the current format in place.
+- If a format change would make the existing `~/.cache/nix-npd` wrong to read,
+  carry its data forward with a **one-off, in-place migration run as part of
+  making the change** (ad-hoc SQL/script against the live store, never shipped
+  in the tree). Do **not** delete the store: it is re-derivable only at the
+  cost of re-running the builds and probes behind every recorded fact, so the
+  accumulated history is worth preserving.
 - When a feature is removed, remove **all** of it in the same change: enum
   variants, struct fields, table columns, parsing, and doc references. Dead
   "maybe useful later" fields are cruft; re-add them when they're actually used.
@@ -80,14 +82,16 @@ An eval at a fixed `(tree, system, config)` is deterministic, so its result is
 valid forever. The key is the git **tree** (the source content), not the commit
 that carries it — the evaluation can't observe a commit's parents, author,
 message, or timestamps (`fetchGit`'s checkout has no `.git`, and npd forwards
-only the path into `import`), so two commits with one tree share an eval (§6). Everything else is an **observation**: a single event, from some
-`Source` — a `Local` build we ran, or `Cache` (narinfo) presence on a
-substituter — stamped with `when`. We append and never discard, which is what
+only the path into `import`), so two commits with one tree share an eval (§6). Everything else is an **observation**: a single event — an outcome we
+watched a local build produce, or narinfo presence on a substituter, recorded
+as the same plain `Built` fact (§7; a success is a success, wherever the bits
+came from). We append and never discard, which is what
 makes flakiness representable (multiple observations of one drv with differing
-outcomes).
+outcomes); rows carry no timestamp — the log is append-only, so insertion
+order *is* the history.
 
 **A cache probe is an observation too** — "is output H in the cache right now"
-is just something we observed at time `when`, recorded so a later run needn't
+is just something we observed, recorded so a later run needn't
 re-probe. There is no eviction and no TTL, which keeps full history (a drv that
 went green → red → green is visible) under one log.
 
@@ -194,17 +198,17 @@ and surface only its tail if the eval aborts fatally.
 
 ## 5. The observation log and the build-policy predicate
 
-Every local build appends an `Observation` (source, outcome, when). The
-ergonomics the workflow needs are then a **pure predicate**
-over that log plus substituter presence:
+Every local build appends an `Observation` (outcome, plus a failure's
+`blocker` outputs). The ergonomics the workflow needs are then a **pure
+predicate** over that log (substituter presence is already *in* the log — a
+probe hit is recorded as a plain `Built`, §7):
 
 - meta-blocked (broken/unsupported/insecure), `--no-skip` off → **skipped**
   — never attempted, like nixpkgs-review; the report shows ⏩. (Checked first,
   so `--retry` alone doesn't build it; a real fact recorded by an earlier
   `--no-skip` run still wins.)
 - never observed, or forced → **build**
-- a `LOCAL` success exists → **skip (ok)**
-- substitutable success → **skip (ok)**
+- a recorded success exists — built here, or substitutable (§7) → **skip (ok)**
 - only failures observed, `--retry` off → **skip (fail)**
 - otherwise → **build**
 
@@ -219,8 +223,8 @@ skips). See `BuildPolicy::decide` in `src/model.rs`. (Tests run by default;
 `--no-tests` opts out.)
 
 **Staying instant when cached.** The driver loads every target's history in one
-SQLite query, and only *probes the cache* for drvs it doesn't already know are
-built (locally, or from a `Cache` observation a prior run recorded); those probes
+SQLite query, and only *probes the cache* for drvs the log has no fact about
+at all; those probes
 run concurrently (`cache::in_cache_many`). So a changed set whose facts are all
 known costs one query and no network — the whole build set is decided in
 milliseconds. (Builds stay strictly behind the eval phase: they are the memory
@@ -309,7 +313,8 @@ propagate a block), so a since-healed failure lingers in the log until then —
 harmlessly, since it is overridden at use (a direct failure by `--retry`, a
 later `Built`, or its own recorded outputs going valid; a dependency block
 automatically, via the `blocker` re-check).
-And a `Cache` fact records substitutability *at probe time* — the remote cache
+And a probe-recorded `Built` fact records substitutability *at probe time* —
+the remote cache
 deleting a path later doesn't invalidate the fact (by design, §3), it just means
 nix substitutes from source instead.
 
@@ -686,7 +691,9 @@ fully substitutable? (All outputs, because the recorded fact stands for the
 whole drv; substitution is per-output, so one missing output would still force
 a local build.) It is drv-precise and drift-free, but **success-only** (a
 404 conflates never-built / failed / GC-evicted — it can never assert a
-failure). A hit is recorded as a `Cache`/`Built` observation so a later run
+failure). A hit is recorded as a plain `Built` observation — deliberately
+indistinguishable from a local success, so the one flakiness rule (a success
+outranks failures) covers both — and a later run
 skips the probe; a miss records nothing (re-probing is cheap, and cache state
 can change under us). Ground truth for anything a narinfo can't answer is a
 **local build** (§5).
@@ -960,12 +967,13 @@ Recorded for context:
   eval depends only on source content), so a rebase/amend or a committed
   working tree is a cache hit and the uncommitted working tree is reviewable
   (§6); not a can of worms because `npd` owns the fixed config. No version tag —
-  a format change invalidates by deleting `~/.cache/nix-npd` (§1).
+  a format change ships with a one-off cleanup of the affected cache files
+  (§1; never by deleting the whole store — the observation log is preserved).
 - *Concurrency* → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.
-- *Cache facts lifetime* → append-only observations, no eviction/TTL. A `Cache`
-  observation records the drvpath, so staleness can't affect correctness (§3).
+- *Cache facts lifetime* → append-only observations, no eviction/TTL. A probe's
+  `Built` observation records the drvpath, so staleness can't affect correctness (§3).
 - *Remote facts* → narinfo on `cache.nixos.org` only; Hydra was dropped (§7).
 - *Storage* → SQLite (`npd.sqlite`) under `dirs::cache_dir()/nix-npd`; all re-derivable cache (§4).
 

@@ -1,32 +1,32 @@
 -- The SQLite fact store's schema, embedded into `store.rs` via `include_str!`
--- (kept in its own file for SQL syntax highlighting). The `source`/`outcome`
--- integer enum-code mappings live in `store.rs` (Rust, not DDL) — the values
+-- (kept in its own file for SQL syntax highlighting). The `outcome`
+-- integer enum-code mapping lives in `store.rs` (Rust, not DDL) — the values
 -- quoted in comments here are informative copies of that source of truth.
 --
--- No migrations, ever (CLAUDE.md): change this schema freely and in place. The
--- whole store is a re-derivable cache, so the remedy for an incompatible
--- change is deleting `~/.cache/nix-npd`, never a compat shim.
+-- No migration code in npd, ever (CLAUDE.md): change this schema freely and in
+-- place, and carry the live `~/.cache/nix-npd` data forward with a one-off
+-- migration run as part of the change — never delete the store (its facts are
+-- expensive to re-derive), and never add a compat shim here.
 
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
--- `local`/`cache` fact here per drv. `drv_path` is stored stripped of its
+-- fact here per drv — a local build's outcome, or substituter presence recorded
+-- as the same plain built (§7). `drv_path` is stored stripped of its
 -- constant `/nix/store/` prefix and `.drv` suffix (`evalfile::strip_drv`), and
 -- `blocker`'s output paths of their `/nix/store/` prefix (`strip_out` — an
--- output path has no `.drv`); both restored on read. `source` and `outcome` are
--- small integer enum codes (`source_code`/`outcome_code` in `store.rs`), not
--- their English labels: `source` 0 = local build, 1 = cache (narinfo) probe;
--- `outcome` 0 = built, 1 = failed, 2 = dep-failed.
--- This is the one append-only, never-evicted table, so trimming its
--- per-row bytes is what compounds over time.
+-- output path has no `.drv`); both restored on read. `outcome` is a
+-- small integer enum code (`outcome_code` in `store.rs`), not its English
+-- label: 0 = built, 1 = failed, 2 = dep-failed.
+-- Rows carry no timestamp: the log is append-only, so `id` (the rowid) is the
+-- observation order. This is the one append-only, never-evicted table, so
+-- trimming its per-row bytes is what compounds over time.
 CREATE TABLE IF NOT EXISTS observation (
-    id         INTEGER PRIMARY KEY,
-    drv_path   TEXT    NOT NULL,
-    source     INTEGER NOT NULL,
-    outcome    INTEGER NOT NULL,
-    when_      INTEGER NOT NULL,
+    id       INTEGER PRIMARY KEY,
+    drv_path TEXT    NOT NULL,
+    outcome  INTEGER NOT NULL,
     -- Newline-joined output paths whose validity re-decides this fact offline on
     -- a later run (DESIGN.md §5): for a `dep-failed`, the culprit dependency's
     -- outputs; for a `failed`, the drv's own outputs. NULL for a success.
-    blocker    TEXT
+    blocker  TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 

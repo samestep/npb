@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::model::{Observation, Outcome, Source};
+use crate::model::{Observation, Outcome};
 
 /// One side's build state, reduced from a drv's observations (or its absence).
 /// `Ord` (declaration order) only tie-breaks section order among pairs sharing
@@ -91,24 +91,22 @@ impl State {
 /// Reduce a side (its optional drv + meta-blocked bit + that drv's
 /// observations) to a state.
 ///
-/// Local observations are ground truth and win over everything; a local success
-/// beats a local failure (it *can* build). A direct failure outranks a
-/// dependency failure (it's the more specific fact about this drv). Being
-/// meta-blocked (`Skipped`) only shows when no build fact exists — a package
-/// built anyway (`--no-skip`) reports its real outcome.
+/// A success beats a failure (it *can* build — `flaky_success_wins`; a cache
+/// hit is recorded as the same `Built` fact, DESIGN §7). A direct failure
+/// outranks a dependency failure (it's the more specific fact about this drv).
+/// Being meta-blocked (`Skipped`) only shows when no build fact exists — a
+/// package built anyway (`--no-skip`) reports its real outcome.
 pub fn side_state(drv: &Option<String>, skipped: bool, obs: &[Observation]) -> State {
     if drv.is_none() {
         return State::Absent;
     }
-    let has = |src: Source, out: Outcome| obs.iter().any(|o| o.source == src && o.outcome == out);
-    if has(Source::Local, Outcome::Built) {
+    let has = |out: Outcome| obs.iter().any(|o| o.outcome == out);
+    if has(Outcome::Built) {
         State::Built
-    } else if has(Source::Local, Outcome::Failed) {
+    } else if has(Outcome::Failed) {
         State::Failed
-    } else if has(Source::Local, Outcome::DepFailed) {
+    } else if has(Outcome::DepFailed) {
         State::Blocked
-    } else if has(Source::Cache, Outcome::Built) {
-        State::Built
     } else if skipped {
         State::Skipped
     } else {
@@ -255,12 +253,10 @@ pub fn render(
 mod tests {
     use super::*;
 
-    fn obs(source: Source, outcome: Outcome) -> Observation {
+    fn obs(outcome: Outcome) -> Observation {
         Observation {
             drv_path: "/nix/store/x.drv".into(),
-            source,
             outcome,
-            when: 0,
             blocker: Vec::new(),
         }
     }
@@ -274,38 +270,24 @@ mod tests {
         assert_eq!(side_state(&d, false, &[]), State::Unknown);
         // Direct vs transitive failures are distinguished.
         assert_eq!(
-            side_state(&d, false, &[obs(Source::Local, Outcome::Failed)]),
+            side_state(&d, false, &[obs(Outcome::Failed)]),
             State::Failed
         );
         assert_eq!(
-            side_state(&d, false, &[obs(Source::Local, Outcome::DepFailed)]),
+            side_state(&d, false, &[obs(Outcome::DepFailed)]),
             State::Blocked
         );
-        // Cache success reads as Built; a local build wins over it.
-        assert_eq!(
-            side_state(&d, false, &[obs(Source::Cache, Outcome::Built)]),
-            State::Built
-        );
-        let s = side_state(
-            &d,
-            false,
-            &[
-                obs(Source::Cache, Outcome::Built),
-                obs(Source::Local, Outcome::Failed),
-            ],
-        );
-        assert_eq!(s, State::Failed);
+        // A success ever recorded — a local build or a cache hit, which the log
+        // doesn't distinguish (§7) — wins over a failure: flakiness reads as
+        // "it can build".
+        assert_eq!(side_state(&d, false, &[obs(Outcome::Built)]), State::Built);
+        let s = side_state(&d, false, &[obs(Outcome::Built), obs(Outcome::Failed)]);
+        assert_eq!(s, State::Built);
         // Meta-blocked with no facts is Skipped; a real fact (a --no-skip
         // run's build or failure) outranks the marking. No drv is still Absent.
         assert_eq!(side_state(&d, true, &[]), State::Skipped);
-        assert_eq!(
-            side_state(&d, true, &[obs(Source::Local, Outcome::Built)]),
-            State::Built
-        );
-        assert_eq!(
-            side_state(&d, true, &[obs(Source::Local, Outcome::Failed)]),
-            State::Failed
-        );
+        assert_eq!(side_state(&d, true, &[obs(Outcome::Built)]), State::Built);
+        assert_eq!(side_state(&d, true, &[obs(Outcome::Failed)]), State::Failed);
         assert_eq!(side_state(&None, true, &[]), State::Absent);
     }
 

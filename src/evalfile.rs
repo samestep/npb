@@ -15,8 +15,9 @@
 //! one concat per changed row, so it costs nothing on the unchanged majority the
 //! merge skips. The format is strict — every drv is a `/nix/store` `.drv` or
 //! absent, matching the rest of npd (e.g. `cache::store_hash`) — with no fallback
-//! for other shapes: on a format change, delete `~/.cache/nix-npd` so old files
-//! are regenerated rather than mis-parsed as if they were stripped.
+//! for other shapes: a format change ships with a one-off cleanup of the old
+//! eval files (just the files — never the whole `~/.cache/nix-npd`, §1) so
+//! they're regenerated rather than mis-parsed as if they were stripped.
 //!
 //! The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller at the
 //! default level; higher levels and a two-file split bought little). The diff

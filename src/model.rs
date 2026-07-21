@@ -5,9 +5,8 @@
 //! stable identity of a build recipe. It survives failures (unlike an output
 //! path) and is shared across commits automatically.
 //!
-//! Nothing here performs I/O or reads the clock; timestamps are passed in. That
-//! keeps the model deterministic and trivially testable and lets the
-//! orchestration layer own all the impurity.
+//! Nothing here performs I/O. That keeps the model deterministic and trivially
+//! testable and lets the orchestration layer own all the impurity.
 
 /// A revision to evaluate, split into the two git identities it plays plus a
 /// display label (DESIGN.md §6).
@@ -97,19 +96,12 @@ pub struct TestJob {
     pub skipped: bool,
 }
 
-/// Where a build observation came from. Local builds and substituter presence
-/// are both observations in one append-only log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    /// We ran `nix build` on one of our machines.
-    Local,
-    /// narinfo presence on a substituter (success only).
-    Cache,
-}
-
 /// The result of a single build attempt/observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
+    /// The drv's outputs were observed valid: a local build succeeded, or a
+    /// substituter has them (a narinfo probe hit, DESIGN.md §7). The log
+    /// deliberately doesn't record which — a success is a success.
     Built,
     /// The derivation itself failed to build.
     Failed,
@@ -120,8 +112,8 @@ pub enum Outcome {
 /// One append-only fact about one derivation, keyed externally by `drv_path`.
 ///
 /// We never overwrite an observation; flakiness is simply multiple observations
-/// of the same `drv_path` with differing outcomes. `when` is unix seconds,
-/// passed in by the caller (the model never reads the clock).
+/// of the same `drv_path` with differing outcomes. Rows carry no timestamp —
+/// the log is append-only, so insertion order *is* the history.
 ///
 /// `blocker` holds the output paths whose store validity re-decides this fact
 /// (DESIGN.md §5), populated for the two failure outcomes: for a
@@ -131,14 +123,12 @@ pub enum Outcome {
 /// re-evaluation: a later run re-checks those paths offline — no `.drv`, no
 /// closure walk — and the moment they are valid (the culprit built/substituted,
 /// or the drv itself built out of band) the stale failure is overridden. Empty
-/// for a `Built`/`Cache` success, and for a failure whose paths weren't recorded
+/// for a `Built`, and for a failure whose paths weren't recorded
 /// (treated conservatively as still-failing).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     pub drv_path: String,
-    pub source: Source,
     pub outcome: Outcome,
-    pub when: i64,
     /// Paths whose validity re-decides this fact: a `DepFailed`'s culprit
     /// outputs, or a `Failed`'s own outputs; else empty.
     pub blocker: Vec<String>,
@@ -176,10 +166,10 @@ pub struct BuildPolicy {
 impl BuildPolicy {
     /// Decide whether to build `drv_path` given its observations.
     ///
-    /// `substitutable` means a successful output is available from a substituter
-    /// (Nix could fetch it without building) — a *success* signal that says
-    /// nothing about local reproducibility. `skipped` is the attr's
-    /// meta-blocked (broken/unsupported/insecure) bit from the eval.
+    /// `skipped` is the attr's meta-blocked (broken/unsupported/insecure) bit
+    /// from the eval. Substituter presence needs no input of its own: a cache
+    /// probe's hit is recorded as a plain `Built` observation (DESIGN.md §7),
+    /// so it decides here exactly like any other success.
     ///
     /// `dep_block_stale` distinguishes the two kinds of recorded failure
     /// (DESIGN.md §5). A **direct** failure (the drv's own build failed) is
@@ -193,33 +183,26 @@ impl BuildPolicy {
     pub fn decide(
         &self,
         observations: &[Observation],
-        substitutable: bool,
         skipped: bool,
         dep_block_stale: bool,
     ) -> Decision {
-        let local: Vec<&Observation> = observations
-            .iter()
-            .filter(|o| o.source == Source::Local)
-            .collect();
-        let local_built = local.iter().any(|o| o.outcome == Outcome::Built);
-        let direct_failed = local.iter().any(|o| o.outcome == Outcome::Failed);
-        let dep_failed = local.iter().any(|o| o.outcome == Outcome::DepFailed);
+        let built = observations.iter().any(|o| o.outcome == Outcome::Built);
+        let direct_failed = observations.iter().any(|o| o.outcome == Outcome::Failed);
+        let dep_failed = observations.iter().any(|o| o.outcome == Outcome::DepFailed);
 
         // Meta-blocked and not overridden: never attempt (checked before the
         // other knobs, so e.g. `--retry` alone still doesn't build it). A real
-        // fact recorded earlier (a prior `--no-skip` run) still counts.
+        // fact recorded earlier (a prior `--no-skip` run, or cache presence)
+        // still counts.
         if skipped && !self.no_skip {
-            return if local_built {
+            return if built {
                 Decision::SkipOk
             } else {
                 Decision::Skipped
             };
         }
         // A trusted success short-circuits.
-        if local_built {
-            return Decision::SkipOk;
-        }
-        if substitutable {
+        if built {
             return Decision::SkipOk;
         }
         // A known-failing derivation is not worth re-running unless asked. A
@@ -241,12 +224,10 @@ impl BuildPolicy {
 mod tests {
     use super::*;
 
-    fn obs(source: Source, outcome: Outcome) -> Observation {
+    fn obs(outcome: Outcome) -> Observation {
         Observation {
             drv_path: "/nix/store/x.drv".into(),
-            source,
             outcome,
-            when: 0,
             blocker: Vec::new(),
         }
     }
@@ -254,50 +235,41 @@ mod tests {
     #[test]
     fn never_observed_builds() {
         assert_eq!(
-            BuildPolicy::default().decide(&[], false, false, false),
+            BuildPolicy::default().decide(&[], false, false),
             Decision::Build
         );
     }
 
     #[test]
-    fn substitutable_skips() {
+    fn recorded_success_skips() {
+        // A Built fact — a local build or a recorded cache hit, which the log
+        // doesn't distinguish (DESIGN.md §7) — decides SkipOk.
+        let o = [obs(Outcome::Built)];
         assert_eq!(
-            BuildPolicy::default().decide(&[], true, false, false),
-            Decision::SkipOk
-        );
-    }
-
-    #[test]
-    fn local_success_skips() {
-        let o = [obs(Source::Local, Outcome::Built)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, false),
+            BuildPolicy::default().decide(&o, false, false),
             Decision::SkipOk
         );
     }
 
     #[test]
     fn only_failures_skip_unless_retry() {
-        let o = [obs(Source::Local, Outcome::Failed)];
+        let o = [obs(Outcome::Failed)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, false),
+            BuildPolicy::default().decide(&o, false, false),
             Decision::SkipFail
         );
         let p = BuildPolicy {
             retry: true,
             ..Default::default()
         };
-        assert_eq!(p.decide(&o, false, false, false), Decision::Build);
+        assert_eq!(p.decide(&o, false, false), Decision::Build);
     }
 
     #[test]
     fn flaky_success_wins() {
-        let o = [
-            obs(Source::Local, Outcome::Failed),
-            obs(Source::Local, Outcome::Built),
-        ];
+        let o = [obs(Outcome::Failed), obs(Outcome::Built)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, false),
+            BuildPolicy::default().decide(&o, false, false),
             Decision::SkipOk
         );
     }
@@ -307,13 +279,13 @@ mod tests {
         // A dependency block (DepFailed, no direct failure) is skipped while its
         // culprit still fails, but re-attempted the moment the block goes stale —
         // no --retry needed. This is the self-healing property (DESIGN.md §5).
-        let o = [obs(Source::Local, Outcome::DepFailed)];
+        let o = [obs(Outcome::DepFailed)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, false),
+            BuildPolicy::default().decide(&o, false, false),
             Decision::SkipFail
         );
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, true),
+            BuildPolicy::default().decide(&o, false, true),
             Decision::Build
         );
     }
@@ -323,58 +295,43 @@ mod tests {
         // A drv that failed *directly* is sticky regardless of dep staleness: a
         // stale sibling dep-block must not resurrect a real direct failure.
         // --retry is the only escape.
-        let o = [
-            obs(Source::Local, Outcome::Failed),
-            obs(Source::Local, Outcome::DepFailed),
-        ];
+        let o = [obs(Outcome::Failed), obs(Outcome::DepFailed)];
         assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, true),
+            BuildPolicy::default().decide(&o, false, true),
             Decision::SkipFail
         );
         let retry = BuildPolicy {
             retry: true,
             ..Default::default()
         };
-        assert_eq!(retry.decide(&o, false, false, true), Decision::Build);
-    }
-
-    #[test]
-    fn cache_success_does_not_count_as_local() {
-        // A recorded Cache success is not a local build; without substitutable we
-        // still build (the caller folds a prior Cache-built obs into substitutable).
-        let o = [obs(Source::Cache, Outcome::Built)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, false, false),
-            Decision::Build
-        );
+        assert_eq!(retry.decide(&o, false, true), Decision::Build);
     }
 
     #[test]
     fn skipped_stays_skipped_unless_no_skip() {
-        // Meta-blocked: never attempted by default — not even when
-        // substitutable, and not under --retry alone.
+        // Meta-blocked: never attempted by default, not even under --retry.
         let p = BuildPolicy::default();
-        assert_eq!(p.decide(&[], false, true, false), Decision::Skipped);
-        assert_eq!(p.decide(&[], true, true, false), Decision::Skipped);
+        assert_eq!(p.decide(&[], true, false), Decision::Skipped);
         let retry = BuildPolicy {
             retry: true,
             ..Default::default()
         };
         assert_eq!(
-            retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true, false),
+            retry.decide(&[obs(Outcome::Failed)], true, false),
             Decision::Skipped
         );
 
-        // A prior forced build's success is still a trusted fact.
-        let o = [obs(Source::Local, Outcome::Built)];
-        assert_eq!(p.decide(&o, false, true, false), Decision::SkipOk);
+        // A recorded success — a prior --no-skip run's build, or cache
+        // presence — is still a trusted fact and outranks the marking.
+        let o = [obs(Outcome::Built)];
+        assert_eq!(p.decide(&o, true, false), Decision::SkipOk);
 
         // --no-skip restores the normal policy.
         let ns = BuildPolicy {
             no_skip: true,
             ..Default::default()
         };
-        assert_eq!(ns.decide(&[], false, true, false), Decision::Build);
-        assert_eq!(ns.decide(&o, false, true, false), Decision::SkipOk);
+        assert_eq!(ns.decide(&[], true, false), Decision::Build);
+        assert_eq!(ns.decide(&o, true, false), Decision::SkipOk);
     }
 }

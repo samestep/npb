@@ -37,17 +37,20 @@ do **not** include links to Claude Code sessions (`Claude-Session:` lines or
 `claude.ai/code/…` URLs) — the whole history has been rewritten to this
 convention, so keep new commits consistent with it.
 
-## No backward compatibility, ever
+## No backward compatibility in the code, ever
 
-npd has exactly one user, no releases, and no deployments. Everything it stores
-(`~/.cache/nix-npd`) is a re-derivable cache. Therefore (DESIGN.md §1):
+npd has exactly one user, no releases, and no deployments. Therefore
+(DESIGN.md §1):
 
-- Never write migration code: no SQLite schema upgrades or `ALTER TABLE`/purge
-  steps for data an older version wrote, no readers or fallbacks for previous
-  file formats, no comments like "may linger on old databases".
-- Change formats in place. If existing cached data would become wrong to read,
-  invalidate instead of migrating: delete `~/.cache/nix-npd` (it is all
-  re-derivable) and let the next run regenerate it.
+- Never write migration code into npd: no SQLite schema upgrades or `ALTER
+  TABLE`/purge steps for data an older version wrote, no readers or fallbacks
+  for previous file formats, no comments like "may linger on old databases".
+- Change formats in place. If a change makes the existing `~/.cache/nix-npd`
+  wrong to read, migrate that store **in place, as part of making the change**
+  — a one-off script or SQL run once against the live database, never shipped
+  in the tree. Do **not** delete the store: its facts are re-derivable only by
+  re-running the builds and probes behind them, so the accumulated history
+  must be carried forward.
 - When removing a feature, remove all of it in the same change — enum variants,
   struct fields, table columns, parsing, tests, and doc references. Don't keep
   dead fields around because they might be useful later.

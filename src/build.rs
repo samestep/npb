@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::cache;
 use crate::live;
-use crate::model::{BuildPolicy, Decision, Observation, Outcome, Source};
+use crate::model::{BuildPolicy, Decision, Observation, Outcome};
 use crate::store::Store;
 
 /// One derivation to consider building. Produced from either an explicit eval
@@ -38,14 +38,6 @@ pub struct Target {
     /// Meta-blocked (broken/unsupported/insecure) — skipped by the default
     /// policy (`BuildPolicy::no_skip` overrides).
     pub skipped: bool,
-}
-
-/// Seconds since the Unix epoch, for an observation's `when` stamp.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before the Unix epoch")
-        .as_secs() as i64
 }
 
 /// nix internal-json log event (only the fields we use).
@@ -288,11 +280,7 @@ fn stale_dep_blocks(
         if let Some(blocker) = obs
             .iter()
             .rev()
-            .find(|o| {
-                o.source == Source::Local
-                    && o.outcome == Outcome::DepFailed
-                    && !o.blocker.is_empty()
-            })
+            .find(|o| o.outcome == Outcome::DepFailed && !o.blocker.is_empty())
             .map(|o| o.blocker.clone())
         {
             all_paths.extend(blocker.iter().cloned());
@@ -346,24 +334,16 @@ fn recheck_direct_failures(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         // A recorded success already decides it; don't second-guess the log.
-        if obs
-            .iter()
-            .any(|o| o.source == Source::Local && o.outcome == Outcome::Built)
-        {
+        if obs.iter().any(|o| o.outcome == Outcome::Built) {
             continue;
         }
-        if !obs
-            .iter()
-            .any(|o| o.source == Source::Local && o.outcome == Outcome::Failed)
-        {
+        if !obs.iter().any(|o| o.outcome == Outcome::Failed) {
             continue;
         }
         let recorded = obs
             .iter()
             .rev()
-            .find(|o| {
-                o.source == Source::Local && o.outcome == Outcome::Failed && !o.blocker.is_empty()
-            })
+            .find(|o| o.outcome == Outcome::Failed && !o.blocker.is_empty())
             .map(|o| o.blocker.clone());
         let (outs, from_record) = match recorded {
             Some(b) => (b, true),
@@ -471,11 +451,8 @@ fn drvs_to_materialize_at(
             .get(&t.drv_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let substitutable = obs
-            .iter()
-            .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
         let dep_stale = stale.get(&t.drv_path).copied().unwrap_or(false);
-        let decision = policy.decide(obs, substitutable, t.skipped, dep_stale);
+        let decision = policy.decide(obs, t.skipped, dep_stale);
         if decision == Decision::Build {
             need.insert(t.drv_path.clone());
         } else if decision == Decision::SkipFail && needs_selfheal_instantiate(obs) {
@@ -498,39 +475,29 @@ fn drvs_to_materialize_at(
 /// self-heals via [`stale_dep_blocks`]) and a direct failure that already
 /// recorded its outputs (checked offline, no `.drv` needed).
 fn needs_selfheal_instantiate(obs: &[Observation]) -> bool {
-    let direct_failed = obs
+    let direct_failed = obs.iter().any(|o| o.outcome == Outcome::Failed);
+    let has_recorded_outputs = obs
         .iter()
-        .any(|o| o.source == Source::Local && o.outcome == Outcome::Failed);
-    let has_recorded_outputs = obs.iter().any(|o| {
-        o.source == Source::Local && o.outcome == Outcome::Failed && !o.blocker.is_empty()
-    });
+        .any(|o| o.outcome == Outcome::Failed && !o.blocker.is_empty());
     direct_failed && !has_recorded_outputs
 }
 
 /// [`build_targets`] against an explicit observation DB (separable for tests).
 /// Probe the substituter for every target the log knows nothing about and
-/// record a `Cache`/`Built` observation per hit — the fact-gathering half of
-/// the decision phase.
+/// record a `Built` observation per hit (DESIGN §7) — the fact-gathering half
+/// of the decision phase.
 ///
 /// We only probe drvs with *no fact*: a probe can only change the decision
-/// there. A drv with any local observation is already decided (built → skip;
-/// failed/blocked → skip-fail, since a local failure outranks cache presence
-/// anyway), and a recorded cache hit is decided too. This is what keeps a
-/// re-run of an unchanged report near-instant: we don't re-probe (HTTP +
-/// `nix-store`) the failures every time. Probes run concurrently
+/// there. A drv with any observation is already decided (a success — its own
+/// build or a prior probe's hit — → skip; failed/blocked → skip-fail). This is
+/// what keeps a re-run of an unchanged report near-instant: we don't re-probe
+/// (HTTP + `nix-store`) the failures every time. Probes run concurrently
 /// (`cache::in_cache_many`). Idempotent: recorded facts make the next call a
 /// no-op.
 fn probe_candidates(store: &Store, targets: &[Target], policy: BuildPolicy) -> Result<Vec<String>> {
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
-    let has_fact = |drv: &str| {
-        obs_by_drv.get(drv).is_some_and(|obs| {
-            obs.iter().any(|o| {
-                o.source == Source::Local
-                    || (o.source == Source::Cache && o.outcome == Outcome::Built)
-            })
-        })
-    };
+    let has_fact = |drv: &str| obs_by_drv.get(drv).is_some_and(|obs| !obs.is_empty());
     // A target the policy will skip anyway isn't worth an HTTP probe.
     let will_skip = |t: &Target| t.skipped && !policy.no_skip;
     let mut to_probe: Vec<String> = Vec::new();
@@ -543,20 +510,18 @@ fn probe_candidates(store: &Store, targets: &[Target], policy: BuildPolicy) -> R
     Ok(to_probe)
 }
 
-/// Record a `Cache`/`Built` observation for each probed drv that was a hit.
+/// Record a `Built` observation for each probed drv that was a hit — cache
+/// presence and a local build are the same success fact (DESIGN §7).
 fn record_hits(
     store: &mut Store,
     to_probe: &[String],
     probed: &HashMap<String, bool>,
 ) -> Result<()> {
-    let now = unix_now();
     for drv in to_probe {
         if probed.get(drv).copied().unwrap_or(false) {
             store.add_observation(&Observation {
                 drv_path: drv.clone(),
-                source: Source::Cache,
                 outcome: Outcome::Built,
-                when: now,
                 blocker: Vec::new(),
             })?;
         }
@@ -662,13 +627,10 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         record_outputs,
     } = recheck_direct_failures(targets, &obs_by_drv)?;
     if !healed.is_empty() || !record_outputs.is_empty() {
-        let now = unix_now();
         for drv in &healed {
             let ob = Observation {
                 drv_path: drv.clone(),
-                source: Source::Local,
                 outcome: Outcome::Built,
-                when: now,
                 blocker: Vec::new(),
             };
             store.add_observation(&ob)?;
@@ -677,22 +639,13 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         for (drv, outs) in record_outputs {
             store.add_observation(&Observation {
                 drv_path: drv,
-                source: Source::Local,
                 outcome: Outcome::Failed,
-                when: now,
                 blocker: outs,
             })?;
         }
     }
 
     let obs_of = |drv: &str| obs_by_drv.get(drv).map(Vec::as_slice).unwrap_or(&[]);
-
-    let cache_built = |drv: &str| {
-        obs_of(drv)
-            .iter()
-            .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built)
-    };
-    let substitutable = |drv: &str| cache_built(drv);
 
     // Pass 1: decide per target, purely from the (just-refreshed) log, plus the
     // one store-backed input the pure predicate can't compute — whether a
@@ -704,12 +657,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
-        let decision = policy.decide(
-            observations,
-            substitutable(&t.drv_path),
-            t.skipped,
-            dep_stale(&t.drv_path),
-        );
+        let decision = policy.decide(observations, t.skipped, dep_stale(&t.drv_path));
         if decision == Decision::Build {
             to_build.push(i);
         }
@@ -744,7 +692,6 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .collect();
         let verified = verify_failing(&reachable)?;
         if !verified.is_empty() {
-            let now = unix_now();
             let mut still_build = Vec::new();
             let mut blocked_seen: HashSet<&str> = HashSet::new();
             for &i in &to_build {
@@ -765,9 +712,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                         if blocked_seen.insert(drv) {
                             store.add_observation(&Observation {
                                 drv_path: drv.to_string(),
-                                source: Source::Local,
                                 outcome: Outcome::DepFailed,
-                                when: now,
                                 blocker,
                             })?;
                         }
@@ -815,9 +760,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 };
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
-                    source: Source::Local,
                     outcome,
-                    when: unix_now(),
                     blocker,
                 })?;
                 recorded.insert(drv.to_string(), outcome);
@@ -833,9 +776,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 // band self-heals just like a requested target (DESIGN §5).
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
-                    source: Source::Local,
                     outcome: Outcome::Failed,
-                    when: unix_now(),
                     blocker: cache::drv_outputs(drv).unwrap_or_default(),
                 })?;
             }
@@ -870,14 +811,11 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             } else {
                 store.failing_drvs()?
             };
-            let now = unix_now();
             for &drv in &leftover {
                 if built_map.get(drv).copied().unwrap_or(false) {
                     store.add_observation(&Observation {
                         drv_path: drv.to_string(),
-                        source: Source::Local,
                         outcome: Outcome::Built,
-                        when: now,
                         blocker: Vec::new(),
                     })?;
                     continue;
@@ -895,9 +833,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 if let Some(blocker) = verify_failing(&reachable)?.into_values().next() {
                     store.add_observation(&Observation {
                         drv_path: drv.to_string(),
-                        source: Source::Local,
                         outcome: Outcome::DepFailed,
-                        when: now,
                         blocker,
                     })?;
                 }
@@ -921,24 +857,20 @@ mod tests {
         }
     }
 
-    fn planted(drv: &str, source: Source, outcome: Outcome) -> Observation {
+    fn planted(drv: &str, outcome: Outcome) -> Observation {
         Observation {
             drv_path: drv.into(),
-            source,
             outcome,
-            when: 1,
             blocker: Vec::new(),
         }
     }
 
     /// Like `planted`, but for a `DepFailed` whose culprit outputs are recorded —
     /// used to exercise the offline staleness re-check (`stale_dep_blocks`).
-    fn planted_block(drv: &str, when: i64, blocker: &[&str]) -> Observation {
+    fn planted_block(drv: &str, blocker: &[&str]) -> Observation {
         Observation {
             drv_path: drv.into(),
-            source: Source::Local,
             outcome: Outcome::DepFailed,
-            when,
             blocker: blocker.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -952,34 +884,21 @@ mod tests {
         let db = dir.path().join("npd.sqlite");
         {
             let mut s = Store::open(&db).unwrap();
-            // Built locally and substitutable: decided as successes.
-            s.add_observation(&planted(
-                "/nix/store/built.drv",
-                Source::Local,
-                Outcome::Built,
-            ))
-            .unwrap();
-            s.add_observation(&planted(
-                "/nix/store/cached.drv",
-                Source::Cache,
-                Outcome::Built,
-            ))
-            .unwrap();
+            // Built locally, and a recorded cache hit (the same plain `Built`
+            // fact, §7): decided as successes.
+            s.add_observation(&planted("/nix/store/built.drv", Outcome::Built))
+                .unwrap();
+            s.add_observation(&planted("/nix/store/cached.drv", Outcome::Built))
+                .unwrap();
             // A direct failure with NO recorded outputs: can't be self-heal-checked
             // offline, so it must be materialized to resolve them (§5).
-            s.add_observation(&planted(
-                "/nix/store/failed.drv",
-                Source::Local,
-                Outcome::Failed,
-            ))
-            .unwrap();
+            s.add_observation(&planted("/nix/store/failed.drv", Outcome::Failed))
+                .unwrap();
             // A direct failure that DID record its outputs: re-checked offline,
             // needs no `.drv`.
             s.add_observation(&Observation {
                 drv_path: "/nix/store/failed-recorded.drv".into(),
-                source: Source::Local,
                 outcome: Outcome::Failed,
-                when: 1,
                 blocker: vec!["/nix/store/out-of-failed-recorded".into()],
             })
             .unwrap();
@@ -1138,10 +1057,6 @@ mod tests {
         assert_eq!(obs_of(&slow).outcome, Outcome::Built);
         assert_eq!(obs_of(&blocked).outcome, Outcome::DepFailed);
 
-        // The incrementally-recorded fact is a genuine local build observation.
-        let fail_obs = obs_of(&fail);
-        assert_eq!(fail_obs.source, Source::Local);
-
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1184,7 +1099,6 @@ mod tests {
         // — keyed on its own drvpath, from the incremental (dep-branch) record.
         let dep_obs = s.load_observations(&dep).unwrap();
         assert_eq!(dep_obs.len(), 1, "the failing dependency is recorded once");
-        assert_eq!(dep_obs[0].source, Source::Local);
         assert_eq!(dep_obs[0].outcome, Outcome::Failed);
         // The requested target is blocked by that dependency.
         let top_obs = s.load_observations(&top).unwrap();
@@ -1229,9 +1143,7 @@ mod tests {
             let mut s = Store::open(&db).unwrap();
             s.add_observation(&Observation {
                 drv_path: dep.clone(),
-                source: Source::Local,
                 outcome: Outcome::Failed,
-                when: 1,
                 blocker: Vec::new(),
             })
             .unwrap();
@@ -1287,9 +1199,7 @@ mod tests {
 
         let failed = |drv: &str, blocker: Vec<String>| Observation {
             drv_path: drv.into(),
-            source: Source::Local,
             outcome: Outcome::Failed,
-            when: 1,
             blocker,
         };
         let mut obs: HashMap<String, Vec<Observation>> = HashMap::new();
@@ -1307,7 +1217,7 @@ mod tests {
             "/d.drv".into(),
             vec![
                 failed("/d.drv", vec![valid.clone()]),
-                planted("/d.drv", Source::Local, Outcome::Built),
+                planted("/d.drv", Outcome::Built),
             ],
         );
 
@@ -1384,11 +1294,9 @@ mod tests {
         // blocked by it — tagged with `dep`'s (now-valid) outputs.
         {
             let mut s = Store::open(&db).unwrap();
-            s.add_observation(&planted(&dep, Source::Local, Outcome::Failed))
-                .unwrap();
+            s.add_observation(&planted(&dep, Outcome::Failed)).unwrap();
             let blocker: Vec<&str> = dep_outs.iter().map(String::as_str).collect();
-            s.add_observation(&planted_block(&top, 2, &blocker))
-                .unwrap();
+            s.add_observation(&planted_block(&top, &blocker)).unwrap();
         }
 
         let targets = [Target {

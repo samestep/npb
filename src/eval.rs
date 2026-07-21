@@ -29,7 +29,9 @@ use crate::model::{AttrEval, Rev, TestJob};
 /// The one nixpkgs config every eval runs under. npd owns the config
 /// (DESIGN.md §6), which is what makes the eval cache key just
 /// `(tree, system)` — changing this line changes the attr→drv map, so cached
-/// evals must be discarded (delete `~/.cache/nix-npd`). The allow-flags are
+/// evals must be discarded (a one-off cleanup of the eval files and `--tests`
+/// rows, not the whole `~/.cache/nix-npd` — the observation log keys on
+/// drvpaths and stays valid, §1). The allow-flags are
 /// on so meta-blocked packages still yield a drv + meta rather than throwing —
 /// we want their drvpath and the option to build them anyway.
 const EVAL_CONFIG: &str = "{ allowBroken = true; allowUnfree = true; \
