@@ -139,7 +139,7 @@ This starts a shell within your shell which has `npd` available on the `PATH`.
 
 ### `-h`, `--help`
 
-To list available CLi arguments:
+To list available CLI arguments:
 
 ```sh
 npd --help
@@ -213,7 +213,7 @@ Note that the path must include a forward-slash.
 
 ### `-V`, `--version`
 
-Print the version:
+To print the version:
 
 ```sh
 npd --version
