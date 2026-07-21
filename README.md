@@ -182,6 +182,22 @@ Note that this is an exception to `npd`'s usual rule that a re-run should be ful
 
 ### `--patch`
 
+To apply a diff on top of the `--head`, provide a path to a patch file. For instance, one trick that `npd` sometimes uses to provide reproducible commands is `--patch /dev/stdin` with a [heredoc](https://en.wikipedia.org/wiki/Here_document):
+
+```sh
+npd --patch /dev/stdin <<'PATCH'
+--- a/pkgs/by-name/he/hello/package.nix
++++ b/pkgs/by-name/he/hello/package.nix
+@@ -66,3 +66,3 @@ stdenv.mkDerivation (finalAttrs: {
+     mainProgram = "hello";
+-    platforms = lib.platforms.all;
++    platforms = [ ]; # bye bye
+     identifiers.cpeParts.vendor = "gnu";
+PATCH
+```
+
+Note that the path must include a forward-slash.
+
 ### `--no-merge`
 
 ### `--no-tests`
