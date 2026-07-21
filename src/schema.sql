@@ -1,6 +1,7 @@
 -- The SQLite fact store's schema, embedded into `store.rs` via `include_str!`
--- (kept in its own file for SQL syntax highlighting). See `store.rs` for the
--- `source`/`outcome` integer enum-code mappings, which are Rust, not DDL.
+-- (kept in its own file for SQL syntax highlighting). The `source`/`outcome`
+-- integer enum-code mappings live in `store.rs` (Rust, not DDL) — the values
+-- quoted in comments here are informative copies of that source of truth.
 --
 -- No migrations, ever (CLAUDE.md): change this schema freely and in place. The
 -- whole store is a re-derivable cache, so the remedy for an incompatible
@@ -11,8 +12,10 @@
 -- constant `/nix/store/` prefix and `.drv` suffix (`evalfile::strip_drv`), and
 -- `blocker`'s output paths of their `/nix/store/` prefix (`strip_out` — an
 -- output path has no `.drv`); both restored on read. `source` and `outcome` are
--- small integer enum codes (`source_code`/`outcome_code`), not their English
--- labels. This is the one append-only, never-evicted table, so trimming its
+-- small integer enum codes (`source_code`/`outcome_code` in `store.rs`), not
+-- their English labels: `source` 0 = local build, 1 = cache (narinfo) probe;
+-- `outcome` 0 = built, 1 = failed, 2 = dep-failed.
+-- This is the one append-only, never-evicted table, so trimming its
 -- per-row bytes is what compounds over time.
 CREATE TABLE IF NOT EXISTS observation (
     id         INTEGER PRIMARY KEY,
@@ -52,9 +55,10 @@ CREATE TABLE IF NOT EXISTS eval_key (
 -- Drv paths are stored *stripped* of their constant `/nix/store/` prefix and
 -- `.drv` suffix, exactly like the eval files (`evalfile::strip_drv`) — restored
 -- on read.
--- `skipped` is the test's own meta-blocked bit (a test can be unsupported on this
--- system even when its package builds — an x86-only NixOS test on aarch64), so
--- it's stored per test, not inferred from the package.
+-- `skipped` is the test's own meta-blocked bit — 0 = buildable, 1 = meta-skipped
+-- (a Rust bool in `TestJob::skipped`; a test can be unsupported on this system
+-- even when its package builds — an x86-only NixOS test on aarch64) — so it's
+-- stored per test, not inferred from the package.
 CREATE TABLE IF NOT EXISTS test_pkg (
     key_id   INTEGER NOT NULL REFERENCES eval_key (id),
     pkg_attr TEXT NOT NULL,
