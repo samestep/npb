@@ -205,11 +205,35 @@ npd --patch HEAD...974b2de7dc8f59ba4ac9729c452834641f82849f
 
 ### `--no-merge`
 
+By default, `npd` merges the `--base` and the `--head` together, then evaluates `--base` versus that merged result. To instead take the merge-base of `--base` and `--head`, and evaluate that versus `--head`:
+
+```sh
+npd --no-merge
+```
+
 ### `--no-tests`
+
+By default, `npd` includes all `passthru.tests` for packages that changed between the two commits. To not include those tests:
+
+```sh
+npd --no-tests
+```
 
 ### `--no-skip`
 
+By default, `npd` skips packages that are marked as `unsupported`, `broken`, or `insecure`. To try to build those packages anyway:
+
+```sh
+npd --no-skip
+```
+
 ### `--retry`
+
+By default, `npd` caches failures and does not try to rebuild derivations that it has seen fail before. To retry failed builds anyway:
+
+```sh
+npd --retry
+```
 
 ### `-s`, `--system`
 
