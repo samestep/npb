@@ -167,7 +167,7 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     // Sections carry their own separator *before* them (a leading blank line),
     // so the gaps fall between sections and none trails the last one.
     let mut s = format!(
-        "\n<details><summary>{} → {} · <b>{attrs_total} package{plural}</b>{note}</summary>\n\n",
+        "\n<details><summary>{} → {} · {attrs_total} package{plural}{note}</summary>\n\n",
         base.glyph(),
         head.glyph(),
     );
@@ -454,16 +454,13 @@ mod tests {
 
         // Composable glyph tokens with a plain package count; the transitive
         // distinction shows through 🚫.
-        assert!(out.contains("✅ → ❌ · <b>1 package</b>"), "{out}");
-        assert!(out.contains("✅ → 🚫 · <b>2 packages</b>"), "{out}");
-        assert!(out.contains("✅ → ⏩ · <b>1 package</b>"), "{out}");
+        assert!(out.contains("✅ → ❌ · 1 package"), "{out}");
+        assert!(out.contains("✅ → 🚫 · 2 packages"), "{out}");
+        assert!(out.contains("✅ → ⏩ · 1 package"), "{out}");
         // Grouping: shared drv collapses to one equals-joined line, shortest first.
         assert!(out.contains("- `foo` = `z.foo`"), "{out}");
         // Two attrs, one derivation: the total counts, the distinct count notes.
-        assert!(
-            out.contains("✅ → ✅ · <b>2 packages</b> (1 unique)"),
-            "{out}"
-        );
+        assert!(out.contains("✅ → ✅ · 2 packages (1 unique)"), "{out}");
         // All sections are folded closed.
         assert!(out.contains("<details><summary>✅ → ❌"), "{out}");
         assert!(out.contains("<details><summary>✅ → ✅"), "{out}");

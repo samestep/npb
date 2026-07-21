@@ -35,12 +35,12 @@ That command may not give you the same result if you run it yourself, but `npd`'
 >
 > ### `x86_64-linux`
 >
-> <details><summary>✅ → ❌ · <b>1 package</b></summary>
+> <details><summary>✅ → ❌ · 1 package</summary>
 >
 > - `coqPackages.graph-theory`
 > </details>
 >
-> <details><summary>✅ → 🚫 · <b>8 packages</b> (5 unique)</summary>
+> <details><summary>✅ → 🚫 · 8 packages (5 unique)</summary>
 >
 > - `coqPackages.mathcomp-analysis-stdlib` = `rocqPackages.mathcomp-analysis-stdlib`
 > - `coqPackages.mathcomp-analysis` = `rocqPackages.mathcomp-analysis`
@@ -49,12 +49,12 @@ That command may not give you the same result if you run it yourself, but `npd`'
 > - `coqPackages.ssprove`
 > </details>
 >
-> <details><summary>✅ → ➖ · <b>1 package</b></summary>
+> <details><summary>✅ → ➖ · 1 package</summary>
 >
 > - `rocqPackages.mathcomp-real-closed`
 > </details>
 >
-> <details><summary>✅ → ✅ · <b>17 packages</b> (13 unique)</summary>
+> <details><summary>✅ → ✅ · 17 packages (13 unique)</summary>
 >
 > - `coqPackages.coqeal`
 > - `coqPackages.fourcolor`
