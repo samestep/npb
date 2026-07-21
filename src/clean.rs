@@ -34,10 +34,11 @@ pub enum CleanSpec {
 }
 
 impl CleanSpec {
-    /// Parse a `--clean` argument: a size budget (`4GiB`, `500MB`, `1048576`), an
-    /// absolute date (`2026-07-15`, UTC midnight), or a duration-ago (`2mo`,
-    /// `1yr`, `30d`). The three are disjoint — only a date carries `-`, only a
-    /// size ends in `B` (or is bare digits), only a duration ends in a time unit.
+    /// Parse a `--clean` argument: a size budget (`4GiB`, `500MB`), an absolute
+    /// date (`2026-07-15`, UTC midnight), or a duration-ago (`2mo`, `1yr`, `30d`).
+    /// A non-date value is *an integer with a suffix* — no bare number, no
+    /// fraction. The three shapes are disjoint — only a date carries `-`, only a
+    /// size suffix ends in `B`, only a duration suffix is a time unit.
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         if let Some(secs) = parse_date(s) {
@@ -57,46 +58,54 @@ impl CleanSpec {
     }
 }
 
-/// Split a `<number><unit>` string into its numeric prefix and alphabetic unit.
-/// Returns `None` if the number doesn't parse.
-fn split_num_unit(s: &str) -> Option<(f64, &str)> {
-    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
-    let (num, unit) = s.split_at(split);
-    Some((num.trim().parse().ok()?, unit))
+/// Split an `<integer><unit>` string into its integer prefix and unit suffix.
+/// Returns `None` unless it is exactly that: a run of digits (the value is *an
+/// integer with a suffix* — no fraction, no sign) followed by a **non-empty**
+/// unit (no bare number). The unit's spelling is validated by the caller.
+fn split_num_unit(s: &str) -> Option<(u64, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(end);
+    if unit.is_empty() {
+        return None; // a suffix is required
+    }
+    Some((num.parse().ok()?, unit))
 }
 
-/// A byte count: `4GiB`, `500MB`, `1.5GB`, or bare digits (bytes). Decimal units
-/// are powers of 1000, `i`-units powers of 1024.
+/// A byte count: `4GiB`, `500MB`, `100B`. Decimal units are powers of 1000,
+/// `i`-units powers of 1024. `None` on overflow or an unrecognized unit.
 fn parse_size(s: &str) -> Option<u64> {
     let (num, unit) = split_num_unit(s)?;
-    let mult: f64 = match unit {
-        "" | "B" => 1.0,
-        "KB" => 1e3,
-        "MB" => 1e6,
-        "GB" => 1e9,
-        "TB" => 1e12,
-        "KiB" => 1024.0,
-        "MiB" => 1024f64.powi(2),
-        "GiB" => 1024f64.powi(3),
-        "TiB" => 1024f64.powi(4),
+    let mult: u64 = match unit {
+        "B" => 1,
+        "kB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        "TiB" => 1 << 40,
         _ => return None,
     };
-    (num >= 0.0).then_some((num * mult) as u64)
+    num.checked_mul(mult)
 }
 
-/// A duration in seconds: `30d`, `2mo`, `1yr`. Months are 30 days, years 365
-/// (a cache cutoff needs no calendar precision).
+/// A duration in seconds: `30s`, `10min`, `2mo`, `1yr`. Months are 30 days,
+/// years 365 (a cache cutoff needs no calendar precision). `None` on overflow or
+/// an unrecognized unit.
 fn parse_duration_secs(s: &str) -> Option<u64> {
     let (num, unit) = split_num_unit(s)?;
-    let mult: f64 = match unit {
-        "h" => 3600.0,
-        "d" => 86_400.0,
-        "w" => 604_800.0,
-        "mo" => 2_592_000.0,        // 30 days
-        "y" | "yr" => 31_536_000.0, // 365 days
+    let mult: u64 = match unit {
+        "s" | "sec" => 1,
+        "m" | "min" => 60,
+        "h" | "hr" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        "mo" => 2_592_000,        // 30 days
+        "y" | "yr" => 31_536_000, // 365 days
         _ => return None,
     };
-    (num >= 0.0).then_some((num * mult) as u64)
+    num.checked_mul(mult)
 }
 
 /// A `YYYY-MM-DD` date as its UTC-midnight Unix time (seconds), or `None` if it
@@ -318,21 +327,32 @@ mod tests {
 
     #[test]
     fn parses_sizes() {
-        assert_eq!(parse_size("1024"), Some(1024)); // bare = bytes
+        assert_eq!(parse_size("100B"), Some(100));
+        assert_eq!(parse_size("1kB"), Some(1_000));
         assert_eq!(parse_size("500MB"), Some(500_000_000));
         assert_eq!(parse_size("4GiB"), Some(4 * 1024 * 1024 * 1024));
-        assert_eq!(parse_size("1.5GB"), Some(1_500_000_000));
+        assert_eq!(parse_size("2TiB"), Some(2 * (1u64 << 40)));
+        assert_eq!(parse_size("1024"), None); // bare digits: a suffix is required
+        assert_eq!(parse_size("1.5GB"), None); // an integer, no fraction
         assert_eq!(parse_size("2mo"), None); // a duration, not a size
         assert_eq!(parse_size("2026-07-15"), None); // a date
     }
 
     #[test]
     fn parses_durations() {
+        assert_eq!(parse_duration_secs("30s"), Some(30));
+        assert_eq!(parse_duration_secs("45sec"), Some(45));
+        assert_eq!(parse_duration_secs("10m"), Some(600));
+        assert_eq!(parse_duration_secs("10min"), Some(600));
+        assert_eq!(parse_duration_secs("2h"), Some(7_200));
+        assert_eq!(parse_duration_secs("2hr"), Some(7_200));
         assert_eq!(parse_duration_secs("30d"), Some(30 * 86_400));
+        assert_eq!(parse_duration_secs("1w"), Some(604_800));
         assert_eq!(parse_duration_secs("2mo"), Some(2 * 2_592_000));
         assert_eq!(parse_duration_secs("1yr"), Some(31_536_000));
         assert_eq!(parse_duration_secs("1y"), Some(31_536_000));
         assert_eq!(parse_duration_secs("500MB"), None);
+        assert_eq!(parse_duration_secs("1.5h"), None); // an integer, no fraction
     }
 
     #[test]
@@ -360,6 +380,8 @@ mod tests {
             CleanSpec::Before(_)
         ));
         assert!(CleanSpec::parse("garbage").is_err());
+        assert!(CleanSpec::parse("1024").is_err()); // bare integer: needs a suffix
+        assert!(CleanSpec::parse("1.5GB").is_err()); // a fraction is not an integer
     }
 
     /// Build an `Eval` with just the fields `victims` reads.
