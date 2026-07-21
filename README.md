@@ -213,6 +213,12 @@ npd --patch HEAD...974b2de7dc8f59ba4ac9729c452834641f82849f
 
 ### `-s`, `--system`
 
+By default, `npd` only evaluates for the system of the machine it is running on. To override that and instead build for one or more other systems:
+
+```sh
+npd -s x86_64-linux -s aarch64-linux -s aarch64-darwin
+```
+
 ### `--clean`
 
 ### `-V`, `--version`
