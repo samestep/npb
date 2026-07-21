@@ -123,21 +123,24 @@ pub enum Outcome {
 /// of the same `drv_path` with differing outcomes. `when` is unix seconds,
 /// passed in by the caller (the model never reads the clock).
 ///
-/// `blocker` is populated only for a [`Outcome::DepFailed`]: it is the output
-/// paths of the *specific* still-failing dependency that blocked this drv (the
-/// "culprit", DESIGN.md §5). It is what makes a dependency-block *self-healing*
-/// without re-evaluation: a later run re-checks those paths' store validity
-/// offline — no `.drv`, no closure walk — and re-attempts the dependent the
-/// moment the culprit has built or been substituted. Empty for every other
-/// outcome (and for a `DepFailed` whose culprit wasn't recorded, which is then
-/// treated conservatively as still-blocking).
+/// `blocker` holds the output paths whose store validity re-decides this fact
+/// (DESIGN.md §5), populated for the two failure outcomes: for a
+/// [`Outcome::DepFailed`] it is the *specific* still-failing dependency that
+/// blocked this drv (the "culprit"); for an [`Outcome::Failed`] it is the drv's
+/// *own* outputs. Either way it makes the failure *self-healing* without
+/// re-evaluation: a later run re-checks those paths offline — no `.drv`, no
+/// closure walk — and the moment they are valid (the culprit built/substituted,
+/// or the drv itself built out of band) the stale failure is overridden. Empty
+/// for a `Built`/`Cache` success, and for a failure whose paths weren't recorded
+/// (treated conservatively as still-failing).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     pub drv_path: String,
     pub source: Source,
     pub outcome: Outcome,
     pub when: i64,
-    /// Output paths of the culprit dependency for a `DepFailed`; else empty.
+    /// Paths whose validity re-decides this fact: a `DepFailed`'s culprit
+    /// outputs, or a `Failed`'s own outputs; else empty.
     pub blocker: Vec<String>,
 }
 

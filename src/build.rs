@@ -312,6 +312,94 @@ fn stale_dep_blocks(
         .collect())
 }
 
+/// What re-checking direct failures against the store turned up (DESIGN §5),
+/// both keyed on drvpath.
+struct FailureRecheck {
+    /// Failures whose outputs are now all valid — record a `Built`, so `decide`
+    /// → `SkipOk` and the report shows a success.
+    heal: HashSet<String>,
+    /// Still-invalid failures whose outputs were freshly resolved from a `.drv`
+    /// (they had none recorded): the resolved outputs, to record so the next run
+    /// re-checks them offline rather than materializing again (self-limiting).
+    record_outputs: Vec<(String, Vec<String>)>,
+}
+
+/// The direct-failure analogue of [`stale_dep_blocks`] (DESIGN §5): re-check
+/// every direct failure's outputs against the store, so one that built out of
+/// band since (a plain `nix build`, an unrelated realisation) heals instead of
+/// staying sticky. Each failure's outputs come from its recorded `blocker`
+/// (offline, no `.drv`) or — for one [`drvs_to_materialize`] pulled in because
+/// it had none recorded — its now-present `.drv` via [`cache::drv_outputs`]. A
+/// target with a recorded `Built` is already decided; a failure whose outputs
+/// can't be resolved at all (no `blocker`, `.drv` absent) stays sticky,
+/// overridden only by `--retry` or a later `Built`.
+fn recheck_direct_failures(
+    targets: &[Target],
+    obs_by_drv: &HashMap<String, Vec<Observation>>,
+) -> Result<FailureRecheck> {
+    // (drvpath, outputs, from_record): whether the outputs came from the log.
+    let mut items: Vec<(String, Vec<String>, bool)> = Vec::new();
+    let mut all_paths: Vec<String> = Vec::new();
+    for t in targets {
+        let obs = obs_by_drv
+            .get(&t.drv_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        // A recorded success already decides it; don't second-guess the log.
+        if obs
+            .iter()
+            .any(|o| o.source == Source::Local && o.outcome == Outcome::Built)
+        {
+            continue;
+        }
+        if !obs
+            .iter()
+            .any(|o| o.source == Source::Local && o.outcome == Outcome::Failed)
+        {
+            continue;
+        }
+        let recorded = obs
+            .iter()
+            .rev()
+            .find(|o| {
+                o.source == Source::Local && o.outcome == Outcome::Failed && !o.blocker.is_empty()
+            })
+            .map(|o| o.blocker.clone());
+        let (outs, from_record) = match recorded {
+            Some(b) => (b, true),
+            // No recorded outputs: resolve from the `.drv` `drvs_to_materialize`
+            // instantiated for exactly this. If it's absent anyway (never
+            // materialized, GC'd), `drv_outputs` yields none and we leave it sticky.
+            None => (cache::drv_outputs(&t.drv_path).unwrap_or_default(), false),
+        };
+        if outs.is_empty() {
+            continue;
+        }
+        all_paths.extend(outs.iter().cloned());
+        items.push((t.drv_path.clone(), outs, from_record));
+    }
+    if all_paths.is_empty() {
+        return Ok(FailureRecheck {
+            heal: HashSet::new(),
+            record_outputs: Vec::new(),
+        });
+    }
+    let invalid = invalid_paths(&all_paths)?;
+    let mut heal = HashSet::new();
+    let mut record_outputs = Vec::new();
+    for (drv, outs, from_record) in items {
+        if outs.iter().all(|p| !invalid.contains(p)) {
+            heal.insert(drv);
+        } else if !from_record {
+            record_outputs.push((drv, outs));
+        }
+    }
+    Ok(FailureRecheck {
+        heal,
+        record_outputs,
+    })
+}
+
 /// From a set of candidate failing drvs (drawn from the observation log), the
 /// subset that is **actually still failing** — some output is invalid in the
 /// store — mapped to that drv's output paths (its `blocker` if it culprits a
@@ -387,11 +475,36 @@ fn drvs_to_materialize_at(
             .iter()
             .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
         let dep_stale = stale.get(&t.drv_path).copied().unwrap_or(false);
-        if policy.decide(obs, substitutable, t.skipped, dep_stale) == Decision::Build {
+        let decision = policy.decide(obs, substitutable, t.skipped, dep_stale);
+        if decision == Decision::Build {
+            need.insert(t.drv_path.clone());
+        } else if decision == Decision::SkipFail && needs_selfheal_instantiate(obs) {
+            // A direct failure that recorded no outputs can't be self-heal-checked
+            // offline (DESIGN §5), so materialize its `.drv` here and let the build
+            // driver resolve the outputs and re-check store validity — the
+            // cache-miss half of the self-heal, folded into the one instantiate
+            // pass rather than a bespoke query. A failure that *did* record its
+            // outputs is checked offline and stays out of the set, which is what
+            // keeps a warm run whose failures are all recorded instant.
             need.insert(t.drv_path.clone());
         }
     }
     Ok(need)
+}
+
+/// A **direct** failure with no recorded outputs: it can't be self-heal-checked
+/// offline (nothing to validate against the store), so its `.drv` must be
+/// materialized to resolve them (DESIGN §5). Excludes a `DepFailed` (its block
+/// self-heals via [`stale_dep_blocks`]) and a direct failure that already
+/// recorded its outputs (checked offline, no `.drv` needed).
+fn needs_selfheal_instantiate(obs: &[Observation]) -> bool {
+    let direct_failed = obs
+        .iter()
+        .any(|o| o.source == Source::Local && o.outcome == Outcome::Failed);
+    let has_recorded_outputs = obs.iter().any(|o| {
+        o.source == Source::Local && o.outcome == Outcome::Failed && !o.blocker.is_empty()
+    });
+    direct_failed && !has_recorded_outputs
 }
 
 /// [`build_targets`] against an explicit observation DB (separable for tests).
@@ -531,7 +644,47 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // no-op; it stays for the test path that drives the build directly.)
     probe_and_record(&mut store, targets, policy, &|_| {})?;
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
-    let obs_by_drv = store.load_observations_many(&drv_refs)?;
+    let mut obs_by_drv = store.load_observations_many(&drv_refs)?;
+
+    // Self-heal direct failures that built out of band (§5): re-check each
+    // failure's outputs against the store — from its recorded `blocker`
+    // (offline) or the `.drv` `drvs_to_materialize` just instantiated for a
+    // failure that had none — and a failure whose outputs are now valid becomes
+    // a `Built`, so `decide()` returns `SkipOk` and the report shows a success
+    // with no `--retry`. This is the direct-failure analogue of the
+    // dependency-block self-heal (`stale_dep_blocks`): a later success read from
+    // the store outranks an earlier recorded failure (`flaky_success_wins`). A
+    // failure resolved from its `.drv` that is still invalid gets its outputs
+    // recorded, so the next run re-checks it offline instead of materializing
+    // again — keeping a warm run whose failures are all recorded instant (§6).
+    let FailureRecheck {
+        heal: healed,
+        record_outputs,
+    } = recheck_direct_failures(targets, &obs_by_drv)?;
+    if !healed.is_empty() || !record_outputs.is_empty() {
+        let now = unix_now();
+        for drv in &healed {
+            let ob = Observation {
+                drv_path: drv.clone(),
+                source: Source::Local,
+                outcome: Outcome::Built,
+                when: now,
+                blocker: Vec::new(),
+            };
+            store.add_observation(&ob)?;
+            obs_by_drv.entry(drv.clone()).or_default().push(ob);
+        }
+        for (drv, outs) in record_outputs {
+            store.add_observation(&Observation {
+                drv_path: drv,
+                source: Source::Local,
+                outcome: Outcome::Failed,
+                when: now,
+                blocker: outs,
+            })?;
+        }
+    }
+
     let obs_of = |drv: &str| obs_by_drv.get(drv).map(Vec::as_slice).unwrap_or(&[]);
 
     let cache_built = |drv: &str| {
@@ -650,17 +803,22 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             let built = drv_built(drv)?;
             if requested.contains(drv) {
                 // A requested target: record its own outcome, success or failure.
-                let outcome = if built {
-                    Outcome::Built
+                // A direct failure records the drv's *own* output paths as its
+                // `blocker` (the .drv is present here, having just been built),
+                // so a later run can re-check their validity offline and
+                // self-heal if it built out of band since — the direct-failure
+                // analogue of a DepFailed's culprit blocker (DESIGN §5).
+                let (outcome, blocker) = if built {
+                    (Outcome::Built, Vec::new())
                 } else {
-                    Outcome::Failed
+                    (Outcome::Failed, cache::drv_outputs(drv).unwrap_or_default())
                 };
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
                     source: Source::Local,
                     outcome,
                     when: unix_now(),
-                    blocker: Vec::new(),
+                    blocker,
                 })?;
                 recorded.insert(drv.to_string(), outcome);
             } else if !built {
@@ -670,13 +828,15 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 // re-pull it (pass 1b) — and so ^C keeps it. A dependency
                 // *success* needs no row: nix's own store validity already
                 // remembers it, and `verify_failing` consults exactly that so a
-                // healed dependency stops blocking.
+                // healed dependency stops blocking. Its own outputs are recorded
+                // as the `blocker` too, so a dependency that later builds out of
+                // band self-heals just like a requested target (DESIGN §5).
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
                     source: Source::Local,
                     outcome: Outcome::Failed,
                     when: unix_now(),
-                    blocker: Vec::new(),
+                    blocker: cache::drv_outputs(drv).unwrap_or_default(),
                 })?;
             }
             Ok(())
@@ -792,7 +952,7 @@ mod tests {
         let db = dir.path().join("npd.sqlite");
         {
             let mut s = Store::open(&db).unwrap();
-            // Known-built locally, substitutable, and failing-only: all decided.
+            // Built locally and substitutable: decided as successes.
             s.add_observation(&planted(
                 "/nix/store/built.drv",
                 Source::Local,
@@ -805,11 +965,23 @@ mod tests {
                 Outcome::Built,
             ))
             .unwrap();
+            // A direct failure with NO recorded outputs: can't be self-heal-checked
+            // offline, so it must be materialized to resolve them (§5).
             s.add_observation(&planted(
                 "/nix/store/failed.drv",
                 Source::Local,
                 Outcome::Failed,
             ))
+            .unwrap();
+            // A direct failure that DID record its outputs: re-checked offline,
+            // needs no `.drv`.
+            s.add_observation(&Observation {
+                drv_path: "/nix/store/failed-recorded.drv".into(),
+                source: Source::Local,
+                outcome: Outcome::Failed,
+                when: 1,
+                blocker: vec!["/nix/store/out-of-failed-recorded".into()],
+            })
             .unwrap();
         }
         // "/nix/store/new.drv" has no fact; "/nix/store/skipped.drv" is meta-blocked.
@@ -817,19 +989,32 @@ mod tests {
             target("/nix/store/built.drv", false),
             target("/nix/store/cached.drv", false),
             target("/nix/store/failed.drv", false),
+            target("/nix/store/failed-recorded.drv", false),
             target("/nix/store/skipped.drv", true),
             target("/nix/store/new.drv", false),
         ];
 
-        // Default policy: only the never-observed, non-skipped drv needs a `.drv`.
+        // Default policy: the never-observed drv needs a `.drv` to build, and the
+        // failure with no recorded outputs needs one to self-heal-check (§5). The
+        // failure that recorded its outputs is checked offline and stays out.
         let need = drvs_to_materialize_at(&db, &targets, BuildPolicy::default()).unwrap();
-        assert_eq!(need, HashSet::from(["/nix/store/new.drv".to_string()]));
+        assert_eq!(
+            need,
+            HashSet::from([
+                "/nix/store/new.drv".to_string(),
+                "/nix/store/failed.drv".to_string(),
+            ])
+        );
 
-        // A fully-cached set (drop the new/skipped outliers) needs nothing — the
-        // instantiation eval is skipped entirely.
-        let cached_only = &targets[..3];
+        // A set that's fully decided offline (successes plus a failure that
+        // recorded its outputs) needs nothing — instantiation is skipped entirely.
+        let cached_only = vec![
+            target("/nix/store/built.drv", false),
+            target("/nix/store/cached.drv", false),
+            target("/nix/store/failed-recorded.drv", false),
+        ];
         assert!(
-            drvs_to_materialize_at(&db, cached_only, BuildPolicy::default())
+            drvs_to_materialize_at(&db, &cached_only, BuildPolicy::default())
                 .unwrap()
                 .is_empty()
         );
@@ -1077,6 +1262,78 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The direct-failure analogue of the dependency self-heal (DESIGN.md §5): a
+    /// `Failed` records the drv's own outputs, and if they are valid in the store
+    /// on a later run — the drv built out of band — the sticky failure is stale
+    /// and heals. Uses `nix-store --add` for a guaranteed-valid path (cheap, no
+    /// build); a bogus path stands in for a still-missing output.
+    #[test]
+    #[ignore = "queries the real store via nix-store; needs nix"]
+    fn direct_failure_self_heals_when_own_outputs_are_valid() {
+        let valid = String::from_utf8(
+            Command::new("nix-store")
+                .args(["--add", "/etc/hostname"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let invalid =
+            "/nix/store/00000000000000000000000000000000-npd-self-heal-absent".to_string();
+
+        let failed = |drv: &str, blocker: Vec<String>| Observation {
+            drv_path: drv.into(),
+            source: Source::Local,
+            outcome: Outcome::Failed,
+            when: 1,
+            blocker,
+        };
+        let mut obs: HashMap<String, Vec<Observation>> = HashMap::new();
+        // Failed, own outputs now valid -> heals.
+        obs.insert("/a.drv".into(), vec![failed("/a.drv", vec![valid.clone()])]);
+        // Failed, own outputs still missing -> stays sticky.
+        obs.insert(
+            "/b.drv".into(),
+            vec![failed("/b.drv", vec![invalid.clone()])],
+        );
+        // Failed with no recorded outputs -> can't re-check, stays sticky.
+        obs.insert("/c.drv".into(), vec![failed("/c.drv", vec![])]);
+        // A recorded success already decides it -> not re-derived from the store.
+        obs.insert(
+            "/d.drv".into(),
+            vec![
+                failed("/d.drv", vec![valid.clone()]),
+                planted("/d.drv", Source::Local, Outcome::Built),
+            ],
+        );
+
+        let targets: Vec<Target> = ["/a.drv", "/b.drv", "/c.drv", "/d.drv"]
+            .iter()
+            .map(|d| target(d, false))
+            .collect();
+        let FailureRecheck {
+            heal,
+            record_outputs,
+        } = recheck_direct_failures(&targets, &obs).unwrap();
+
+        assert!(heal.contains("/a.drv"), "valid own outputs must heal");
+        assert!(!heal.contains("/b.drv"), "missing outputs stay sticky");
+        assert!(!heal.contains("/c.drv"), "no recorded outputs -> no heal");
+        assert!(
+            !heal.contains("/d.drv"),
+            "a recorded Built already decides it"
+        );
+        // `/b` was resolved from the log (recorded blocker), so a still-invalid
+        // check doesn't re-record it; only outputs freshly resolved from a `.drv`
+        // are backfilled, and none here came from a `.drv`.
+        assert!(
+            record_outputs.is_empty(),
+            "already-recorded failures aren't re-recorded"
+        );
     }
 
     /// The self-healing path (DESIGN.md §5): a dependent recorded `DepFailed`,

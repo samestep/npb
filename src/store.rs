@@ -438,8 +438,8 @@ mod tests {
         // a different drv is independent
         assert!(s.load_observations("/nix/store/y.drv").unwrap().is_empty());
 
-        // A dep-failed's culprit output paths round-trip through the blocker
-        // column (newline-joined); a non-dep-failed carries none.
+        // A failure's blocker output paths round-trip through the blocker
+        // column (newline-joined); a success carries none.
         let mut dep = mk(Outcome::DepFailed, 300);
         dep.drv_path = "/nix/store/z.drv".into();
         dep.blocker = vec!["/nix/store/o1".into(), "/nix/store/o2".into()];

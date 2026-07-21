@@ -274,11 +274,27 @@ both sound and *self-correcting*:
   dependency-side of `flaky_success_wins`: a later success outranks an earlier
   failure, read from the store rather than from a recorded `Built`.
 
-A **direct** failure (a drv's own build failed) stays sticky by contrast —
+A **direct** failure (a drv's own build failed) is stickier by contrast —
 presumed to recur, `--retry` to re-attempt — because it *is* a fact about that
-drv, not a second-order inference about a dependency. `--retry` disables
-propagation entirely; the check is gated behind a non-empty failing set and a
-union-closure query, so a run with nothing failing pays nothing.
+drv, not a second-order inference about a dependency. It still self-heals on the
+same store-validity signal, though (`recheck_direct_failures`): a `Failed`
+records the drv's *own* output paths in its `blocker` (the direct-failure
+analogue of a `DepFailed`'s culprit blocker), and a later run re-checks them —
+the moment they are valid, the drv built out of band (a plain `nix build`, an
+unrelated realisation) and the sticky `Failed` becomes a `Built`, no `--retry`
+needed. A failure that recorded its outputs is checked **offline** (no `.drv`,
+one `nix-store --check-validity`), so a warm run whose failures are all recorded
+stays instant. A failure with *no* recorded outputs — nothing to validate
+against — isn't a dead end: it's simply a materialize candidate
+(`needs_selfheal_instantiate`), so `drvs_to_materialize` (§6) pulls it into the
+one instantiate pass, its outputs are resolved from the freshly-written `.drv`,
+and the same check runs. If it's still invalid it records those outputs, so the
+next run re-checks it offline instead of re-materializing — self-limiting. The
+only sticky residue is a failure whose outputs can't be resolved at all (no
+`blocker`, `.drv` GC'd), overridden as before by `--retry` or a later `Built`.
+`--retry` disables propagation entirely; the check is gated behind a non-empty
+failing set and a union-closure query, so a run with nothing failing pays
+nothing.
 
 **Soundness caveats (known, accepted).** Every recorded fact is now grounded in
 store validity: `Built` from valid outputs, `Failed` from a drv's own stop event
@@ -290,8 +306,9 @@ verifiably failing in its closure, is left unrecorded and re-attempted next run.
 What remains, deliberately: a `Failed`/`DepFailed` row is only re-examined
 against the store *lazily*, when the policy is about to act on it (skip a build,
 propagate a block), so a since-healed failure lingers in the log until then —
-harmlessly, since it is overridden at use (a direct failure by `--retry` or a
-later `Built`; a dependency block automatically, via the `blocker` re-check).
+harmlessly, since it is overridden at use (a direct failure by `--retry`, a
+later `Built`, or its own recorded outputs going valid; a dependency block
+automatically, via the `blocker` re-check).
 And a `Cache` fact records substitutability *at probe time* — the remote cache
 deleting a path later doesn't invalidate the fact (by design, §3), it just means
 nix substitutes from source instead.
@@ -461,15 +478,19 @@ of changed attrs would only re-pay that import — so this trims the phase's
 wall-time from the *sum* of the imports toward the *slowest single* one at no
 extra total work. Crucially, it instantiates *only the drvs the build phase
 will actually touch*.
-A drv already known built / substitutable / failing is decided from the
-observation log alone (§5), so writing its `.drv` buys nothing; the driver asks
-the log which drvs still need probing or building (`build::drvs_to_materialize`,
-the pre-probe form of the build-policy predicate — one SQLite query, no `.drv`
-required) and instantiates just those. In the warm-cache iterative loop npd is
-built for, *every* changed drv is already known, that set is empty, and the
-instantiation eval is skipped entirely — without this, a fully-cached run still
-paid a couple of seconds re-importing nixpkgs to write `.drv` files nothing
-would read. On a RAM-constrained machine
+A drv already decided from the observation log alone — built, substitutable, or
+a failure with its outputs recorded (checked offline, §5) — buys nothing from a
+`.drv`; the driver asks the log which drvs still need probing, building, **or a
+self-heal-check** (`build::drvs_to_materialize`, the pre-probe form of the
+build-policy predicate — one SQLite query, no `.drv` required) and instantiates
+just those. That last case is a failure with *no* recorded outputs: it can't be
+re-checked offline, so its `.drv` is materialized here to resolve them and the
+build phase re-checks store validity (§5) — folding the self-heal's cache-miss
+into this one pass rather than a bespoke query. In the warm-cache iterative loop
+npd is built for, *every* changed drv is already decided from the log — successes
+and recorded failures alike — that set is empty, and the instantiation eval is
+skipped entirely — without this, a fully-cached run still paid a couple of
+seconds re-importing nixpkgs to write `.drv` files nothing would read. On a RAM-constrained machine
 the lean `--no-instantiate` workers are also what let npd parallelize at all —
 instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
 

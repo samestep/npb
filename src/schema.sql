@@ -20,9 +20,9 @@ CREATE TABLE IF NOT EXISTS observation (
     source     INTEGER NOT NULL,
     outcome    INTEGER NOT NULL,
     when_      INTEGER NOT NULL,
-    -- For a `dep-failed`: newline-joined output paths of the culprit dependency
-    -- (DESIGN.md §5), so a later run can re-check the block's validity offline.
-    -- NULL for every other outcome.
+    -- Newline-joined output paths whose validity re-decides this fact offline on
+    -- a later run (DESIGN.md §5): for a `dep-failed`, the culprit dependency's
+    -- outputs; for a `failed`, the drv's own outputs. NULL for a success.
     blocker    TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
