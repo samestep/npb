@@ -197,7 +197,11 @@ npd --patch /dev/stdin <<'PATCH'
 PATCH
 ```
 
-Note that the path must include a forward-slash.
+Note that the path must include a forward-slash. That is to avoid ambiguity because `--patch` also accepts three-dot [GitHub commit comparison](https://docs.github.com/en/pull-requests/how-tos/commit-changes/comparing-commits) expressions:
+
+```sh
+npd --patch HEAD...974b2de7dc8f59ba4ac9729c452834641f82849f
+```
 
 ### `--no-merge`
 
