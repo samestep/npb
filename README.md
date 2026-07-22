@@ -10,7 +10,7 @@ npb --pr 539280
 
 That command may not give you the same result if you run it yourself, but `npb`'s report includes a _reproducible_ command that will:
 
-> ## [`npb`](https://github.com/samestep/npb/tree/002d37d631715ab0edfbdcfab79c39db4a375e4a) · [`26426a9`](https://github.com/NixOS/nixpkgs/commit/26426a9ad1c5cebe35b163a94152065a7b9d1413) → [`17a97c0`](https://github.com/NixOS/nixpkgs/commit/17a97c09e0d9467dd191a2cfbc800c2a984b5f1b)
+> ## [`npb`](README.md) · [`26426a9`](https://github.com/NixOS/nixpkgs/commit/26426a9ad1c5cebe35b163a94152065a7b9d1413) → [`17a97c0`](https://github.com/NixOS/nixpkgs/commit/17a97c09e0d9467dd191a2cfbc800c2a984b5f1b)
 >
 > <details><summary>Expand this for a reproducible command.</summary>
 >
