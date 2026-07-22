@@ -160,8 +160,8 @@ eval, so a file beats SQLite on every axis that matters here:
   file's mtime, which a cache **hit** re-stamps (`evalfile::touch_eval`, called
   from `eval::eval_pairs`) — a read alone wouldn't, so a shared base eval reused
   across many reviews would otherwise look as old as its first write. Evicting an
-  eval also purges that `(tree, system)`'s `--tests` rows (below), keyed on the
-  same tree, so the two stay in lockstep. (The "millions of tiny files" failure
+  eval also purges that `(tree, system)`'s `--tests` and transitive-block rows
+  (below, §6), keyed on the same tree, so they all stay in lockstep. (The "millions of tiny files" failure
   mode is about a file _per attr_; one file per _eval_ is ~two files per review.)
 
 Writes are atomic — a uniquely-named temp file in the same directory (rename is
@@ -200,7 +200,7 @@ table, so its per-row bytes are what compound over time (~15% off it, measured).
 
 ```
 ~/.cache/nix-npb/
-  npb.sqlite                    # observation log (tiny) + --tests cache (the bulk) + patch-tree cache (§8)
+  npb.sqlite                    # observation log (tiny) + --tests cache (the bulk) + transitive-block cache (§6) + patch-tree cache (§8)
   <sys>/<tree>.tsv.zst          # attr→drv maps (zstd), one file per eval — evicted by --clean
 ```
 
@@ -350,6 +350,59 @@ store, they don't change. (An earlier design threaded a named "profile" label
 through the key to leave room for several configs, and a later one an
 eval-version tag baked into each filename; with exactly one config ever defined,
 both were redundant and dropped.)
+
+**Transitively meta-blocked packages.** The allow-everything config has one
+consequence that must be undone at the changed-set level. `allowUnsupportedSystem`
+(and the other allow-flags) let a package that is _itself_ broken/unsupported/insecure
+evaluate to a drv — that's the point, so its `skipped` bit and drvpath are known
+(§5). But it _also_ lets a package that is clean in its own `meta` yet
+**depends** on a meta-blocked package evaluate: a `matrix-synapse` plugin (a
+plain `buildPythonPackage`, supported everywhere) lists Linux-only
+`matrix-synapse-unwrapped` in its `nativeCheckInputs`, so on `aarch64-darwin` the
+dependency is `unsupported` — under nixpkgs' _strict_ config (what
+`nix-env`/`nixpkgs-review`/ofborg use) forcing the plugin derivation would
+**throw**, and the plugin never enters their changed set. Under npb's config it
+evaluates fine, so npb would otherwise report a phantom Darwin rebuild for a
+package no real user of the platform can build.
+
+The meta-blocked bit does _not_ propagate through `meta` (the plugin's own meta
+is clean), and — unlike direct unsupportedness — it can't be read off the drv
+either: whether forcing the derivation throws depends on _which attr_ (hence
+which `meta`) it references, so it's genuinely per-attr. npb therefore recovers
+the verdict the only faithful way, the way nixpkgs-review does: **ask the
+evaluator.** After the diff, a targeted second eval (`eval::eval_availability`,
+driven from `main::run_phases`) re-imports nixpkgs over just the changed-set
+candidate attrs under a **strict** config (`STRICT_CONFIG`: `allowBroken` off,
+no `allowUnsupportedSystem`/`allowInsecure`, `allowUnfree` on to match), running
+through the same shard scheduler as `--tests`/instantiate (§6). An attr that
+**throws** there is broken/unsupported/insecure or forces such a dependency —
+exactly nixpkgs-review's `evalAttrs.nix` `tryEval` — and is marked **skipped**
+(⏩, the same masking a direct meta-block gets). This is precise and per-attr, no
+closure proxy: the evaluator's throw _is_ the answer, and it handles transitive
+_broken_ (a dep the allow-everything eval let build) as correctly as transitive
+unsupported.
+
+The check is applied to **every** changed attr not directly meta-blocked, _not_
+only the ones the build policy would touch — because the skip must mask recorded
+facts exactly like a direct meta-block (§5): a default run shows ⏩ even for an
+attr an earlier `--no-skip` run built, so the report never depends on build
+history. Gating it on "would build" would let an attr with a recorded success
+slip through as ✅, the very dependence §5 forbids. `--no-skip` itself builds
+meta-blocked packages by choice, so it disables the reclassification.
+
+**The verdict is cached, because the strict eval is the one expensive step.** It
+is a pure function of `(tree, system, attr)` — the attr's meta and its
+dependencies' meta are all fixed by the tree — exactly like the full eval, so it
+lives in a `transitive_block` table keyed per-attr on the same interned
+`eval_key` as the `--tests` cache and evicted with it (§4). A warm run reads
+every candidate's verdict with one SQLite query and evaluates **nothing**; only
+_misses_ (a cold run, or an attr never checked) reach the strict eval, whose
+results are then cached. Without this a fully-cached re-run re-evaluated the
+changed set every time — a nixpkgs re-import is ~1 s, which defeated "instant
+when cached". The misses from every side and system are gathered into one
+scheduler run (one shard per `(commit, system)`, concurrency across them), each
+verdict cached under its own key; a candidate can only ever be its own key's
+attr, so no cross-key confusion is possible.
 
 **Why the git _tree_, not the commit.** The eval is a pure function of the
 checked-out file content — a commit merely wraps a tree with parents, an author,
@@ -712,7 +765,7 @@ npb shares **one persistent progress tree** (`live::Tree`/`live::with_live` in
 `src/live.rs`) spanning the whole pre-build run — a refresher thread redraws it at
 a steady 100 ms off lock-free per-node atomics that the workers bump. It is a
 tree: each piece of network or nontrivial work (`fetch`/`download`, `enumerate`,
-`evaluate`, `tests`, `instantiate`, `probe`) is a top-level node the moment npb
+`evaluate`, `tests`, `instantiate`, `check`, `probe`) is a top-level node the moment npb
 learns it needs it — nesting a system level (always, one system or many) and
 the per-side commit _display_ (`Rev::display`, §6: the friendly name of the tree
 actually evaluated — `master`, `HEAD`, `merge(a, b)`, `#431 merge` — never a

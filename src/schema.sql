@@ -3,10 +3,14 @@
 -- integer enum-code mapping lives in `store.rs` (Rust, not DDL) — the values
 -- quoted in comments here are informative copies of that source of truth.
 --
--- No migration code in npb, ever (CLAUDE.md): change this schema freely and in
--- place, and carry the live `~/.cache/nix-npb` data forward with a one-off
--- migration run as part of the change — never delete the store (its facts are
--- expensive to re-derive), and never add a compat shim here.
+-- npb is public and writes no migration code (DESIGN.md §1, CLAUDE.md): a
+-- current npb must read a store an older npb wrote and vice versa, so this schema
+-- evolves only *additively* — a new `CREATE TABLE IF NOT EXISTS`, or a column
+-- both versions tolerate — never a rename, drop, or `ALTER` that an old binary
+-- (or the no-migration rule) couldn't handle. Everything here is re-derivable
+-- cache, but it's never deleted or invalidated to dodge a format change; a table
+-- keyed on `eval_key` is evicted per `(tree, system)` in lockstep with the eval
+-- files (`--clean`), not purged wholesale.
 
 -- The append-only observation log (DESIGN.md §3): the build driver appends a
 -- fact here per drv — a local build's outcome, or substituter presence recorded
@@ -76,6 +80,27 @@ CREATE TABLE IF NOT EXISTS test_drv (
     drv_path  TEXT NOT NULL,
     skipped   INTEGER NOT NULL,
     PRIMARY KEY (key_id, pkg_attr, test_attr)
+) STRICT, WITHOUT ROWID;
+
+-- The transitive-meta-block cache (DESIGN.md §6). Whether a changed attr is
+-- *transitively* meta-blocked — clean in its own `meta` yet throwing under
+-- nixpkgs' strict config because it (or a dependency it forces) is
+-- broken/unsupported/insecure — is a pure function of `(tree, system, attr)`,
+-- decided by a targeted strict eval of the changed set (`eval::eval_availability`,
+-- npb's analogue of nixpkgs-review's `evalAttrs.nix`). That eval re-imports
+-- nixpkgs (seconds), so the per-attr verdict is cached here and read on later
+-- runs instead of re-evaluating, keeping warm runs instant (DESIGN.md §4, §6).
+-- Keyed on the same interned `eval_key` as the `--tests` cache and evicted with
+-- it. It keys on `attr`, not a drv, because the verdict is genuinely per-attr:
+-- the throw depends on which attr (hence which `meta`) is forced, so two attrs
+-- sharing a drv can differ. `blocked` is 0 = builds, 1 = throws (skipped, ⏩). A
+-- row exists only for an attr actually checked (evaluated); an unchecked attr is
+-- simply absent and recomputed on a later run.
+CREATE TABLE IF NOT EXISTS transitive_block (
+    key_id  INTEGER NOT NULL REFERENCES eval_key (id),
+    attr    TEXT    NOT NULL,
+    blocked INTEGER NOT NULL,
+    PRIMARY KEY (key_id, attr)
 ) STRICT, WITHOUT ROWID;
 
 -- The patch-tree cache (DESIGN.md §8): maps a `--patch <A...B>` compare — its

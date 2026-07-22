@@ -9,7 +9,7 @@
 //! `nix-eval-jobs` output is parsed by streaming NDJSON straight off the child's
 //! stdout (never buffering the whole, meta-heavy output).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -34,8 +34,26 @@ use crate::model::{AttrEval, Rev, TestJob};
 /// drvpaths and stays valid, §1). The allow-flags are
 /// on so meta-blocked packages still yield a drv + meta rather than throwing —
 /// we want their drvpath and the option to build them anyway.
+///
+/// One consequence: the allow-flags also let a package with clean `meta` but a
+/// meta-blocked *dependency* evaluate (a `matrix-synapse` plugin pulling in
+/// Linux-only `matrix-synapse-unwrapped` on `aarch64-darwin`), where nixpkgs'
+/// strict config would throw. That's a phantom rebuild no real user of the
+/// platform can build, so it's undone at the changed-set level by a targeted
+/// strict re-eval ([`eval_availability`], DESIGN §6), not by changing this config.
 const EVAL_CONFIG: &str = "{ allowBroken = true; allowUnfree = true; \
                              allowUnsupportedSystem = true; allowInsecurePredicate = _: true; }";
+
+/// The config for the transitive-meta-block check ([`eval_availability`], DESIGN
+/// §6), matching nixpkgs-review's stricter walk: unsupported/insecure *not*
+/// allowed and `allowBroken` off, so a changed package that is (or forces a
+/// dependency that is) broken/unsupported/insecure **throws** when evaluated —
+/// exactly the packages nixpkgs-review's `nix-env`/`evalAttrs` drop. `allowUnfree`
+/// matches [`EVAL_CONFIG`] so an unfree dependency isn't mistaken for a block.
+/// Unlike [`EVAL_CONFIG`] this config is *not* a stored-format input (it drives a
+/// per-attr verdict cached in SQLite, keyed on the eval, not the eval files), so
+/// it isn't frozen the way [`EVAL_CONFIG`] is (§1).
+const STRICT_CONFIG: &str = "{ allowUnfree = true; }";
 
 // --- nix-eval-jobs output ---------------------------------------------------
 
@@ -124,9 +142,16 @@ fn nix_string_list(items: &[String]) -> String {
 /// commit — see [`Rev`]). Interpolants are escaped via [`nix_escape`] (the repo
 /// path in particular is user input, `--nixpkgs`).
 fn build_expr(repo: &Path, rev: &str, system: &str) -> String {
+    build_expr_cfg(repo, rev, system, EVAL_CONFIG)
+}
+
+/// [`build_expr`] with an explicit nixpkgs `config`. Only the full-eval config
+/// ([`EVAL_CONFIG`]) is a frozen stored-format input; the transitive-block check
+/// uses [`STRICT_CONFIG`] here (DESIGN §6), never touching the cached eval files.
+fn build_expr_cfg(repo: &Path, rev: &str, system: &str, config: &str) -> String {
     format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
-         {{ system = \"{}\"; config = {EVAL_CONFIG}; }}",
+         {{ system = \"{}\"; config = {config}; }}",
         nix_escape(&repo.display().to_string()),
         nix_escape(rev),
         nix_escape(system),
@@ -698,12 +723,12 @@ fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String]) -> String 
 /// as `attr`) would replace. `splitString "."` also mis-splits a quoted path
 /// element like `haskell.compiler."ghc94"`, which `--select` would handle
 /// correctly. Adopt it (in both spots) once it lands upstream.
-fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String]) -> String {
+fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &str) -> String {
     let list = nix_string_list(paths);
     format!(
         "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
          (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
-        build_expr(repo, rev, system)
+        build_expr_cfg(repo, rev, system, config)
     )
 }
 
@@ -786,7 +811,7 @@ pub fn instantiate_execute(
         handle,
         |gi, label, paths, on_item| {
             let (rev, system) = meta[gi];
-            let expr = select_expr(repo, &rev.commit, system, paths);
+            let expr = select_expr(repo, &rev.commit, system, paths, EVAL_CONFIG);
             // Streamed rows are discarded (mapped to `()`); the `.drv` writes are
             // the point. The per-job callback drives the live count.
             stream_jobs(
@@ -801,6 +826,107 @@ pub fn instantiate_execute(
         },
         |_, _| Ok(()),
     )
+}
+
+/// Decide the *transitively* meta-blocked changed attrs (DESIGN §6). For each
+/// request `(rev, system, attrs)`, evaluate those attr paths at
+/// `(rev.commit, system)` under [`STRICT_CONFIG`] and return, per request, the
+/// attrs that **threw** — broken/unsupported/insecure, or forcing such a
+/// dependency — exactly the packages nixpkgs-review's stricter walk drops.
+///
+/// This is the targeted analogue of nixpkgs-review's second eval
+/// (`evalAttrs.nix`), narrowed to the changed set. npb's full eval runs
+/// allow-everything so meta-blocked packages still yield a drv (§6) — which can't
+/// reveal that a *dependency* is blocked — so the evaluator is asked directly
+/// here: precise and per-attr (the throw depends on which attr's `meta` is
+/// forced), with no closure guesswork. A clean attr comes back with a `drvPath`;
+/// a thrown one carries only an `error`, so `drv_path` is `None`.
+///
+/// Same shard scheduler as [`eval_tests`]/[`instantiate_execute`] — one shard per
+/// request, concurrency across requests, the light [`SLOT_MEM_MB`] budget (these
+/// are ordinary workers, not the heavy `--tests` ones). Callers pass only the
+/// attrs whose verdict isn't already cached (`store::Store::blocked_verdicts`);
+/// an all-empty `requests` does nothing.
+pub fn eval_availability(
+    repo: &Path,
+    requests: &[(Rev, String, Vec<String>)],
+    opts: EvalOpts,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<Vec<HashSet<String>>> {
+    if requests.iter().all(|(_, _, a)| a.is_empty()) {
+        return Ok(requests.iter().map(|_| HashSet::new()).collect());
+    }
+    let slots = default_slots(SLOT_MEM_MB, opts.slots);
+    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
+    let groups: Vec<(String, String)> = requests
+        .iter()
+        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
+        .collect();
+    let nodes = add_phase(tree, "check", &groups, Leaf::Count);
+    let labels: Vec<String> = requests
+        .iter()
+        .map(|(rev, sys, _)| format!("check {} ({sys})", rev.display))
+        .collect();
+    let items: Vec<Vec<String>> = requests.iter().map(|(_, _, a)| a.clone()).collect();
+    let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
+    // One shard per request (size at the largest), like instantiate: the cost is
+    // the per-key nixpkgs import, so sub-slicing a handful of attrs buys nothing.
+    let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    // Per request, the attrs that evaluated cleanly (a drv — i.e. did not throw).
+    let clean: Vec<Mutex<HashSet<String>>> = (0..requests.len())
+        .map(|_| Mutex::new(HashSet::new()))
+        .collect();
+
+    run_shards(
+        nodes,
+        labels,
+        items,
+        shard_size,
+        slots,
+        // One streamed job per requested attr (clean *and* thrown attrs each emit
+        // a line), so `items.len()` is the denominator.
+        true,
+        handle,
+        |gi, label, attrs, on_item| {
+            let (rev, system) = meta[gi];
+            let expr = select_expr(repo, &rev.commit, system, attrs, STRICT_CONFIG);
+            // `attrPath` (unquoted, joined) matches the requested path even when
+            // it contains a `.` that nix-eval-jobs would quote in `attr`.
+            stream_jobs(
+                &expr,
+                1,
+                per_worker_mb,
+                false,
+                label,
+                |raw| (raw.attr_path.join("."), raw.drv_path.is_some()),
+                || on_item(1),
+            )
+        },
+        |gi, rows| {
+            let mut set = clean[gi].lock().unwrap();
+            for (attr, present) in rows {
+                if present {
+                    set.insert(attr);
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    // Blocked = requested attrs that did not come back clean (they threw).
+    Ok(requests
+        .iter()
+        .enumerate()
+        .map(|(gi, (_, _, attrs))| {
+            let clean = clean[gi].lock().unwrap();
+            attrs
+                .iter()
+                .filter(|a| !clean.contains(*a))
+                .cloned()
+                .collect()
+        })
+        .collect())
 }
 
 // --- the shard scheduler (shared by the full-set eval and the --tests eval) ---

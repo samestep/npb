@@ -1118,7 +1118,142 @@ fn run_phases(
         build::probe_execute(probe)?;
     }
 
+    // Reclassify any *transitively* meta-blocked changed attr — one whose own
+    // `meta` is clean but which throws under nixpkgs' strict config because it
+    // forces a broken/unsupported/insecure dependency (DESIGN §6) — as skipped
+    // (⏩), and re-derive the build set so those aren't phantom-built.
+    mark_transitive_blocks(
+        repo,
+        &mut per_system_changed,
+        base,
+        head,
+        no_skip,
+        opts,
+        tree,
+        handle,
+    )?;
+    let targets = assemble_targets(&per_system_changed);
+
     Ok((per_system_changed, targets))
+}
+
+/// Fold each side's *transitively* meta-blocked changed attrs into its skipped
+/// bit (DESIGN §6). A changed package can carry no meta-block of its own yet
+/// still throw under nixpkgs' strict config because it forces a
+/// broken/unsupported/insecure *dependency* — e.g. a `matrix-synapse` plugin
+/// pulling in Linux-only `matrix-synapse-unwrapped` on `aarch64-darwin`.
+/// nixpkgs-review's `nix-env`/`evalAttrs` drop such a package; npb marks it
+/// skipped too, so the build drops it and the report shows ⏩ like the dependency.
+///
+/// The verdict is decided by asking the evaluator directly ([`eval::eval_availability`]),
+/// exactly nixpkgs-review's mechanism — npb's full eval runs allow-everything so a
+/// meta-blocked package still yields a drv (§6), which can't reveal a *dependency's*
+/// block, so a targeted strict eval of the changed set does. It's per-attr (the
+/// throw depends on which attr's `meta` is forced), so unlike the observation log
+/// there's no drv-keying subtlety.
+///
+/// The verdict is a pure function of `(tree, system, attr)`, so it is **cached**
+/// (`transitive_block`, DESIGN §6): a warm run reads every candidate with one
+/// SQLite query and evaluates nothing; only misses (a cold run, or an attr never
+/// checked) reach the strict eval, whose results are then cached. Candidates are
+/// **every** changed attr not *directly* meta-blocked — not gated on the build
+/// policy — because the skip must mask recorded facts like a direct meta-block
+/// (§5): a default run shows ⏩ even for an attr an earlier `--no-skip` run built,
+/// so the report never depends on build history. `--no-skip` itself builds
+/// meta-blocked packages by choice, so it disables the reclassification.
+#[allow(clippy::too_many_arguments)]
+fn mark_transitive_blocks(
+    repo: &std::path::Path,
+    per_system_changed: &mut PerSystemChanged,
+    base: &Rev,
+    head: &Rev,
+    no_skip: bool,
+    opts: eval::EvalOpts,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<()> {
+    if no_skip {
+        return Ok(());
+    }
+    let mut store = store::Store::open(&paths::db_path()?)?;
+
+    // For each side (base/head) of each system, the changed attrs not *directly*
+    // meta-blocked are the candidates whose transitive availability we must
+    // decide. Consult the cache; the misses become strict-eval requests. `blocked`
+    // accumulates the ⏩ verdicts, keyed by `(is_base, system)` so they map back to
+    // the right side (base.tree may equal head.tree, so `rev` alone won't do).
+    let mut blocked: HashMap<(bool, String), HashSet<String>> = HashMap::new();
+    let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
+    let mut req_side: Vec<(bool, String)> = Vec::new();
+    for (sys, changed) in per_system_changed.iter() {
+        for (rev, is_base) in [(base, true), (head, false)] {
+            let cands: Vec<String> = changed
+                .iter()
+                .filter_map(|c| {
+                    let (drv, skipped) = if is_base {
+                        (&c.base_drv, c.base_skipped)
+                    } else {
+                        (&c.head_drv, c.head_skipped)
+                    };
+                    drv.as_ref().filter(|_| !skipped).map(|_| c.attr.clone())
+                })
+                .collect();
+            if cands.is_empty() {
+                continue;
+            }
+            let cached = store.blocked_verdicts(&rev.tree, sys, &cands)?;
+            let hit = blocked.entry((is_base, sys.clone())).or_default();
+            let mut misses = Vec::new();
+            for a in cands {
+                match cached.get(&a) {
+                    Some(true) => {
+                        hit.insert(a);
+                    }
+                    Some(false) => {}
+                    None => misses.push(a),
+                }
+            }
+            if !misses.is_empty() {
+                requests.push((rev.clone(), sys.clone(), misses));
+                req_side.push((is_base, sys.clone()));
+            }
+        }
+    }
+
+    if !requests.is_empty() {
+        let errored = eval::eval_availability(repo, &requests, opts, tree, handle)?;
+        for (ri, err) in errored.into_iter().enumerate() {
+            let (rev, sys, misses) = &requests[ri];
+            let (is_base, _) = &req_side[ri];
+            // Cache every checked miss (blocked iff it threw), then record the blocked.
+            let verdicts: Vec<(String, bool)> = misses
+                .iter()
+                .map(|a| (a.clone(), err.contains(a)))
+                .collect();
+            store.cache_blocked(&rev.tree, sys, &verdicts)?;
+            blocked
+                .entry((*is_base, sys.clone()))
+                .or_default()
+                .extend(err);
+        }
+    }
+
+    if blocked.values().all(HashSet::is_empty) {
+        return Ok(());
+    }
+    for (sys, changed) in per_system_changed.iter_mut() {
+        let base_b = blocked.get(&(true, sys.clone()));
+        let head_b = blocked.get(&(false, sys.clone()));
+        for c in changed.iter_mut() {
+            if base_b.is_some_and(|s| s.contains(&c.attr)) {
+                c.base_skipped = true;
+            }
+            if head_b.is_some_and(|s| s.contains(&c.attr)) {
+                c.head_skipped = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The heading label for a `--patch A...B` compare head (DESIGN §8). When the

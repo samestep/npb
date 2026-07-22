@@ -12,20 +12,20 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::evalfile::{restore_drv, strip_drv};
 use crate::model::{Observation, Outcome, TestJob};
 
-// No migration code in npb, ever (CLAUDE.md): change this schema freely and in
-// place, and carry the live `~/.cache/nix-npb` data forward with a one-off
-// migration run as part of the change — never delete the store (its facts are
-// expensive to re-derive), and never add a compat shim. The DDL lives in
-// its own `.sql` file (embedded at compile time) purely for editor syntax
-// highlighting; the `outcome` enum-code mapping below is its Rust half.
+// npb is public and writes no migration code (DESIGN.md §1, CLAUDE.md): this
+// schema evolves only *additively* — a new `CREATE TABLE IF NOT EXISTS`, or a
+// column an old binary tolerates — never a rename, drop, or `ALTER` that would
+// need a migration, and never a compat shim. The store is re-derivable but never
+// deleted or invalidated to dodge a format change. The DDL lives in its own
+// `.sql` file (embedded at compile time) purely for editor syntax highlighting;
+// the `outcome` enum-code mapping below is its Rust half.
 const SCHEMA: &str = include_str!("schema.sql");
 
-// `outcome` persists as a small integer enum code, not its English label.
-// The values are stable on-disk (the cache is re-derivable, so they need no
-// migration — but keeping them fixed keeps the `failing_drvs` query below and
-// any hand-inspection legible). Changing a variant's code is a format change:
-// migrate the live store in place as part of the change (CLAUDE.md); npb
-// itself never carries migration code.
+// `outcome` persists as a small integer enum code, not its English label. The
+// values are fixed on-disk — an older npb must read what a newer one wrote — so
+// existing codes never change (the additive rule above); a new outcome may only
+// take a new, unused code. Keeping them fixed also keeps the `failing_drvs`
+// query below and any hand-inspection legible.
 fn outcome_code(o: Outcome) -> i64 {
     match o {
         Outcome::Built => 0,
@@ -333,11 +333,75 @@ impl Store {
         Ok(out)
     }
 
-    /// Drop the `--tests` cache for one `(tree, system)` — its `eval_key` row and
-    /// the `test_pkg`/`test_drv` rows that reference it — when its eval file is
-    /// evicted (`--clean`, DESIGN.md §4). Returns the number of `test_drv` rows
-    /// removed (the bulk); a no-op if the key was never recorded. The caller
-    /// [`Store::vacuum`]s once after a batch of these to return the pages.
+    /// Cached transitive-meta-block verdicts (DESIGN.md §6) for `attrs` at this
+    /// key, as `attr → blocked`. An attr absent from the result was never checked
+    /// (or the key isn't recorded) and must be recomputed — the same
+    /// absence-means-unknown contract as [`Store::tests_cached_pkgs`]. Keyed on
+    /// attr, not a drv, because the verdict is genuinely per-attr: the strict-eval
+    /// throw depends on which attr's `meta` is forced (§6). One query.
+    pub fn blocked_verdicts(
+        &self,
+        tree: &str,
+        system: &str,
+        attrs: &[String],
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let mut out = std::collections::HashMap::new();
+        let Some(key_id) = self.key_id(tree, system)? else {
+            return Ok(out);
+        };
+        if attrs.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = placeholders(attrs.len());
+        let sql = format!(
+            "SELECT attr, blocked FROM transitive_block \
+             WHERE key_id = ?1 AND attr IN ({placeholders})",
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(
+            std::iter::once(key_id.to_string()).chain(attrs.iter().cloned()),
+        );
+        let rows = stmt.query_map(params, |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+        })?;
+        for row in rows {
+            let (attr, blocked) = row?;
+            out.insert(attr, blocked);
+        }
+        Ok(out)
+    }
+
+    /// Record transitive-meta-block verdicts (`(attr, blocked)`) at this key, in
+    /// one transaction. Idempotent (`INSERT OR REPLACE`). Only *checked* attrs
+    /// (evaluated this run) belong here — an unchecked one is left uncached so a
+    /// later run rechecks it.
+    pub fn cache_blocked(
+        &mut self,
+        tree: &str,
+        system: &str,
+        verdicts: &[(String, bool)],
+    ) -> Result<()> {
+        if verdicts.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let key_id = Self::key_id_get_or_create(&tx, tree, system)?;
+        for (attr, blocked) in verdicts {
+            tx.execute(
+                "INSERT OR REPLACE INTO transitive_block (key_id, attr, blocked) \
+                 VALUES (?1, ?2, ?3)",
+                params![key_id, attr, blocked],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop the caches for one `(tree, system)` — its `eval_key` row and the
+    /// `test_pkg`/`test_drv`/`transitive_block` rows that reference it — when its
+    /// eval file is evicted (`--clean`, DESIGN.md §4). Returns the number of
+    /// `test_drv` rows removed (the bulk); a no-op if the key was never recorded.
+    /// The caller [`Store::vacuum`]s once after a batch of these to return the pages.
     pub fn purge_tests(&mut self, tree: &str, system: &str) -> Result<usize> {
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(0);
@@ -345,6 +409,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let drvs = tx.execute("DELETE FROM test_drv WHERE key_id = ?1", [key_id])?;
         tx.execute("DELETE FROM test_pkg WHERE key_id = ?1", [key_id])?;
+        tx.execute("DELETE FROM transitive_block WHERE key_id = ?1", [key_id])?;
         tx.execute("DELETE FROM eval_key WHERE id = ?1", [key_id])?;
         tx.commit()?;
         Ok(drvs)
@@ -602,6 +667,62 @@ mod tests {
         // Purging an unknown key is a no-op, and VACUUM after a batch is fine.
         assert_eq!(s.purge_tests("treeA", sys).unwrap(), 0);
         s.vacuum().unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_verdict_cache_round_trip_and_purge() {
+        let dir = std::env::temp_dir().join(format!("npb-tb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
+        let sys = "aarch64-darwin";
+        let attrs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (a, b, c) = (
+            "matrix-synapse-plugins.matrix-synapse-ldap3".to_string(),
+            "hello".to_string(),
+            "ripgrep".to_string(),
+        );
+
+        // Nothing cached: every candidate is a miss (absent from the map).
+        assert!(
+            s.blocked_verdicts("treeA", sys, &attrs(&[&a]))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Record a blocked and a clean verdict; both are definitive (`false` is a
+        // real "checked, clean" answer, not a miss).
+        s.cache_blocked("treeA", sys, &[(a.clone(), true), (b.clone(), false)])
+            .unwrap();
+        let v = s
+            .blocked_verdicts("treeA", sys, &attrs(&[&a, &b, &c]))
+            .unwrap();
+        assert_eq!(v.get(&a), Some(&true));
+        assert_eq!(v.get(&b), Some(&false));
+        assert_eq!(v.get(&c), None); // never recorded ⇒ still a miss
+
+        // A different tree shares nothing.
+        assert!(
+            s.blocked_verdicts("treeB", sys, &attrs(&[&a]))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Eviction (via purge_tests) drops this key's verdicts in lockstep.
+        s.cache_blocked("treeB", sys, &[(a.clone(), true)]).unwrap();
+        s.purge_tests("treeA", sys).unwrap();
+        assert!(
+            s.blocked_verdicts("treeA", sys, &attrs(&[&a]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.blocked_verdicts("treeB", sys, &attrs(&[&a]))
+                .unwrap()
+                .get(&a),
+            Some(&true)
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

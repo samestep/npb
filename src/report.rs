@@ -23,10 +23,14 @@ pub enum State {
     Blocked,
     /// Meta-blocked (broken/unsupported/insecure) — not attempted by default,
     /// nixpkgs-review's "skipped" (its meta-blocked subset; a *missing* attr is
-    /// `Absent`, not this). `--no-skip` builds it anyway and reports the real
-    /// outcome; without the flag the marking *masks* any recorded fact, so a
-    /// default run's report doesn't depend on what earlier `--no-skip` runs
-    /// happened to learn.
+    /// `Absent`, not this). Covers both a *direct* meta-block (the attr's own
+    /// `meta`) and a *transitive* one (a clean package that throws under a strict
+    /// re-eval because it forces a meta-blocked dependency `EVAL_CONFIG`
+    /// force-allowed, DESIGN §6 — e.g. a `matrix-synapse` plugin on
+    /// `aarch64-darwin`), folded into the same bit. `--no-skip` builds it anyway
+    /// and reports the real outcome; without
+    /// the flag the marking *masks* any recorded fact, so a default run's report
+    /// doesn't depend on what earlier `--no-skip` runs happened to learn.
     Skipped,
     /// Has a derivation but no build fact yet. Builds always run, so this is
     /// only the build phase's accepted gap (§5): a target nix never reached,

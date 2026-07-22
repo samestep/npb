@@ -69,7 +69,11 @@ pub struct Rev {
 /// analogue of nixpkgs-review's "skipped" (its meta-blocked subset; a *missing*
 /// attr is a separate state, ➖ absent): the profile's allow-flags let such a
 /// package evaluate to a drv anyway, but by default it is not *built* (like
-/// nixpkgs-review) — see [`BuildPolicy`].
+/// nixpkgs-review) — see [`BuildPolicy`]. This bit carries only a package's
+/// *own* meta-block; a *transitive* one (a clean package that only evaluates
+/// because a meta-blocked dependency was force-allowed) is detected separately,
+/// by a targeted strict re-eval of the changed set, and folded into the same
+/// skip (DESIGN §6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrEval {
     pub attr: String,
