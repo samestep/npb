@@ -482,6 +482,45 @@ fn needs_selfheal_instantiate(obs: &[Observation]) -> bool {
     direct_failed && !has_recorded_outputs
 }
 
+/// Narrow [`drvs_to_materialize`]'s set to the drvs whose `.drv` is **not** already
+/// a valid store path — the recipes instantiation must still write. A `.drv` that
+/// survived on disk from an earlier run needs no re-materialization: `nix build
+/// <drv>^*` and the narinfo probe read it in place, so instantiating it again only
+/// re-pays the nixpkgs import for a file already present. This is what lets a
+/// re-run of a report with still-to-build rows — an `❔` unbuilt target nix
+/// couldn't reach, a never-probed drv — skip that import while **still building**
+/// the target: the goal is to drop the instantiate step, not the build (which a
+/// present `.drv` lets nix do directly). Since the phase re-imports nixpkgs once
+/// per `(commit, system)` (DESIGN §6), a side is skipped entirely only when *all*
+/// its recipes are present; one absent drv still pays that side's import, but
+/// instantiation is trimmed to just the absent attrs.
+///
+/// Sound because a drv path is content-addressed: a valid `.drv` at path `H` *is*
+/// the recipe hashing to `H`, and the store's closure invariant (a valid path's
+/// references are valid) guarantees its input `.drv`s are present too, so the
+/// build and probe can walk it. npb keeps no gcroots (DESIGN §4), so a `.drv` may
+/// have been reclaimed by `nix-collect-garbage` since — then it is simply
+/// re-materialized here, no worse than before. Only called with a non-empty `need`
+/// (a fully-cached run skips instantiation from the log alone, never reaching
+/// here), so the one extra `nix-store --check-validity` never burdens a warm run.
+pub fn drvs_needing_instantiation(need: HashSet<String>) -> Result<HashSet<String>> {
+    if need.is_empty() {
+        return Ok(need);
+    }
+    // `invalid_paths` returns the subset that is *not* valid in the store — for a
+    // `.drv`, exactly the recipes still absent, which are the ones to instantiate.
+    let paths: Vec<String> = need.iter().cloned().collect();
+    let absent = invalid_paths(&paths)?;
+    Ok(retain_absent(need, &absent))
+}
+
+/// Keep only the drvs whose `.drv` is absent (present in `absent`) — the recipes
+/// still needing instantiation. Split out from [`drvs_needing_instantiation`] so
+/// the keep-the-*absent* polarity is unit-testable without a Nix store.
+fn retain_absent(need: HashSet<String>, absent: &HashSet<String>) -> HashSet<String> {
+    need.into_iter().filter(|d| absent.contains(d)).collect()
+}
+
 /// [`build_targets`] against an explicit observation DB (separable for tests).
 /// Probe the substituter for every target the log knows nothing about and
 /// record a `Built` observation per hit (DESIGN §7) — the fact-gathering half
@@ -957,6 +996,36 @@ mod tests {
             drvs_to_materialize_at(&db, &targets, no_skip)
                 .unwrap()
                 .contains("/nix/store/skipped.drv")
+        );
+    }
+
+    /// `drvs_needing_instantiation` keeps the recipes still **absent** from the
+    /// store and drops those already present — a present `.drv` needs no
+    /// re-materialization (§6). This pins the keep-the-absent polarity (the easy
+    /// bug: keeping the *valid* ones would re-instantiate exactly what's on disk).
+    #[test]
+    fn drvs_needing_instantiation_keeps_only_the_absent() {
+        let need = HashSet::from([
+            "/nix/store/present.drv".to_string(),
+            "/nix/store/absent.drv".to_string(),
+        ]);
+        // `invalid_paths` would return the absent subset; simulate it here so the
+        // filter is exercised without a Nix store.
+        let absent = HashSet::from(["/nix/store/absent.drv".to_string()]);
+        assert_eq!(
+            retain_absent(need, &absent),
+            HashSet::from(["/nix/store/absent.drv".to_string()])
+        );
+    }
+
+    /// An empty set short-circuits (no `nix-store` call on a warm run, which never
+    /// reaches here anyway since instantiation is skipped from the log alone, §6).
+    #[test]
+    fn drvs_needing_instantiation_empty_is_noop() {
+        assert!(
+            drvs_needing_instantiation(HashSet::new())
+                .unwrap()
+                .is_empty()
         );
     }
 

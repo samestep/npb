@@ -1078,7 +1078,12 @@ fn run_phases(
     // built/substitutable/failing is decided from the log alone). When *every*
     // changed drv is already known (the warm-cache iterative loop), this is empty
     // and the instantiation eval is skipped, keeping the run instant (§5–§6).
-    let need = build::drvs_to_materialize(&targets, policy)?;
+    // ...and, of those, skip any whose `.drv` already survives on disk from an
+    // earlier run: nix can build/probe it in place, so re-instantiating it would
+    // only re-pay the nixpkgs import for a recipe already present. This is what
+    // makes a re-run of a report with still-to-build rows (e.g. `❔` targets nix
+    // couldn't reach) skip the import while still building them (§6).
+    let need = build::drvs_needing_instantiation(build::drvs_to_materialize(&targets, policy)?)?;
     let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
     for (sys, changed) in &per_system_changed {
         let mut base_attrs = Vec::new();

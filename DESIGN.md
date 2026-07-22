@@ -514,6 +514,27 @@ seconds re-importing nixpkgs to write `.drv` files nothing would read. On a RAM-
 the lean `--no-instantiate` workers are also what let npb parallelize at all —
 instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
 
+**And of what the log says to materialize, npb skips the recipes already on
+disk.** A drv the log can't decide still buys nothing from _re_-writing a `.drv`
+that already exists: nix builds and probes it in place. So a second filter
+(`build::drvs_needing_instantiation`) drops from that set every drv whose `.drv`
+is already a valid store path — one `nix-store --check-validity`, run only when
+the log-derived set is non-empty (a warm run never reaches it). This is what
+makes _re_-running a report cheap even when it still has un-decided rows — most
+sharply an `❔` (a target nix couldn't reach, §5/§8): its outputs never built and
+never probed to a hit, so it stays log-undecided and would re-instantiate every
+run — but its `.drv`, a cheap store object, typically _survives_ from the first
+run (npb keeps no gcroots, §4, yet nothing collects until `nix-collect-garbage`),
+so the re-run reuses it and **still builds the target**, just without the import.
+The goal there is to drop the redundant instantiate, _not_ the build — which a
+present `.drv` lets nix do directly. It stays sound because a drv path is
+content-addressed (a valid `.drv` at `H` _is_ the recipe hashing to `H`) and the
+store closure invariant makes its input `.drv`s present too; if GC did reclaim it,
+it is simply re-materialized, no worse than before. The import is per
+`(commit, system)` (one shard, above), so a side is skipped whole only when _all_
+its recipes are present — one absent drv still pays that side's import, with
+instantiation trimmed to the absent attrs.
+
 **Choosing `base` and `head`.** Every input mode resolves to one shape: a
 _base-branch tip_ and a _head_ to review against it (`resolve_local`/`resolve_pr`
 in `src/main.rs`), onto which a single merge rule (`apply_merge`) then applies.
