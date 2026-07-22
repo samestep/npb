@@ -1,6 +1,6 @@
-//! npd core data model.
+//! npb core data model.
 //!
-//! Pure data types the rest of npd is organized around. The guiding decision
+//! Pure data types the rest of npb is organized around. The guiding decision
 //! (see DESIGN.md §2): build facts are keyed on the *derivation path* — the
 //! stable identity of a build recipe. It survives failures (unlike an output
 //! path) and is shared across commits automatically.
@@ -14,7 +14,7 @@
 /// The eval is a pure function of the source **tree** — the checked-out file
 /// content — not of the commit that carries it. A commit adds parents, an
 /// author, a message, and timestamps, none of which the evaluation can observe:
-/// `fetchGit`'s checkout has no `.git`, and npd forwards only the resulting
+/// `fetchGit`'s checkout has no `.git`, and npb forwards only the resulting
 /// *path* into `import`. So the eval (and `--tests`) cache keys on [`tree`]: two
 /// commits with the same tree share one eval — a rebase that doesn't touch the
 /// changed files, a message-only `--amend`, a cherry-pick landing identical
@@ -32,7 +32,7 @@
 /// [`display`] is the *human* name of the side for the live progress tree
 /// ([`crate::live`]): the ref the user actually expressed (or the default's
 /// name) rather than a resolved sha — `master`, `HEAD`, a branch, `#431 base` —
-/// and, for a commit npd *derives*, an honest description of it: `merge(a, b)`
+/// and, for a commit npb *derives*, an honest description of it: `merge(a, b)`
 /// for a synthetic merge, `merge-base(a, b)` for a `--no-merge` fork point,
 /// `HEAD*` for a working-tree/patch head. It describes the tree actually
 /// evaluated (DESIGN §6), so a sha appears only if the user typed one. Distinct
@@ -65,7 +65,7 @@ pub struct Rev {
 /// deliberately render an errored attr as *absent* (➖): in a delta view an
 /// eval breakage is visible as the attr disappearing, so no separate error
 /// state is needed. `skipped` folds
-/// `meta.broken` / `meta.unsupported` / `meta.insecure` into one bit — npd's
+/// `meta.broken` / `meta.unsupported` / `meta.insecure` into one bit — npb's
 /// analogue of nixpkgs-review's "skipped" (its meta-blocked subset; a *missing*
 /// attr is a separate state, ➖ absent): the profile's allow-flags let such a
 /// package evaluate to a drv anyway, but by default it is not *built* (like
@@ -158,7 +158,7 @@ pub enum Decision {
 pub struct BuildPolicy {
     /// Re-attempt a previously-failed drv (expect it might pass now).
     pub retry: bool,
-    /// Build the packages npd would otherwise skip for being meta-blocked
+    /// Build the packages npb would otherwise skip for being meta-blocked
     /// (broken/unsupported/insecure) — off by default, like nixpkgs-review.
     pub no_skip: bool,
 }

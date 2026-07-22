@@ -1,4 +1,4 @@
-# npd
+# npb
 
 Read DESIGN.md before making non-trivial changes; it is the source of truth for
 the architecture and is kept up to date as part of any change that affects it.
@@ -6,7 +6,7 @@ the architecture and is kept up to date as part of any change that affects it.
 ## Finishing a change: `nix flake check`, then commit to `main`
 
 Development happens on `main` — don't create feature branches or open pull
-requests. Committing your work to `main` is part of *finishing* the task, not a
+requests. Committing your work to `main` is part of _finishing_ the task, not a
 separate step to wait for permission on.
 
 Before committing, run `nix flake check`: it is the source of truth for "does
@@ -18,7 +18,7 @@ counts.
 
 One non-obvious gotcha: **Nix builds from the git tree, so it never sees
 untracked files.** `git add` any new file (a new `src/*.rs` module, an
-`examples/` entry) *before* running the check, or the build fails with a
+`examples/` entry) _before_ running the check, or the build fails with a
 confusing `E0583` ("file not found for module") and cascade noise — the module
 simply isn't in the source Nix copied.
 
@@ -39,13 +39,13 @@ convention, so keep new commits consistent with it.
 
 ## No backward compatibility in the code, ever
 
-npd has exactly one user, no releases, and no deployments. Therefore
+npb has exactly one user, no releases, and no deployments. Therefore
 (DESIGN.md §1):
 
-- Never write migration code into npd: no SQLite schema upgrades or `ALTER
-  TABLE`/purge steps for data an older version wrote, no readers or fallbacks
+- Never write migration code into npb: no SQLite schema upgrades or `ALTER
+TABLE`/purge steps for data an older version wrote, no readers or fallbacks
   for previous file formats, no comments like "may linger on old databases".
-- Change formats in place. If a change makes the existing `~/.cache/nix-npd`
+- Change formats in place. If a change makes the existing `~/.cache/nix-npb`
   wrong to read, migrate that store **in place, as part of making the change**
   — a one-off script or SQL run once against the live database, never shipped
   in the tree. Do **not** delete the store: its facts are re-derivable only by

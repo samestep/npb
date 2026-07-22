@@ -78,9 +78,9 @@ const VERB_W: usize = 8;
 /// Activity — nix 2.34 `derivation-building-goal.cc`), so the callback can
 /// attribute the outcome from output validity right away. (Nix keeps the build
 /// log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves it, so
-/// npd doesn't duplicate it.)
+/// npb doesn't duplicate it.)
 ///
-/// nix's exit status is deliberately *not* returned: npd records only outcomes
+/// nix's exit status is deliberately *not* returned: npb records only outcomes
 /// it can ground in store validity — a drv's own stop event (here) or, for the
 /// drvs that got no build activity, the post-batch output-validity check in
 /// [`build_targets_at`] — never an inference gated on the ambiguous exit code
@@ -91,7 +91,7 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
     nix.arg("build").args(&installables).args([
         "--keep-going",
         // No ./result* out-links: they'd litter the cwd (the user's nixpkgs
-        // checkout) and pin every built output as a GC root — npd keeps no
+        // checkout) and pin every built output as a GC root — npb keeps no
         // gcroots by design (DESIGN §4); the *observation* is the durable fact.
         "--no-link",
         "--log-format",
@@ -181,7 +181,7 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
         // pipe until its next stderr write EPIPEs it — potentially minutes.
         let _ = nix.kill();
     }
-    // Reap nix (and nom) regardless. A build failing is normal (npd records the
+    // Reap nix (and nom) regardless. A build failing is normal (npb records the
     // per-drv outcome above), so the exit status is intentionally discarded.
     let _ = nix.wait().context("waiting for nix build")?;
     if let Some(mut nom) = nom {
@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn drvs_to_materialize_matches_the_build_decision() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("npd.sqlite");
+        let db = dir.path().join("npb.sqlite");
         {
             let mut s = Store::open(&db).unwrap();
             // Built locally, and a recorded cache hit (the same plain `Built`
@@ -986,9 +986,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("npd-build-test-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("npb-build-test-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("npd.sqlite");
+        let db = dir.join("npb.sqlite");
 
         // Nonce'd names so nothing is valid in the store from a previous run.
         let expr = format!(
@@ -997,13 +997,13 @@ mod tests {
                    name = name; system = builtins.currentSystem;
                    builder = "/bin/sh"; args = ["-c" cmd];
                  }};
-                 fail = mk "npd-test-fail-{nonce}" "exit 1";
+                 fail = mk "npb-test-fail-{nonce}" "exit 1";
                  # Spin on shell builtins (~10s): the sandbox has no `sleep`
                  # (PATH is /path-not-set), and the delay must outlast the poll
                  # below that watches for the failure's row.
-                 slow = mk "npd-test-slow-{nonce}"
+                 slow = mk "npb-test-slow-{nonce}"
                    "i=0; while [ $i -lt 15000000 ]; do i=$((i+1)); done; echo ok > $out";
-                 blocked = mk "npd-test-blocked-{nonce}" "cat ${{fail}} > $out";
+                 blocked = mk "npb-test-blocked-{nonce}" "cat ${{fail}} > $out";
                in {{ inherit fail slow blocked; }}"#
         );
         let fail = instantiate(&expr, "fail");
@@ -1070,9 +1070,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("npd-depfail-test-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("npb-depfail-test-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("npd.sqlite");
+        let db = dir.join("npb.sqlite");
 
         // `top` depends on `dep`, which fails. Only `top` is a requested target.
         let expr = format!(
@@ -1081,8 +1081,8 @@ mod tests {
                    name = name; system = builtins.currentSystem;
                    builder = "/bin/sh";
                  }} // args);
-                 dep = mk "npd-dep-fail-{nonce}" {{ args = ["-c" "exit 1"]; }};
-                 top = mk "npd-top-{nonce}" {{ args = ["-c" "cat ${{dep}} > $out"]; }};
+                 dep = mk "npb-dep-fail-{nonce}" {{ args = ["-c" "exit 1"]; }};
+                 top = mk "npb-top-{nonce}" {{ args = ["-c" "cat ${{dep}} > $out"]; }};
                in {{ inherit dep top; }}"#
         );
         let dep = instantiate(&expr, "dep");
@@ -1120,9 +1120,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("npd-propagate-test-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("npb-propagate-test-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("npd.sqlite");
+        let db = dir.join("npb.sqlite");
 
         let expr = format!(
             r#"let
@@ -1130,8 +1130,8 @@ mod tests {
                    name = name; system = builtins.currentSystem;
                    builder = "/bin/sh";
                  }} // args);
-                 dep = mk "npd-pdep-fail-{nonce}" {{ args = ["-c" "exit 1"]; }};
-                 top = mk "npd-ptop-{nonce}" {{ args = ["-c" "cat ${{dep}} > $out"]; }};
+                 dep = mk "npb-pdep-fail-{nonce}" {{ args = ["-c" "exit 1"]; }};
+                 top = mk "npb-ptop-{nonce}" {{ args = ["-c" "cat ${{dep}} > $out"]; }};
                in {{ inherit dep top; }}"#
         );
         let dep = instantiate(&expr, "dep");
@@ -1195,7 +1195,7 @@ mod tests {
         .trim()
         .to_string();
         let invalid =
-            "/nix/store/00000000000000000000000000000000-npd-self-heal-absent".to_string();
+            "/nix/store/00000000000000000000000000000000-npb-self-heal-absent".to_string();
 
         let failed = |drv: &str, blocker: Vec<String>| Observation {
             drv_path: drv.into(),
@@ -1258,9 +1258,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("npd-heal-test-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("npb-heal-test-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("npd.sqlite");
+        let db = dir.join("npb.sqlite");
 
         // `dep` *succeeds* here (a flaky dependency that has since been fixed);
         // `top` depends on it. Only `top` is a requested target.
@@ -1270,11 +1270,11 @@ mod tests {
                    name = name; system = builtins.currentSystem;
                    builder = "/bin/sh";
                  }} // args);
-                 dep = mk "npd-heal-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
+                 dep = mk "npb-heal-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
                  # `: ${{dep}}` references dep (making it a build input) without
                  # any external command — the sandbox PATH is empty, so `cat` &c.
                  # aren't available; only shell builtins (`:`, `echo`, `>`) are.
-                 top = mk "npd-heal-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+                 top = mk "npb-heal-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
                in {{ inherit dep top; }}"#
         );
         let dep = instantiate(&expr, "dep");

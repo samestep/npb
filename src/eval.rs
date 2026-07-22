@@ -5,7 +5,7 @@
 //! eval (the file format and its diff live in [`crate::evalfile`]).
 //!
 //! The revision's source comes from `builtins.fetchGit` on its [`Rev::commit`],
-//! so Nix fetches and caches it in the store — npd manages no worktrees.
+//! so Nix fetches and caches it in the store — npb manages no worktrees.
 //! `nix-eval-jobs` output is parsed by streaming NDJSON straight off the child's
 //! stdout (never buffering the whole, meta-heavy output).
 
@@ -26,11 +26,11 @@ use crate::evalfile::{eval_path, write_eval};
 use crate::live;
 use crate::model::{AttrEval, Rev, TestJob};
 
-/// The one nixpkgs config every eval runs under. npd owns the config
+/// The one nixpkgs config every eval runs under. npb owns the config
 /// (DESIGN.md §6), which is what makes the eval cache key just
 /// `(tree, system)` — changing this line changes the attr→drv map, so cached
 /// evals must be discarded (a one-off cleanup of the eval files and `--tests`
-/// rows, not the whole `~/.cache/nix-npd` — the observation log keys on
+/// rows, not the whole `~/.cache/nix-npb` — the observation log keys on
 /// drvpaths and stays valid, §1). The allow-flags are
 /// on so meta-blocked packages still yield a drv + meta rather than throwing —
 /// we want their drvpath and the option to build them anyway.
@@ -63,7 +63,7 @@ struct RawJob {
     meta: Option<RawMeta>,
 }
 
-/// Fold `--meta`'s availability bits into npd's single "skipped" bit (its
+/// Fold `--meta`'s availability bits into npb's single "skipped" bit (its
 /// meta-blocked analogue of nixpkgs-review's "skipped"): marked broken *or*
 /// unsupported-on-this-system *or* insecure. A missing `meta` (an errored attr
 /// carries none) reads as not-skipped. Shared by the full-set walk and the
@@ -135,7 +135,7 @@ fn build_expr(repo: &Path, rev: &str, system: &str) -> String {
 
 /// Scrub the evaluator's environment of the variables nixpkgs is known to
 /// leak into derivations via `builtins.getEnv` (drbd bakes `$SHELL` into its
-/// Makefile patch), so cached evals don't depend on the shell npd was launched
+/// Makefile patch), so cached evals don't depend on the shell npb was launched
 /// from — `getEnv` then returns `""`, matching a hermetic evaluation.
 fn scrub_env(cmd: &mut Command) -> &mut Command {
     cmd.env_remove("SHELL");
@@ -177,7 +177,7 @@ fn stream_jobs<T>(
     // byte-identical either way — same drvs — so this doesn't affect the cached
     // evals. Kept alive until the child exits (nix-eval-jobs reads it at start).
     let mut expr_file = tempfile::Builder::new()
-        .prefix("npd-eval-")
+        .prefix("npb-eval-")
         .suffix(".nix")
         .tempfile()
         .context("creating nix-eval-jobs expr file")?;
@@ -195,7 +195,7 @@ fn stream_jobs<T>(
         "--max-memory-size",
         &max_s,
     ]);
-    // `--no-instantiate` evaluates without writing the `.drv` files. npd only
+    // `--no-instantiate` evaluates without writing the `.drv` files. npb only
     // needs the drvPath + outputs (both emitted regardless), so skipping the
     // writes is ~40% faster and avoids instantiating the ~114k attrs it never
     // builds. The small changed set is instantiated on demand before building
@@ -512,7 +512,7 @@ impl std::fmt::Display for EvalAborted {
 
 impl std::error::Error for EvalAborted {}
 
-/// The memory ceiling npd plans slots from: total physical RAM, further capped
+/// The memory ceiling npb plans slots from: total physical RAM, further capped
 /// by any cgroup limit the process runs under (a container, or a systemd
 /// `MemoryMax=` scope). Unlike *available* RAM (which the old planner used,
 /// and which lies — it moves while a minutes-long eval runs), both are
@@ -741,7 +741,7 @@ pub fn instantiate_prepare(
     Some(Instantiate { requests, nodes })
 }
 
-/// Write the changed set's `.drv` files to the store (DESIGN §6). npd's evals run
+/// Write the changed set's `.drv` files to the store (DESIGN §6). npb's evals run
 /// with `--no-instantiate` (drvPath + outputs only — no `.drv` writes for the
 /// ~114k attrs it never builds), so the drvs the build and the narinfo probe
 /// actually touch — the small changed set — are materialized here, one
@@ -1032,7 +1032,7 @@ pub fn eval_pairs(
     // eval nodes exist (below), so their `tests` can appear early while the cold
     // systems evaluate, yet still sort under `evaluate` (DESIGN §9).
     let mut cached: Vec<&str> = Vec::new();
-    // Dedupe on the eval key `(tree, system)`: `npd X X`, repeated --system, or
+    // Dedupe on the eval key `(tree, system)`: `npb X X`, repeated --system, or
     // two revisions sharing a tree would otherwise run the same eval twice
     // concurrently — harmless (the write is atomic) but 2× the work.
     let mut seen = std::collections::HashSet::new();

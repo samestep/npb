@@ -1,5 +1,5 @@
 //! Substituter (binary cache) facts: is a derivation's output already built and
-//! available from `cache.nixos.org`? This is the one remote source npd still
+//! available from `cache.nixos.org`? This is the one remote source npb still
 //! consults — a drv-precise, success-only signal (a narinfo either exists or it
 //! doesn't). Recorded as `Cache` observations so a later run needn't re-probe.
 

@@ -3,8 +3,8 @@
 -- integer enum-code mapping lives in `store.rs` (Rust, not DDL) — the values
 -- quoted in comments here are informative copies of that source of truth.
 --
--- No migration code in npd, ever (CLAUDE.md): change this schema freely and in
--- place, and carry the live `~/.cache/nix-npd` data forward with a one-off
+-- No migration code in npb, ever (CLAUDE.md): change this schema freely and in
+-- place, and carry the live `~/.cache/nix-npb` data forward with a one-off
 -- migration run as part of the change — never delete the store (its facts are
 -- expensive to re-derive), and never add a compat shim here.
 
@@ -79,9 +79,9 @@ CREATE TABLE IF NOT EXISTS test_drv (
 ) STRICT, WITHOUT ROWID;
 
 -- The patch-tree cache (DESIGN.md §8): maps a `--patch <A...B>` compare — its
--- anchor commit and sha-pinned expression — to the head *tree* npd reconstructed
+-- anchor commit and sha-pinned expression — to the head *tree* npb reconstructed
 -- by applying that compare's diff onto the anchor. It lets a *reproduction*
--- command's warm re-run skip the GitHub compare download: npd re-mints the
+-- command's warm re-run skip the GitHub compare download: npb re-mints the
 -- synthetic head over the cached tree (when its git objects survive) instead of
 -- re-fetching. `anchor` and `expr` come straight from the command, so this needs
 -- no knowledge of the original `--pr` run; the value is a tree hash, never the

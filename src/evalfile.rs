@@ -6,7 +6,7 @@
 //! overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file (drop
 //! old commits' evals) without vacuuming a monolithic DB. The format is one
 //! `attr\tdrv` line per attr, sorted by attr (empty drv = no derivation), plus a
-//! third field `!` on the few rows npd skips (meta-blocked:
+//! third field `!` on the few rows npb skips (meta-blocked:
 //! broken/unsupported/insecure), so the diff is a linear two-pointer merge.
 //!
 //! The drv column is stored *stripped*: `/nix/store/<h>-<n>.drv` is written as
@@ -14,9 +14,9 @@
 //! every line — ~15 B/line, ~15% off the file. Reconstruction (`restore_drv`) is
 //! one concat per changed row, so it costs nothing on the unchanged majority the
 //! merge skips. The format is strict — every drv is a `/nix/store` `.drv` or
-//! absent, matching the rest of npd (e.g. `cache::store_hash`) — with no fallback
+//! absent, matching the rest of npb (e.g. `cache::store_hash`) — with no fallback
 //! for other shapes: a format change ships with a one-off cleanup of the old
-//! eval files (just the files — never the whole `~/.cache/nix-npd`, §1) so
+//! eval files (just the files — never the whole `~/.cache/nix-npb`, §1) so
 //! they're regenerated rather than mis-parsed as if they were stripped.
 //!
 //! The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller at the
@@ -38,7 +38,7 @@ use crate::paths::cache_root;
 /// The cache file for one `(tree, system)` eval. Keyed on the git *tree*, not
 /// the commit: the eval depends only on the source content, so two commits with
 /// the same tree share one file (see [`crate::model::Rev`], DESIGN.md §6). The
-/// eval format carries no version tag: everything under `~/.cache/nix-npd` is
+/// eval format carries no version tag: everything under `~/.cache/nix-npb` is
 /// re-derivable, so a change to the file format, the eval config (`EVAL_CONFIG`
 /// in `eval.rs`), or *how* `nix-eval-jobs` is invoked is invalidated by deleting
 /// the cache, not by coexisting versions (no migration code — see CLAUDE.md).
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn touch_eval_advances_mtime() {
         use std::time::{Duration, SystemTime};
-        let dir = std::env::temp_dir().join(format!("npd-touch-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-touch-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("e.tsv.zst");
         fs::write(&path, b"contents").unwrap();
@@ -494,7 +494,7 @@ mod tests {
             ae("br", Some("/nix/store/b-br.drv"), true),
             ae("bad", None, false),
         ];
-        let dir = std::env::temp_dir().join(format!("npd-eval-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-eval-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("e.tsv");
         write_eval(&path, &attrs).unwrap();
@@ -596,7 +596,7 @@ mod tests {
             drv_path: drv.map(str::to_string),
             skipped,
         };
-        let dir = std::env::temp_dir().join(format!("npd-stream-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-stream-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let bpath = dir.join("b.tsv.zst");
         let hpath = dir.join("h.tsv.zst");

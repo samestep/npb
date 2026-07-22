@@ -1,4 +1,4 @@
-//! The SQLite fact store, in `~/.cache/nix-npd/npd.sqlite` (DESIGN.md §3–§4): the
+//! The SQLite fact store, in `~/.cache/nix-npb/npb.sqlite` (DESIGN.md §3–§4): the
 //! append-only observation log and the `--tests` eval cache. Full-set evals do
 //! *not* live here — they're standalone files (see `eval.rs`) — so what remains
 //! is only the small, index-worthy data an engine actually earns.
@@ -12,8 +12,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::evalfile::{restore_drv, strip_drv};
 use crate::model::{Observation, Outcome, TestJob};
 
-// No migration code in npd, ever (CLAUDE.md): change this schema freely and in
-// place, and carry the live `~/.cache/nix-npd` data forward with a one-off
+// No migration code in npb, ever (CLAUDE.md): change this schema freely and in
+// place, and carry the live `~/.cache/nix-npb` data forward with a one-off
 // migration run as part of the change — never delete the store (its facts are
 // expensive to re-derive), and never add a compat shim. The DDL lives in
 // its own `.sql` file (embedded at compile time) purely for editor syntax
@@ -24,7 +24,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 // The values are stable on-disk (the cache is re-derivable, so they need no
 // migration — but keeping them fixed keeps the `failing_drvs` query below and
 // any hand-inspection legible). Changing a variant's code is a format change:
-// migrate the live store in place as part of the change (CLAUDE.md); npd
+// migrate the live store in place as part of the change (CLAUDE.md); npb
 // itself never carries migration code.
 fn outcome_code(o: Outcome) -> i64 {
     match o {
@@ -79,7 +79,7 @@ impl Store {
         // WAL: readers don't block the writer; better for a durable local store.
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         // Two *writers* still conflict (even in WAL), and SQLite's default busy
-        // handler fails immediately — a second npd (or the report path's Cache
+        // handler fails immediately — a second npb (or the report path's Cache
         // writes) would abort a batch mid-run with SQLITE_BUSY. Waiting out the
         // other writer's millisecond-scale autocommit is always right here.
         conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -360,7 +360,7 @@ impl Store {
     // --- the patch-tree cache (DESIGN.md §8) --------------------------------
 
     /// The head tree a `--patch <A...B>` compare reconstructs onto `anchor`, if
-    /// npd has recorded it. `None` on a miss (the caller then downloads).
+    /// npb has recorded it. `None` on a miss (the caller then downloads).
     pub fn patch_tree(&self, anchor: &str, expr: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -389,9 +389,9 @@ mod tests {
 
     #[test]
     fn observations_append_and_load() {
-        let dir = std::env::temp_dir().join(format!("npd-obs-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-obs-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
 
         assert!(s.load_observations("/nix/store/x.drv").unwrap().is_empty());
 
@@ -429,9 +429,9 @@ mod tests {
 
     #[test]
     fn failing_drvs_are_failures_only() {
-        let dir = std::env::temp_dir().join(format!("npd-failing-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-failing-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
         let obs = |drv: &str, outcome| Observation {
             drv_path: drv.into(),
             outcome,
@@ -472,9 +472,9 @@ mod tests {
 
     #[test]
     fn test_cache_round_trip_and_negative() {
-        let dir = std::env::temp_dir().join(format!("npd-testcache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-testcache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
         let (c, sys) = ("treeA", "aarch64-linux");
         let pkgs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
@@ -547,9 +547,9 @@ mod tests {
 
     #[test]
     fn purge_tests_drops_one_key_only() {
-        let dir = std::env::temp_dir().join(format!("npd-purge-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-purge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
         let sys = "aarch64-linux";
         let pkgs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let job = |t: &str, drv: &str| TestJob {
@@ -608,9 +608,9 @@ mod tests {
 
     #[test]
     fn patch_tree_round_trip() {
-        let dir = std::env::temp_dir().join(format!("npd-patchtree-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("npb-patchtree-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
 
         // Miss before anything is recorded.
         assert_eq!(s.patch_tree("anchorsha", "a...b").unwrap(), None);

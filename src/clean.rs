@@ -1,6 +1,6 @@
 //! `--clean`: bound the on-disk cache by evicting eval files (DESIGN.md §4).
 //!
-//! The eval files (`<system>/<tree>.tsv.zst`) are ~98% of everything npd stores,
+//! The eval files (`<system>/<tree>.tsv.zst`) are ~98% of everything npb stores,
 //! and each is a standalone, re-derivable artifact keyed on `(tree, system)` — so
 //! the cache is bounded by dropping whole eval files, no monolith to vacuum. The
 //! last-*used* time is the file's mtime, which `eval::eval_pairs` re-stamps on
@@ -199,7 +199,7 @@ fn gather(root: &std::path::Path) -> Result<Vec<Eval>> {
     }
     for sysent in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
         let sysent = sysent?;
-        // System subdirs only — skip `npd.sqlite` and its sidecars.
+        // System subdirs only — skip `npb.sqlite` and its sidecars.
         if !sysent.file_type()?.is_dir() {
             continue;
         }

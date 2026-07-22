@@ -217,7 +217,7 @@ impl LiveHandle<'_> {
 }
 
 /// Run `body` while a refresher thread reflects `tree`'s progress on stderr,
-/// then freeze it — npd's single progress-display primitive for the whole
+/// then freeze it — npb's single progress-display primitive for the whole
 /// pre-build phase (resolution → probe). Two modes, keyed on [`colors_enabled`]
 /// (a TTY with color permitted) — so `NO_COLOR` takes the same plain path as a
 /// pipe, there being no monochrome-redraw middle ground:
@@ -299,7 +299,7 @@ pub fn human_elapsed(d: Duration) -> String {
 // --- the progress tree (DESIGN §6, §9) ---------------------------------------
 //
 // One persistent, append-only tree spanning eval → probe: every piece of
-// network or nontrivial work becomes a node the moment npd learns it needs it,
+// network or nontrivial work becomes a node the moment npb learns it needs it,
 // nothing is ever removed, and cached/no-op work never appears at all. Phases
 // (`enumerate`, `evaluate`, `tests`, `instantiate`, `probe`, and the network
 // `fetch`/`download`) are top-level nodes; under them a system level and the
@@ -861,7 +861,7 @@ pub fn plan_label_width(systems: &[String], pr: Option<u64>, compare: Option<&st
     w
 }
 
-/// Whether npd should emit color (SGR) on stderr — a TTY with `NO_COLOR` /
+/// Whether npb should emit color (SGR) on stderr — a TTY with `NO_COLOR` /
 /// `CLICOLOR` permitting it, per `console` (which also honors `CLICOLOR_FORCE`).
 /// The single source of truth for BOTH color and interactivity: color-off and
 /// plain (append-only, no cursor moves) are the same mode, so `NO_COLOR` behaves
@@ -871,7 +871,7 @@ pub fn colors_enabled() -> bool {
     console::colors_enabled_stderr()
 }
 
-/// npd's one visual separator, on stderr, between each of its phases (the live
+/// npb's one visual separator, on stderr, between each of its phases (the live
 /// tree, nom's build, the report): a blank line, a dim rule, a blank line — the
 /// spacing does the separating, the rule just marks it. Dimmed only on a
 /// terminal, so a redirected stderr gets plain hyphens.

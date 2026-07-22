@@ -220,9 +220,9 @@ pub fn render(
     // ``` fences and all) can't close the block early.
     let fence = "`".repeat(longest_backtick_run(command).max(2) + 1);
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
-    // `npd` links to the exact source tree this binary was built from (§8).
+    // `npb` links to the exact source tree this binary was built from (§8).
     let url = crate::URL;
-    let mut out = format!("## [`npd`]({url}) · {base} → {head}\n\n");
+    let mut out = format!("## [`npb`]({url}) · {base} → {head}\n\n");
     // The reproduction command and the glyph legend each fold away behind a
     // <details>, keeping the heading close to the per-system sections below.
     out.push_str("<details><summary>Expand this for a reproducible command.</summary>\n\n");
@@ -314,7 +314,7 @@ mod tests {
         // The block closes on its own oversized fence, then the <details> wrapping it.
         assert!(out.contains("\n````\n</details>\n"), "{out}");
         // The common (no-backtick) command still gets a plain triple fence.
-        let out = render("b", "h", "npd --base a --head b", &[]);
+        let out = render("b", "h", "npb --base a --head b", &[]);
         assert!(out.contains("\n```sh\n"), "{out}");
     }
 
@@ -424,7 +424,7 @@ mod tests {
         let out = render(
             "base",
             "head",
-            "npd --base base --head head",
+            "npb --base base --head head",
             &[("aarch64-linux".into(), entries)],
         );
 
@@ -432,7 +432,7 @@ mod tests {
         assert!(
             out.contains(
                 "<details><summary>Expand this for a reproducible command.</summary>\n\n\
-                 ```sh\nnpd --base base --head head\n```\n</details>\n"
+                 ```sh\nnpb --base base --head head\n```\n</details>\n"
             ),
             "{out}"
         );
