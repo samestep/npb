@@ -176,7 +176,7 @@ To set `--base` and `--head` from the current state of an open pull request:
 npb --pr 543008
 ```
 
-Note that this is an exception to `npb`'s usual rule that a re-run should be fully cached. If you run `npb` with a `--pr` argument, then that PR is updated, and you run the same `npb` command again, it will fetch the current state of the PR every time.
+Note that this is an exception to `npb`'s usual rule that a re-run should be fully cached. If you run `npb` with a `--pr` argument, and then that PR is updated, and then you run the same `npb` command again, it will fetch the current state of the PR every time.
 
 ### `--patch`
 
