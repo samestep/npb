@@ -29,23 +29,35 @@ you expect to just repeat).
   `nix-eval-jobs`; building goes through `nix build` + the existing remote
   builders. `npb` owns the **memory** and the **orchestration**, not the plumbing.
 
-### No backward compatibility in the code, ever
+### No breaking changes, and still no migration code
 
-`npb` has exactly one user, no releases, and no deployments. So there is no
-such thing as "legacy data" or an "old format" for the _code_ to support:
+`npb` is public, with users beyond its author. We are **committed to the
+formats and interfaces we have already chosen.** Two constraints now hold at
+once, and it is their _combination_ that dictates the discipline:
 
-- **Never write migration code into npb** — no schema upgrades, no purges of
-  rows an older version wrote, no readers for previous file formats, no "this
-  column may linger" tolerance. Change the current format in place.
-- If a format change would make the existing `~/.cache/nix-npb` wrong to read,
-  carry its data forward with a **one-off, in-place migration run as part of
-  making the change** (ad-hoc SQL/script against the live store, never shipped
-  in the tree). Do **not** delete the store: it is re-derivable only at the
-  cost of re-running the builds and probes behind every recorded fact, so the
-  accumulated history is worth preserving.
-- When a feature is removed, remove **all** of it in the same change: enum
-  variants, struct fields, table columns, parsing, and doc references. Dead
-  "maybe useful later" fields are cruft; re-add them when they're actually used.
+- We can no longer just change a format when it's convenient. `~/.cache/nix-npb`
+  (the SQLite schema, the eval-file format) lives on other people's machines,
+  holding history re-derivable only at the cost of re-running every build and
+  probe behind it, and a current `npb` must read a store an older `npb` wrote.
+- **And we still write no migration code** — no SQLite schema upgrades or `ALTER
+  TABLE`/purge steps for data an older version wrote, no readers or fallbacks
+  for previous file formats, no "this column may linger on old databases"
+  tolerance. That rule has not relaxed; what's gone is the escape hatch that
+  paired with it (changing the format in place, then hand-migrating the single
+  local store).
+
+With neither "just change it" nor "migrate it" available, the only move left is
+**restraint**: don't make a format change that would need a migration. Evolve a
+stored format only in ways an old and new `npb` both tolerate — a purely
+additive column or file — or leave it alone; never delete or invalidate the
+store to sidestep the problem. The CLI (flags, subcommands) and the report
+format are interfaces people script against and share: keep them stable and grow
+them additively, never breaking an existing flag, subcommand, or output shape.
+
+When a feature is removed, still remove **all** of its dead code in the same
+change — enum variants, struct fields, table columns, parsing, tests, doc
+references — but a removal that changes a stored format or a user-facing
+interface is itself a breaking change, and is held to the rule above.
 
 (Design _rationale_ for dropped approaches — e.g. why Hydra isn't consulted,
 §7 — is worth keeping in this document. Code paths for them are not.)
@@ -330,12 +342,13 @@ overlays, `config.allowAliases`, …). The trap is letting a user pass arbitrary
 Nix as config — that isn't cleanly hashable. `npb` avoids it by **defining the
 eval config itself**: one fixed allow-everything config (`EVAL_CONFIG` in
 `src/eval.rs`), so the key is just `(tree, system)`. There is no extra tag in
-the key: a change to the file format, _how_ `nix-eval-jobs` is invoked, or the
-config itself alters the stored map, and the remedy is to delete
-`~/.cache/nix-npb` and regenerate (§1), not to coexist with old files. (An
-earlier design threaded a named "profile" label through the key to leave room
-for several configs, and a later one an eval-version tag baked into each
-filename; with exactly one config ever defined and a delete-to-invalidate cache,
+the key: the file format, _how_ `nix-eval-jobs` is invoked, and the config
+itself all determine the stored map, so they are part of the compatibility
+surface we hold fixed (§1) — a change to any of them would invalidate every
+cached eval, and with neither a migration path nor the freedom to discard the
+store, they don't change. (An earlier design threaded a named "profile" label
+through the key to leave room for several configs, and a later one an
+eval-version tag baked into each filename; with exactly one config ever defined,
 both were redundant and dropped.)
 
 **Why the git _tree_, not the commit.** The eval is a pure function of the
@@ -986,8 +999,9 @@ Recorded for context:
   eval depends only on source content), so a rebase/amend or a committed
   working tree is a cache hit and the uncommitted working tree is reviewable
   (§6); not a can of worms because `npb` owns the fixed config. No version tag —
-  a format change ships with a one-off cleanup of the affected cache files
-  (§1; never by deleting the whole store — the observation log is preserved).
+  the format is held fixed rather than versioned, evolving only in ways an old
+  and new npb both tolerate (§1); never a delete-and-regenerate, never a
+  migration.
 - _Concurrency_ → not handled. One machine is the driver and keeps its store
   local; multiple drivers keep independent stores, exactly as the Nix store
   already works. The append-only design stays friendly to revisiting this.

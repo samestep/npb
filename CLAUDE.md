@@ -37,20 +37,30 @@ do **not** include links to Claude Code sessions (`Claude-Session:` lines or
 `claude.ai/code/…` URLs) — the whole history has been rewritten to this
 convention, so keep new commits consistent with it.
 
-## No backward compatibility in the code, ever
+## No breaking changes, and still no migration code
 
-npb has exactly one user, no releases, and no deployments. Therefore
-(DESIGN.md §1):
+npb is public now, so we're committed to the formats and interfaces we've
+already chosen (DESIGN.md §1). Two constraints hold at once — the second is the
+one that's easy to forget:
 
-- Never write migration code into npb: no SQLite schema upgrades or `ALTER
-TABLE`/purge steps for data an older version wrote, no readers or fallbacks
-  for previous file formats, no comments like "may linger on old databases".
-- Change formats in place. If a change makes the existing `~/.cache/nix-npb`
-  wrong to read, migrate that store **in place, as part of making the change**
-  — a one-off script or SQL run once against the live database, never shipped
-  in the tree. Do **not** delete the store: its facts are re-derivable only by
-  re-running the builds and probes behind them, so the accumulated history
-  must be carried forward.
-- When removing a feature, remove all of it in the same change — enum variants,
-  struct fields, table columns, parsing, tests, and doc references. Don't keep
-  dead fields around because they might be useful later.
+- We no longer just change a format when it's convenient. The on-disk store at
+  `~/.cache/nix-npb` (the SQLite schema, the eval-file format) lives on users'
+  machines and holds history re-derivable only by re-running the builds and
+  probes behind it, and a current npb must read a store an older npb wrote.
+- We still write **no migration code**: no SQLite schema upgrades or `ALTER
+  TABLE`/purge steps for data an older version wrote, no readers or fallbacks
+  for previous file formats, no "may linger on old databases" comments. That
+  rule hasn't relaxed — what's gone is the old escape hatch of changing the
+  format in place and hand-migrating the single local store.
+
+With neither "just change it" nor "migrate it" on the table, the move is
+**restraint**: don't make a format change that would need a migration. Evolve a
+stored format only additively (something an old and new npb both tolerate) or
+leave it alone; never delete or invalidate the store. Likewise the CLI (flags,
+subcommands) and the report format are interfaces users script against — keep
+them stable and grow them additively.
+
+When removing a feature, still remove all of its dead code in the same change
+(enum variants, struct fields, table columns, parsing, tests, doc references),
+but a removal that changes a stored format or a user-facing interface is a
+breaking change, held to the rule above.
