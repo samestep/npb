@@ -952,12 +952,12 @@ fn reveal_system_tests(
     let mut subtree: Vec<Arc<live::Node>> = Vec::new();
     subtree.push(tree.detached_node(sys.to_string(), 1, sys_index));
     for (rev, misses) in pending {
-        // A `NN%` shard-progress leaf (like `evaluate`): its count is streamed
-        // test jobs — a package yields one or more tests — so the package count
-        // isn't the count's denominator, but it *is* what the shard `%` tracks,
-        // which is exactly the "how many packages to look for tests for" figure
-        // we waited for the diff to learn.
-        let node = tree.detached_percent(rev.display.clone(), depth, sys_index);
+        // A bare-count leaf: its number is streamed test jobs — a package yields
+        // one or more tests — with no total known ahead of time. Not a shard
+        // `NN%` like `evaluate`: `tests` is one shard per key (DESIGN §6), so a
+        // `%` could only ever read 0/50/100 — exactly what the blue/yellow/green
+        // label already says — so we show just the count.
+        let node = tree.detached_counter(rev.display.clone(), depth, -1, sys_index);
         subtree.push(node.clone());
         acc.requests.push((rev, sys.to_string(), misses));
         acc.nodes.push(node);

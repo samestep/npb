@@ -699,8 +699,12 @@ off the slot count backs off concurrent heavy workers directly — real memory
 control — the starting count is budgeted at the heavy-worker footprint
 (`TESTS_SLOT_MEM_MB`, the worker restart cap, not the full-set eval's lighter
 per-slot figure) and honors `--eval-slots`, and each key's single worker recycles
-its heap per package at that cap. It gets
-the identical `done + running / total` display. Sharing the scheduler means its
+its heap per package at that cap. It gets the same live scheduler display as
+every other phase, minus the shard `NN%`: `tests` is one shard per key (above),
+so a shard-progress percentage could only ever read 0/50/100 — exactly what the
+blue → yellow → green label color already says — so a `tests` leaf shows just its
+bare streamed test-job count (a package yields one or more tests, so no total is
+known ahead of time). Sharing the scheduler means its
 concurrency logic is exercised — and kept correct — by **every** memory-heavy
 `nix-eval-jobs` fan-out (enumeration, the full-set eval, `--tests`, and
 instantiation, §6) rather than each re-implementing it. And every live readout in

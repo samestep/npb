@@ -524,20 +524,25 @@ impl Tree {
         Arc::new(Node::new(label.into(), depth, false, false, -1, sort_key))
     }
 
-    /// Build a `NN%` shard-progress leaf WITHOUT appending it (for
-    /// [`insert_sorted`]) — the `tests` counterpart of [`percent`], for the same
-    /// reason: its count is streamed test *jobs* (a package has one or more
-    /// tests), so the package count isn't its denominator, but it drives the
-    /// shard progress the `%` shows.
+    /// Build a counting leaf WITHOUT appending it (for [`insert_sorted`]) — the
+    /// `tests` counterpart of [`counter`]. `total` is `-1` for an unknown
+    /// denominator (`tests`: its count is streamed test *jobs* — a package has
+    /// one or more tests — with no total known ahead of time), so it shows just
+    /// the bare streamed count under a state color, no right-hand column. No
+    /// `NN%` like [`percent`]: `tests` is one shard per key (DESIGN §6), so a
+    /// shard-progress `%` could only ever read 0/50/100 — exactly what the
+    /// blue/yellow/green label already conveys.
     ///
+    /// [`counter`]: Tree::counter
     /// [`percent`]: Tree::percent
-    pub fn detached_percent(
+    pub fn detached_counter(
         &self,
         label: impl Into<String>,
         depth: usize,
+        total: i64,
         sort_key: i64,
     ) -> Arc<Node> {
-        Arc::new(Node::new(label.into(), depth, true, true, 0, sort_key))
+        Arc::new(Node::new(label.into(), depth, true, false, total, sort_key))
     }
 
     /// Splice a subtree in among `phase`'s children, keeping them ordered by
@@ -1027,7 +1032,7 @@ mod tests {
         let phase = tree.node("tests", 0);
         for (label, key) in [("sysB", 1), ("sysA", 0), ("sysC", 2)] {
             let sys = tree.detached_node(label, 1, key);
-            let leaf = tree.detached_percent("HEAD", 2, key);
+            let leaf = tree.detached_counter("HEAD", 2, -1, key);
             tree.insert_sorted(&phase, vec![sys, leaf]);
         }
         let lines = node_lines(&tree);
@@ -1049,8 +1054,8 @@ mod tests {
         // top-down), and nothing re-prints on a later call.
         let tree = Tree::new(0, false); // no color
         let phase = tree.node("evaluate", 0);
-        let a1 = tree.detached_percent("base", 2, 0);
-        let a2 = tree.detached_percent("head", 2, 0);
+        let a1 = tree.detached_counter("base", 2, -1, 0);
+        let a2 = tree.detached_counter("head", 2, -1, 0);
         tree.insert_sorted(
             &phase,
             vec![tree.detached_node("sysA", 1, 0), a1.clone(), a2.clone()],
