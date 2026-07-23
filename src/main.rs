@@ -6,18 +6,19 @@
 
 mod build;
 mod cache;
+mod cacheversion;
 mod clean;
 mod eval;
 mod evalfile;
 mod live;
 mod model;
 mod paths;
+mod prompt;
 mod report;
 mod store;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::process::Command as Proc;
 use std::sync::{Arc, Mutex};
@@ -25,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::model::{BuildPolicy, Rev};
+use crate::model::{BuildPolicy, Profile, Rev};
 
 /// The npb source tree this binary was built from, as a GitHub URL. `NPB_REV`
 /// is baked in by the Nix build (`self.rev`, or `main` for a dirty tree); it is
@@ -70,9 +71,15 @@ struct Cli {
     /// Don't add passthru.tests
     #[arg(long, conflicts_with = "clean")]
     no_tests: bool,
-    /// Try to build unsupported/broken/insecure packages
+    /// Enable allowUnsupportedSystem in Nixpkgs config
     #[arg(long, conflicts_with = "clean")]
-    no_skip: bool,
+    allow_unsupported: bool,
+    /// Enable allowBroken in Nixpkgs config
+    #[arg(long, conflicts_with = "clean")]
+    allow_broken: bool,
+    /// Set allowInsecurePredicate to true in Nixpkgs config
+    #[arg(long, conflicts_with = "clean")]
+    allow_insecure: bool,
     /// Try to build derivations that have failed before
     #[arg(long, conflicts_with = "clean")]
     retry: bool,
@@ -743,37 +750,22 @@ fn merge_source(repo: &std::path::Path, base: &Rev, head: &Rev) -> Result<Rev> {
 
 /// Flatten the per-system changed sets into build targets: every side's drv,
 /// deduped by drv. A drv path is system-specific (the system is part of its
-/// input hash), so deduping on the drv alone already keeps systems apart.
-///
-/// Several `(attr, side)` rows can share one drv with *different* meta-blocked
-/// bits — aliases where only some variants are marked (on darwin `ollama-cuda`
-/// shares `ollama`'s drv but is marked unsupported), or a meta-only unmarking
-/// (a PR deleting `meta.broken` leaves the drv identical on both sides with
-/// the bit flipped). The marking is a property of the *attr*, not the recipe,
-/// so the deduped target is skipped only if EVERY row wanting this drv is
-/// marked: any unmarked row is a legitimate request to build it.
+/// input hash), so deduping on the drv alone already keeps systems apart. A side
+/// that threw under the profile has no drv, so it contributes no target — the
+/// meta-blocked packages simply never appear here (DESIGN §6).
 fn assemble_targets(
     per_system_changed: &[(String, Vec<evalfile::ChangedAttr>)],
 ) -> Vec<build::Target> {
     let mut targets: Vec<build::Target> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for (_sys, changed) in per_system_changed {
         for c in changed {
-            let sides = [(&c.base_drv, c.base_skipped), (&c.head_drv, c.head_skipped)];
-            for (drv, skipped) in sides {
+            for drv in [&c.base_drv, &c.head_drv] {
                 let Some(drv) = drv else { continue };
-                match index.entry(drv.clone()) {
-                    Entry::Occupied(e) => {
-                        let t = &mut targets[*e.get()];
-                        t.skipped = t.skipped && skipped;
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(targets.len());
-                        targets.push(build::Target {
-                            drv_path: drv.clone(),
-                            skipped,
-                        });
-                    }
+                if seen.insert(drv.clone()) {
+                    targets.push(build::Target {
+                        drv_path: drv.clone(),
+                    });
                 }
             }
         }
@@ -813,14 +805,14 @@ enum HeadRepro {
 /// `--patch` (a GitHub compare download, or an embedded diff — see [`HeadRepro`]
 /// and the `--patch` flag), so npb does the git plumbing internally and the
 /// command calls no external binary. Only flags that change *what the report
-/// contains* are echoed (`--no-merge`, `--no-skip`, `--no-tests`, the systems);
-/// `--retry` and the eval-sizing knobs don't change the changeset, so they're
-/// omitted.
+/// contains* are echoed (`--no-merge`, the profile's `--allow-*`, `--no-tests`,
+/// the systems); `--retry` and the eval-sizing knobs don't change the changeset,
+/// so they're omitted.
 fn repro_command(
     base_sha: &str,
     head: &HeadRepro,
     no_merge: bool,
-    no_skip: bool,
+    profile: Profile,
     no_tests: bool,
     systems: &[String],
 ) -> String {
@@ -828,8 +820,14 @@ fn repro_command(
     if no_merge {
         flags.push_str(" --no-merge");
     }
-    if no_skip {
-        flags.push_str(" --no-skip");
+    if profile.broken {
+        flags.push_str(" --allow-broken");
+    }
+    if profile.unsupported {
+        flags.push_str(" --allow-unsupported");
+    }
+    if profile.insecure {
+        flags.push_str(" --allow-insecure");
     }
     if no_tests {
         flags.push_str(" --no-tests");
@@ -862,21 +860,24 @@ fn repro_command(
 /// folded in. Threaded from [`run_phases`] into the build and the report.
 type PerSystemChanged = Vec<(String, Vec<evalfile::ChangedAttr>)>;
 
-/// The not-skipped changed-package names for the `--tests` eval, per side. A
-/// package skipped on a side (meta-blocked) contributes no tests there — building
-/// a test drv builds the package — unless `--no-skip`. Sorted + deduped.
-fn changed_names(changed: &[evalfile::ChangedAttr], no_skip: bool) -> (Vec<String>, Vec<String>) {
-    let names_on = |not_skipped: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
+/// The changed-package names for the `--tests` eval, per side: only packages
+/// that evaluated to a drv on that side. A package that threw under the profile
+/// has no drv, so there's nothing to test for it there. Sorted + deduped.
+fn changed_names(changed: &[evalfile::ChangedAttr]) -> (Vec<String>, Vec<String>) {
+    let names_on = |has_drv: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
         let mut v: Vec<String> = changed
             .iter()
-            .filter(|c| no_skip || not_skipped(c))
+            .filter(|c| has_drv(c))
             .map(|c| c.attr.clone())
             .collect();
         v.sort();
         v.dedup();
         v
     };
-    (names_on(|c| !c.base_skipped), names_on(|c| !c.head_skipped))
+    (
+        names_on(|c| c.base_drv.is_some()),
+        names_on(|c| c.head_drv.is_some()),
+    )
 }
 
 /// Per-system state accumulated as each platform's eval lands (DESIGN §9). Its
@@ -910,11 +911,11 @@ fn reveal_system_tests(
     systems: &[String],
     base: &Rev,
     head: &Rev,
-    no_skip: bool,
+    profile: Profile,
     sys: &str,
     changed: &[evalfile::ChangedAttr],
 ) -> Result<()> {
-    let (base_names, head_names) = changed_names(changed, no_skip);
+    let (base_names, head_names) = changed_names(changed);
     let sys_index = systems.iter().position(|s| s == sys).unwrap() as i64;
 
     // Sides with cache misses, deduped by tree (a shared base/head tree is one
@@ -925,7 +926,9 @@ fn reveal_system_tests(
         if !seen_trees.insert(rev.tree.clone()) {
             continue;
         }
-        let cached = acc.store.tests_cached_pkgs(&rev.tree, sys, names)?;
+        let cached = acc
+            .store
+            .tests_cached_pkgs(&rev.tree, &profile.qualify(sys), names)?;
         let misses: Vec<String> = names
             .iter()
             .filter(|p| !cached.contains(*p))
@@ -978,9 +981,9 @@ fn run_phases(
     head: &Rev,
     systems: &[String],
     opts: eval::EvalOpts,
+    profile: Profile,
     policy: BuildPolicy,
     tests: bool,
-    no_skip: bool,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<(PerSystemChanged, Vec<build::Target>)> {
@@ -1010,15 +1013,18 @@ fn run_phases(
             return;
         }
         let result = (|| -> Result<()> {
-            if !evalfile::eval_path(&base.tree, sys)?.exists()
-                || !evalfile::eval_path(&head.tree, sys)?.exists()
+            // Storage addresses by the profile-qualified system key; the diff and
+            // display still group by the bare `sys`.
+            let key = profile.qualify(sys);
+            if !evalfile::eval_path(&base.tree, &key)?.exists()
+                || !evalfile::eval_path(&head.tree, &key)?.exists()
             {
                 return Ok(()); // not both sides yet
             }
             acc.processed.insert(sys.to_string());
-            let changed = evalfile::changed_set(&base.tree, &head.tree, sys)?;
+            let changed = evalfile::changed_set(&base.tree, &head.tree, &key)?;
             if tests {
-                reveal_system_tests(&mut acc, tree, systems, base, head, no_skip, sys, &changed)?;
+                reveal_system_tests(&mut acc, tree, systems, base, head, profile, sys, &changed)?;
             }
             acc.changed.insert(sys.to_string(), changed);
             Ok(())
@@ -1032,7 +1038,9 @@ fn run_phases(
     // when eval starts fire once `eval_two` has created the eval nodes (so `tests`
     // still sorts below `evaluate`). The sweep then catches the fully-cached run,
     // where `eval_two` creates no nodes and fires nothing at all.
-    eval::eval_two(repo, base, head, systems, opts, tree, handle, &process)?;
+    eval::eval_two(
+        repo, base, head, systems, opts, profile, tree, handle, &process,
+    )?;
     for sys in systems {
         process(sys);
     }
@@ -1054,22 +1062,24 @@ fn run_phases(
     // scheduler pass, cache the results, then fold each system's test rows into
     // its changed set — classified (regression / fixed / new / …) like any attr.
     if tests {
-        let jobs_per = eval::eval_tests(repo, &requests, nodes, opts, handle)?;
+        let jobs_per = eval::eval_tests(repo, &requests, nodes, opts, profile, handle)?;
         let mut acc = accum.lock().unwrap();
         for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
-            acc.store.cache_test_eval(&rev.tree, sys, misses, jobs)?;
+            acc.store
+                .cache_test_eval(&rev.tree, &profile.qualify(sys), misses, jobs)?;
         }
         for (sys, changed) in per_system_changed.iter_mut() {
-            let (base_names, head_names) = changed_names(changed, no_skip);
-            let bmap = acc.store.tests_drvs_for(&base.tree, sys, &base_names)?;
-            let hmap = acc.store.tests_drvs_for(&head.tree, sys, &head_names)?;
+            let (base_names, head_names) = changed_names(changed);
+            let key = profile.qualify(sys);
+            let bmap = acc.store.tests_drvs_for(&base.tree, &key, &base_names)?;
+            let hmap = acc.store.tests_drvs_for(&head.tree, &key, &head_names)?;
             changed.extend(evalfile::changed_tests(&bmap, &hmap));
         }
     }
 
-    // Build both sides of the changed set (skipping anything already known,
-    // substitutable, or meta-blocked) so the report has a real state for every
-    // row.
+    // Build both sides of the changed set (skipping anything already known or
+    // substitutable) so the report has a real state for every row. Meta-blocked
+    // packages threw during eval and carry no drv, so they aren't targets at all.
     let targets = assemble_targets(&per_system_changed);
 
     // The evals ran with --no-instantiate (no `.drv` writes for the ~114k attrs
@@ -1089,14 +1099,11 @@ fn run_phases(
         let mut base_attrs = Vec::new();
         let mut head_attrs = Vec::new();
         for c in changed {
-            let wants = |drv: &Option<String>, skipped: bool| {
-                drv.as_ref()
-                    .is_some_and(|d| (no_skip || !skipped) && need.contains(d))
-            };
-            if wants(&c.base_drv, c.base_skipped) {
+            let wants = |drv: &Option<String>| drv.as_ref().is_some_and(|d| need.contains(d));
+            if wants(&c.base_drv) {
                 base_attrs.push(c.attr.clone());
             }
-            if wants(&c.head_drv, c.head_skipped) {
+            if wants(&c.head_drv) {
                 head_attrs.push(c.attr.clone());
             }
         }
@@ -1110,150 +1117,15 @@ fn run_phases(
     // node sorts below instantiate's), then run in order: the probe's HTTP HEADs
     // read each drv's outputs from its `.drv`, so they must follow instantiation.
     let inst = eval::instantiate_prepare(tree, &inst);
-    let probe = build::probe_prepare(&targets, policy, tree)?;
+    let probe = build::probe_prepare(&targets, tree)?;
     if let Some(inst) = inst {
-        eval::instantiate_execute(repo, inst, handle)?;
+        eval::instantiate_execute(repo, inst, profile, handle)?;
     }
     if let Some(probe) = probe {
         build::probe_execute(probe)?;
     }
 
-    // Reclassify any *transitively* meta-blocked changed attr — one whose own
-    // `meta` is clean but which throws under nixpkgs' strict config because it
-    // forces a broken/unsupported/insecure dependency (DESIGN §6) — as skipped
-    // (⏩), and re-derive the build set so those aren't phantom-built.
-    mark_transitive_blocks(
-        repo,
-        &mut per_system_changed,
-        base,
-        head,
-        no_skip,
-        opts,
-        tree,
-        handle,
-    )?;
-    let targets = assemble_targets(&per_system_changed);
-
     Ok((per_system_changed, targets))
-}
-
-/// Fold each side's *transitively* meta-blocked changed attrs into its skipped
-/// bit (DESIGN §6). A changed package can carry no meta-block of its own yet
-/// still throw under nixpkgs' strict config because it forces a
-/// broken/unsupported/insecure *dependency* — e.g. a `matrix-synapse` plugin
-/// pulling in Linux-only `matrix-synapse-unwrapped` on `aarch64-darwin`.
-/// nixpkgs-review's `nix-env`/`evalAttrs` drop such a package; npb marks it
-/// skipped too, so the build drops it and the report shows ⏩ like the dependency.
-///
-/// The verdict is decided by asking the evaluator directly ([`eval::eval_availability`]),
-/// exactly nixpkgs-review's mechanism — npb's full eval runs allow-everything so a
-/// meta-blocked package still yields a drv (§6), which can't reveal a *dependency's*
-/// block, so a targeted strict eval of the changed set does. It's per-attr (the
-/// throw depends on which attr's `meta` is forced), so unlike the observation log
-/// there's no drv-keying subtlety.
-///
-/// The verdict is a pure function of `(tree, system, attr)`, so it is **cached**
-/// (`transitive_block`, DESIGN §6): a warm run reads every candidate with one
-/// SQLite query and evaluates nothing; only misses (a cold run, or an attr never
-/// checked) reach the strict eval, whose results are then cached. Candidates are
-/// **every** changed attr not *directly* meta-blocked — not gated on the build
-/// policy — because the skip must mask recorded facts like a direct meta-block
-/// (§5): a default run shows ⏩ even for an attr an earlier `--no-skip` run built,
-/// so the report never depends on build history. `--no-skip` itself builds
-/// meta-blocked packages by choice, so it disables the reclassification.
-#[allow(clippy::too_many_arguments)]
-fn mark_transitive_blocks(
-    repo: &std::path::Path,
-    per_system_changed: &mut PerSystemChanged,
-    base: &Rev,
-    head: &Rev,
-    no_skip: bool,
-    opts: eval::EvalOpts,
-    tree: &live::Tree,
-    handle: live::LiveHandle<'_>,
-) -> Result<()> {
-    if no_skip {
-        return Ok(());
-    }
-    let mut store = store::Store::open(&paths::db_path()?)?;
-
-    // For each side (base/head) of each system, the changed attrs not *directly*
-    // meta-blocked are the candidates whose transitive availability we must
-    // decide. Consult the cache; the misses become strict-eval requests. `blocked`
-    // accumulates the ⏩ verdicts, keyed by `(is_base, system)` so they map back to
-    // the right side (base.tree may equal head.tree, so `rev` alone won't do).
-    let mut blocked: HashMap<(bool, String), HashSet<String>> = HashMap::new();
-    let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
-    let mut req_side: Vec<(bool, String)> = Vec::new();
-    for (sys, changed) in per_system_changed.iter() {
-        for (rev, is_base) in [(base, true), (head, false)] {
-            let cands: Vec<String> = changed
-                .iter()
-                .filter_map(|c| {
-                    let (drv, skipped) = if is_base {
-                        (&c.base_drv, c.base_skipped)
-                    } else {
-                        (&c.head_drv, c.head_skipped)
-                    };
-                    drv.as_ref().filter(|_| !skipped).map(|_| c.attr.clone())
-                })
-                .collect();
-            if cands.is_empty() {
-                continue;
-            }
-            let cached = store.blocked_verdicts(&rev.tree, sys, &cands)?;
-            let hit = blocked.entry((is_base, sys.clone())).or_default();
-            let mut misses = Vec::new();
-            for a in cands {
-                match cached.get(&a) {
-                    Some(true) => {
-                        hit.insert(a);
-                    }
-                    Some(false) => {}
-                    None => misses.push(a),
-                }
-            }
-            if !misses.is_empty() {
-                requests.push((rev.clone(), sys.clone(), misses));
-                req_side.push((is_base, sys.clone()));
-            }
-        }
-    }
-
-    if !requests.is_empty() {
-        let errored = eval::eval_availability(repo, &requests, opts, tree, handle)?;
-        for (ri, err) in errored.into_iter().enumerate() {
-            let (rev, sys, misses) = &requests[ri];
-            let (is_base, _) = &req_side[ri];
-            // Cache every checked miss (blocked iff it threw), then record the blocked.
-            let verdicts: Vec<(String, bool)> = misses
-                .iter()
-                .map(|a| (a.clone(), err.contains(a)))
-                .collect();
-            store.cache_blocked(&rev.tree, sys, &verdicts)?;
-            blocked
-                .entry((*is_base, sys.clone()))
-                .or_default()
-                .extend(err);
-        }
-    }
-
-    if blocked.values().all(HashSet::is_empty) {
-        return Ok(());
-    }
-    for (sys, changed) in per_system_changed.iter_mut() {
-        let base_b = blocked.get(&(true, sys.clone()));
-        let head_b = blocked.get(&(false, sys.clone()));
-        for c in changed.iter_mut() {
-            if base_b.is_some_and(|s| s.contains(&c.attr)) {
-                c.base_skipped = true;
-            }
-            if head_b.is_some_and(|s| s.contains(&c.attr)) {
-                c.head_skipped = true;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The heading label for a `--patch A...B` compare head (DESIGN §8). When the
@@ -1273,6 +1145,12 @@ fn compare_head_display(anchor: &str, expr: &str) -> String {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Reconcile the on-disk cache with this npb's eval-cache format version before
+    // touching it — a format bump prompts a one-time wipe of the eval cache while
+    // keeping the observation log (DESIGN §1, §4). Runs ahead of `--clean` too, so
+    // an old cache is brought current whatever the invocation.
+    cacheversion::ensure_current()?;
+
     // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
     // files and exit, reviewing nothing. It conflicts with every review knob.
     if let Some(spec) = &cli.clean {
@@ -1281,11 +1159,13 @@ fn run(cli: Cli) -> Result<()> {
 
     // Tests run by default; --no-tests opts out.
     let tests = !cli.no_tests;
-    let no_skip = cli.no_skip;
-    let policy = BuildPolicy {
-        retry: cli.retry,
-        no_skip,
+    // The evaluation profile: strict by default; each --allow-* flag widens it.
+    let profile = Profile {
+        broken: cli.allow_broken,
+        unsupported: cli.allow_unsupported,
+        insecure: cli.allow_insecure,
     };
+    let policy = BuildPolicy { retry: cli.retry };
     let opts = eval::EvalOpts::default();
     let repo = resolve_repo(cli.path)?;
 
@@ -1392,7 +1272,7 @@ fn run(cli: Cli) -> Result<()> {
             ensure_distinct_trees(&base, &head)?;
 
             let (per_system_changed, targets) = run_phases(
-                &repo, &base, &head, &systems, opts, policy, tests, no_skip, &tree, handle,
+                &repo, &base, &head, &systems, opts, profile, policy, tests, &tree, handle,
             )?;
             Ok((
                 base,
@@ -1433,18 +1313,15 @@ fn run(cli: Cli) -> Result<()> {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
-            // The *effective* skipped bit: under --no-skip a meta-blocked
-            // package is built like any other and reports its real outcome;
-            // without the flag the marking masks any recorded fact (⏩), so a
-            // default run's report is stable regardless of what earlier
-            // --no-skip runs learned.
-            let mask = |skipped: bool| skipped && !policy.no_skip;
+            // A side with no drv either threw under the profile (⏩) or is absent
+            // (➖); the threw bit is a pure eval fact, so the report never depends
+            // on build history (DESIGN §5, §6).
             entries.push(report::Entry {
                 attr: c.attr.clone(),
                 base_drv: c.base_drv.clone(),
                 head_drv: c.head_drv.clone(),
-                base: report::side_state(&c.base_drv, mask(c.base_skipped), &base_obs),
-                head: report::side_state(&c.head_drv, mask(c.head_skipped), &head_obs),
+                base: report::side_state(&c.base_drv, c.base_threw, &base_obs),
+                head: report::side_state(&c.head_drv, c.head_threw, &head_obs),
             });
         }
         per_system.push((sys.clone(), entries));
@@ -1526,7 +1403,7 @@ fn run(cli: Cli) -> Result<()> {
         &base.commit,
         &head_repro,
         cli.no_merge,
-        no_skip,
+        profile,
         !tests,
         &systems,
     );
@@ -1549,48 +1426,49 @@ mod tests {
         attr: &str,
         base_drv: Option<&str>,
         head_drv: Option<&str>,
-        base_skipped: bool,
-        head_skipped: bool,
+        base_threw: bool,
+        head_threw: bool,
     ) -> evalfile::ChangedAttr {
         evalfile::ChangedAttr {
             attr: attr.into(),
             base_drv: base_drv.map(str::to_string),
             head_drv: head_drv.map(str::to_string),
-            base_skipped,
-            head_skipped,
+            base_threw,
+            head_threw,
         }
     }
 
     #[test]
-    fn assemble_targets_dedups_and_ands_skipped() {
+    fn assemble_targets_dedups_by_drv() {
         let changed = vec![
-            // A meta-only unmarking: same drv both sides, bit flips — the
-            // unmarked head side must win (build it).
-            ca("unmarked", Some("/d/flip"), Some("/d/flip"), true, false),
-            // Aliases sharing one head drv where only some variants are marked
-            // (the darwin ollama shape): one unmarked alias ⇒ build.
+            // Same drv on both sides ⇒ one target.
+            ca("same", Some("/d/x"), Some("/d/x"), false, false),
+            // Distinct base/head drvs ⇒ two targets.
+            ca("bumped", Some("/d/b0"), Some("/d/b1"), false, false),
+            // Aliases sharing one head drv ⇒ that drv appears once.
             ca("tool", Some("/d/t0"), Some("/d/shared"), false, false),
-            ca("tool-cuda", Some("/d/t1"), Some("/d/shared"), false, true),
-            // Every alias marked ⇒ stays skipped.
-            ca("allskipped-a", None, Some("/d/ab"), false, true),
-            ca("allskipped-b", None, Some("/d/ab"), false, true),
+            ca("tool-cuda", None, Some("/d/shared"), false, false),
+            // A side that threw carries no drv, so it contributes no target; the
+            // built head side still does.
+            ca("threw-base", None, Some("/d/only-head"), true, false),
         ];
         let targets = assemble_targets(&[("sys".into(), changed)]);
-
-        let skipped_of = |drv: &str| {
-            targets
-                .iter()
-                .find(|t| t.drv_path == drv)
-                .unwrap_or_else(|| panic!("no target for {drv}"))
-                .skipped
-        };
-        // Deduped: flip once, shared once, ab once, plus the two base drvs.
-        assert_eq!(targets.len(), 5);
-        assert!(!skipped_of("/d/flip"));
-        assert!(!skipped_of("/d/shared"));
-        assert!(skipped_of("/d/ab"));
-        assert!(!skipped_of("/d/t0"));
-        assert!(!skipped_of("/d/t1"));
+        let drvs: HashSet<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
+        // Each distinct drv once: x, b0, b1, t0, shared, only-head.
+        assert_eq!(targets.len(), 6);
+        assert_eq!(
+            drvs,
+            [
+                "/d/x",
+                "/d/b0",
+                "/d/b1",
+                "/d/t0",
+                "/d/shared",
+                "/d/only-head"
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
@@ -2004,38 +1882,49 @@ mod tests {
     fn assemble_targets_dedups_a_shared_drv_across_systems() {
         // A drv path is system-specific, so a real drv never recurs across
         // systems; but were the same drv to appear on both, it's one recipe and
-        // dedups to a single target with the meta-blocked bit AND-merged (any
-        // unmarked side is a legitimate request to build it).
-        let a = vec![ca("x", None, Some("/d/x"), false, true)];
+        // dedups to a single target.
+        let a = vec![ca("x", None, Some("/d/x"), false, false)];
         let b = vec![ca("x", None, Some("/d/x"), false, false)];
         let targets = assemble_targets(&[("sysA".into(), a), ("sysB".into(), b)]);
         assert_eq!(targets.len(), 1);
-        assert!(!targets[0].skipped);
+        assert_eq!(targets[0].drv_path, "/d/x");
     }
 
     #[test]
     fn repro_command_forms() {
+        let strict = Profile {
+            broken: false,
+            unsupported: false,
+            insecure: false,
+        };
+        let all = Profile {
+            broken: true,
+            unsupported: true,
+            insecure: true,
+        };
         // Committed head: plain --base/--head, only report-shaping flags echoed.
         let cmd = repro_command(
             "aaa",
             &HeadRepro::Commit("bbb".into()),
             false,
-            false,
+            strict,
             false,
             &["x86_64-linux".into()],
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -s x86_64-linux");
+        // Every widening flag echoed, in token order (u, b, i → the flags below).
         let cmd = repro_command(
             "aaa",
             &HeadRepro::Commit("bbb".into()),
             true,
-            true,
+            all,
             true,
             &["a".into(), "b".into()],
         );
         assert_eq!(
             cmd,
-            "npb --base aaa --head bbb --no-merge --no-skip --no-tests -s a -s b"
+            "npb --base aaa --head bbb --no-merge --allow-broken --allow-unsupported \
+             --allow-insecure --no-tests -s a -s b"
         );
 
         // Compare (PR): --patch is the compare expression, applied onto --head.
@@ -2046,7 +1935,7 @@ mod tests {
                 expr: "fork...m2".into(),
             },
             false,
-            false,
+            strict,
             false,
             &["sys".into()],
         );
@@ -2060,7 +1949,7 @@ mod tests {
                 diff: "--- a\n+++ b\n".into(),
             },
             false,
-            false,
+            strict,
             false,
             &["sys".into()],
         );

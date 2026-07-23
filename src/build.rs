@@ -32,12 +32,10 @@ use crate::model::{BuildPolicy, Decision, Observation, Outcome};
 use crate::store::Store;
 
 /// One derivation to consider building. Produced from either an explicit eval
-/// or a diff's changed set.
+/// or a diff's changed set. A meta-blocked package never becomes a target: it
+/// threw during eval under the profile, so it has no drv (DESIGN §6).
 pub struct Target {
     pub drv_path: String,
-    /// Meta-blocked (broken/unsupported/insecure) — skipped by the default
-    /// policy (`BuildPolicy::no_skip` overrides).
-    pub skipped: bool,
 }
 
 /// nix internal-json log event (only the fields we use).
@@ -452,7 +450,7 @@ fn drvs_to_materialize_at(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let dep_stale = stale.get(&t.drv_path).copied().unwrap_or(false);
-        let decision = policy.decide(obs, t.skipped, dep_stale);
+        let decision = policy.decide(obs, dep_stale);
         if decision == Decision::Build {
             need.insert(t.drv_path.clone());
         } else if decision == Decision::SkipFail && needs_selfheal_instantiate(obs) {
@@ -533,16 +531,14 @@ fn retain_absent(need: HashSet<String>, absent: &HashSet<String>) -> HashSet<Str
 /// (HTTP + `nix-store`) the failures every time. Probes run concurrently
 /// (`cache::in_cache_many`). Idempotent: recorded facts make the next call a
 /// no-op.
-fn probe_candidates(store: &Store, targets: &[Target], policy: BuildPolicy) -> Result<Vec<String>> {
+fn probe_candidates(store: &Store, targets: &[Target]) -> Result<Vec<String>> {
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;
     let has_fact = |drv: &str| obs_by_drv.get(drv).is_some_and(|obs| !obs.is_empty());
-    // A target the policy will skip anyway isn't worth an HTTP probe.
-    let will_skip = |t: &Target| t.skipped && !policy.no_skip;
     let mut to_probe: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
     for t in targets {
-        if !has_fact(&t.drv_path) && !will_skip(t) && seen.insert(t.drv_path.clone()) {
+        if !has_fact(&t.drv_path) && seen.insert(t.drv_path.clone()) {
             to_probe.push(t.drv_path.clone());
         }
     }
@@ -575,10 +571,9 @@ fn record_hits(
 fn probe_and_record(
     store: &mut Store,
     targets: &[Target],
-    policy: BuildPolicy,
     progress: &(dyn Fn(usize) + Sync),
 ) -> Result<()> {
-    let to_probe = probe_candidates(store, targets, policy)?;
+    let to_probe = probe_candidates(store, targets)?;
     if to_probe.is_empty() {
         return Ok(());
     }
@@ -602,13 +597,9 @@ pub struct Probe {
 /// drv's output paths from its `.drv`, so they run only after `instantiate` has
 /// written them. A fully-known build set adds no node and returns `None` — which
 /// is what keeps a re-run of an unchanged report near-instant (no HTTP).
-pub fn probe_prepare(
-    targets: &[Target],
-    policy: BuildPolicy,
-    tree: &live::Tree,
-) -> Result<Option<Probe>> {
+pub fn probe_prepare(targets: &[Target], tree: &live::Tree) -> Result<Option<Probe>> {
     let store = Store::open(&crate::paths::db_path()?)?;
-    let to_probe = probe_candidates(&store, targets, policy)?;
+    let to_probe = probe_candidates(&store, targets)?;
     if to_probe.is_empty() {
         return Ok(None);
     }
@@ -646,7 +637,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // SQLite round-trip — an all-known set costs a single query, no network.
     // (The tree's probe phase normally recorded these already, so this is a
     // no-op; it stays for the test path that drives the build directly.)
-    probe_and_record(&mut store, targets, policy, &|_| {})?;
+    probe_and_record(&mut store, targets, &|_| {})?;
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let mut obs_by_drv = store.load_observations_many(&drv_refs)?;
 
@@ -696,7 +687,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
-        let decision = policy.decide(observations, t.skipped, dep_stale(&t.drv_path));
+        let decision = policy.decide(observations, dep_stale(&t.drv_path));
         if decision == Decision::Build {
             to_build.push(i);
         }
@@ -889,10 +880,9 @@ mod tests {
     use std::fs;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    fn target(drv: &str, skipped: bool) -> Target {
+    fn target(drv: &str) -> Target {
         Target {
             drv_path: drv.into(),
-            skipped,
         }
     }
 
@@ -942,14 +932,13 @@ mod tests {
             })
             .unwrap();
         }
-        // "/nix/store/new.drv" has no fact; "/nix/store/skipped.drv" is meta-blocked.
+        // "/nix/store/new.drv" has no fact.
         let targets = vec![
-            target("/nix/store/built.drv", false),
-            target("/nix/store/cached.drv", false),
-            target("/nix/store/failed.drv", false),
-            target("/nix/store/failed-recorded.drv", false),
-            target("/nix/store/skipped.drv", true),
-            target("/nix/store/new.drv", false),
+            target("/nix/store/built.drv"),
+            target("/nix/store/cached.drv"),
+            target("/nix/store/failed.drv"),
+            target("/nix/store/failed-recorded.drv"),
+            target("/nix/store/new.drv"),
         ];
 
         // Default policy: the never-observed drv needs a `.drv` to build, and the
@@ -967,9 +956,9 @@ mod tests {
         // A set that's fully decided offline (successes plus a failure that
         // recorded its outputs) needs nothing — instantiation is skipped entirely.
         let cached_only = vec![
-            target("/nix/store/built.drv", false),
-            target("/nix/store/cached.drv", false),
-            target("/nix/store/failed-recorded.drv", false),
+            target("/nix/store/built.drv"),
+            target("/nix/store/cached.drv"),
+            target("/nix/store/failed-recorded.drv"),
         ];
         assert!(
             drvs_to_materialize_at(&db, &cached_only, BuildPolicy::default())
@@ -977,25 +966,12 @@ mod tests {
                 .is_empty()
         );
 
-        // The cache-bypass knobs re-open their targets: --retry a failure,
-        // --no-skip a meta-blocked one — each then needs its `.drv` again.
-        let retry = BuildPolicy {
-            retry: true,
-            ..Default::default()
-        };
+        // --retry re-opens a failed target, so it needs its `.drv` again.
+        let retry = BuildPolicy { retry: true };
         assert!(
             drvs_to_materialize_at(&db, &targets, retry)
                 .unwrap()
                 .contains("/nix/store/failed.drv")
-        );
-        let no_skip = BuildPolicy {
-            no_skip: true,
-            ..Default::default()
-        };
-        assert!(
-            drvs_to_materialize_at(&db, &targets, no_skip)
-                .unwrap()
-                .contains("/nix/store/skipped.drv")
         );
     }
 
@@ -1083,7 +1059,6 @@ mod tests {
             .into_iter()
             .map(|drv| Target {
                 drv_path: drv.clone(),
-                skipped: false,
             })
             .collect();
         let db2 = db.clone();
@@ -1159,7 +1134,6 @@ mod tests {
 
         let targets = [Target {
             drv_path: top.clone(),
-            skipped: false,
         }];
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
 
@@ -1220,7 +1194,6 @@ mod tests {
 
         let targets = [Target {
             drv_path: top.clone(),
-            skipped: false,
         }];
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
 
@@ -1292,7 +1265,7 @@ mod tests {
 
         let targets: Vec<Target> = ["/a.drv", "/b.drv", "/c.drv", "/d.drv"]
             .iter()
-            .map(|d| target(d, false))
+            .map(|d| target(d))
             .collect();
         let FailureRecheck {
             heal,
@@ -1370,7 +1343,6 @@ mod tests {
 
         let targets = [Target {
             drv_path: top.clone(),
-            skipped: false,
         }];
         // Default policy — no --retry. The stale block alone must re-open `top`.
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();

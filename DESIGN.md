@@ -59,6 +59,20 @@ change — enum variants, struct fields, table columns, parsing, tests, doc
 references — but a removal that changes a stored format or a user-facing
 interface is itself a breaking change, and is held to the rule above.
 
+**One sanctioned exception: the eval-cache format version.** The re-derivable
+_eval cache_ — the eval files and the eval-derived DB tables (`eval_key`,
+`test_pkg`, `test_drv`) — is versioned out of band by a `format-version` marker
+at the cache root (`src/cacheversion.rs`). When a change to that format can't be
+made additively — e.g. the 2026-07 switch to profile-qualified eval keys
+(`<token>/<system>`), which also dropped the eval-file meta bit and the
+`transitive_block` table (§6) — the version is bumped and the old eval cache is
+wiped once, after a Y/n prompt, on the next run. This is deliberately _not_ a
+general escape hatch: the **observation log stays sacrosanct** — drvpath-keyed
+and format-stable, it (and the `patch_tree` cache) is never touched by a bump,
+and it remains the one thing whose loss the no-migration rule exists to prevent.
+The move is still restraint everywhere else; the marker only sanctions
+discarding the cheap, re-derivable evaluations, never the expensive history.
+
 (Design _rationale_ for dropped approaches — e.g. why Hydra isn't consulted,
 §7 — is worth keeping in this document. Code paths for them are not.)
 
@@ -160,9 +174,10 @@ eval, so a file beats SQLite on every axis that matters here:
   file's mtime, which a cache **hit** re-stamps (`evalfile::touch_eval`, called
   from `eval::eval_pairs`) — a read alone wouldn't, so a shared base eval reused
   across many reviews would otherwise look as old as its first write. Evicting an
-  eval also purges that `(tree, system)`'s `--tests` and transitive-block rows
-  (below, §6), keyed on the same tree, so they all stay in lockstep. (The "millions of tiny files" failure
-  mode is about a file _per attr_; one file per _eval_ is ~two files per review.)
+  eval also purges that key's `--tests` rows (below, §6), keyed on the same
+  profile-qualified `(tree, system)`, so they stay in lockstep. (The "millions of
+  tiny files" failure mode is about a file _per attr_; one file per _eval_ is
+  ~two files per review.)
 
 Writes are atomic — a uniquely-named temp file in the same directory (rename is
 only atomic within one filesystem), then `rename` into place — so a crash can't
@@ -200,8 +215,9 @@ table, so its per-row bytes are what compound over time (~15% off it, measured).
 
 ```
 ~/.cache/nix-npb/
-  npb.sqlite                    # observation log (tiny) + --tests cache (the bulk) + transitive-block cache (§6) + patch-tree cache (§8)
-  <sys>/<tree>.tsv.zst          # attr→drv maps (zstd), one file per eval — evicted by --clean
+  format-version                # eval-cache format version (§1); a bump wipes the eval cache, keeps the log
+  npb.sqlite                    # observation log (tiny) + --tests cache (the bulk) + patch-tree cache (§8)
+  <token>/<sys>/<tree>.tsv.zst  # attr→drv maps (zstd), one file per (profile, system, eval) — evicted by --clean
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -215,26 +231,25 @@ Every local build appends an `Observation` (outcome, plus a failure's
 predicate** over that log (substituter presence is already _in_ the log — a
 probe hit is recorded as a plain `Built`, §7):
 
-- meta-blocked (broken/unsupported/insecure), `--no-skip` off → **skipped**
-  — never attempted, like nixpkgs-review; the report shows ⏩. (Checked first,
-  so `--retry` alone doesn't build it. The marking _masks_ recorded facts, in
-  the predicate and the report alike: a default run shows ⏩ even for a drv an
-  earlier `--no-skip` run built or failed, so default-run output never depends
-  on what past `--no-skip` runs happened to learn.)
 - never observed, or forced → **build**
 - a recorded success exists — built here, or substitutable (§7) → **skip (ok)**
 - only failures observed, `--retry` off → **skip (fail)**
 - otherwise → **build**
 
-("Skipped" is npb's name for what nixpkgs-review calls skipped — its
-meta-blocked subset; a _missing_ attr is a separate state, ➖ absent. The
-cache-skips above — `skip (ok)`/`skip (fail)` — are not that state: they still
-render as the real built/failed outcome.)
+Meta-blocked packages never reach this predicate: they **threw** during eval
+under the profile (§6), so they carry no drv and produce no build target at all.
+That's what makes the masking invariant trivial — the ⏩ ("threw") state is a
+pure eval fact, so it can't disagree with what an earlier build learned, because
+a threw side has no drv and thus no build history. (The cache-skips above —
+`skip (ok)`/`skip (fail)` — are not a state of their own: they still render as
+the real built/failed outcome. A _missing_ attr is ➖ absent; a _threw_ attr is
+⏩ — see §8.)
 
-So the cache-bypass knobs are just fields on the policy: `retry` (re-attempt a
-known failure) and `no_skip` (build the meta-blocked packages npb otherwise
-skips). See `BuildPolicy::decide` in `src/model.rs`. (Tests run by default;
-`--no-tests` opts out.)
+So the one cache-bypass knob is a field on the policy: `retry` (re-attempt a
+known failure). See `BuildPolicy::decide` in `src/model.rs`. (Tests run by
+default; `--no-tests` opts out. The evaluation profile — strict by default,
+widened by `--allow-broken`/`--allow-unsupported`/`--allow-insecure` — is §6's
+concern, not the build policy's.)
 
 **Staying instant when cached.** The driver loads every target's history in one
 SQLite query, and only _probes the cache_ for drvs the log has no fact about
@@ -334,75 +349,56 @@ nix substitutes from source instead.
 
 ## 6. Evaluation, its cache key, and the diff
 
-**The cache key is `(tree, system, config)`, and it is not a can of worms —
+**The cache key is `(tree, system, profile)`, and it is not a can of worms —
 provided `npb` owns the config.** What determines the attr→drv map is the
 nixpkgs source _tree_, the platform, and the nixpkgs _config_ (allowlists like
-`allowBroken`/`allowUnfree`/`allowUnsupportedSystem`, `permittedInsecurePackages`,
-overlays, `config.allowAliases`, …). The trap is letting a user pass arbitrary
-Nix as config — that isn't cleanly hashable. `npb` avoids it by **defining the
-eval config itself**: one fixed allow-everything config (`EVAL_CONFIG` in
-`src/eval.rs`), so the key is just `(tree, system)`. There is no extra tag in
-the key: the file format, _how_ `nix-eval-jobs` is invoked, and the config
-itself all determine the stored map, so they are part of the compatibility
-surface we hold fixed (§1) — a change to any of them would invalidate every
-cached eval, and with neither a migration path nor the freedom to discard the
-store, they don't change. (An earlier design threaded a named "profile" label
-through the key to leave room for several configs, and a later one an
-eval-version tag baked into each filename; with exactly one config ever defined,
-both were redundant and dropped.)
+`allowBroken`/`allowUnfree`/`allowUnsupportedSystem`, `allowInsecurePredicate`,
+…). The trap is letting a user pass arbitrary Nix as config — that isn't cleanly
+hashable. `npb` avoids it by **deriving the config from a bounded profile**:
+three boolean axes (`--allow-broken` / `--allow-unsupported` / `--allow-insecure`),
+with `allowUnfree` always on (matching nixpkgs-review). That's eight hashable
+values, not arbitrary Nix. On disk the profile is a three-character token — one
+position per axis, its letter when allowed else `-` (`---` strict, `ubi`
+allow-everything, `u-i` unsupported+insecure) — prefixed onto the system to form
+the eval key `<token>/<system>` (`model::Profile`). Drv hashes are
+_config-independent_ (the allow-flags gate **throws**, not derivation inputs),
+so the durable observation log (§3) is shared across every profile; only the
+cheap, re-derivable eval files multiply. The file format and _how_
+`nix-eval-jobs` is invoked are also part of the stored-format surface, versioned
+out of band by a `format-version` marker (§1, §4).
 
-**Transitively meta-blocked packages.** The allow-everything config has one
-consequence that must be undone at the changed-set level. `allowUnsupportedSystem`
-(and the other allow-flags) let a package that is _itself_ broken/unsupported/insecure
-evaluate to a drv — that's the point, so its `skipped` bit and drvpath are known
-(§5). But it _also_ lets a package that is clean in its own `meta` yet
-**depends** on a meta-blocked package evaluate: a `matrix-synapse` plugin (a
-plain `buildPythonPackage`, supported everywhere) lists Linux-only
-`matrix-synapse-unwrapped` in its `nativeCheckInputs`, so on `aarch64-darwin` the
-dependency is `unsupported` — under nixpkgs' _strict_ config (what
-`nix-env`/`nixpkgs-review`/ofborg use) forcing the plugin derivation would
-**throw**, and the plugin never enters their changed set. Under npb's config it
-evaluates fine, so npb would otherwise report a phantom Darwin rebuild for a
-package no real user of the platform can build.
+**Evaluate under the profile you mean; the throw is the signal.** `npb`
+evaluates under the profile the user asked for — **strict by default**. A
+package that is broken/unsupported/insecure under that profile simply **throws**
+during evaluation and falls out — and so does anything that _forces_ such a
+package, for free: a clean package with a meta-blocked _dependency_ throws too.
+Example: a `matrix-synapse` plugin (a plain `buildPythonPackage`, supported
+everywhere) lists Linux-only `matrix-synapse-unwrapped` in its
+`nativeCheckInputs`; on `aarch64-darwin` forcing the plugin forces that
+unsupported dependency, so under the strict default it throws and never enters
+the changed set — matching `nix-env`/`nixpkgs-review`/ofborg exactly, with no
+phantom Darwin rebuild. `--allow-unsupported` widens the profile and the plugin
+evaluates again.
 
-The meta-blocked bit does _not_ propagate through `meta` (the plugin's own meta
-is clean), and — unlike direct unsupportedness — it can't be read off the drv
-either: whether forcing the derivation throws depends on _which attr_ (hence
-which `meta`) it references, so it's genuinely per-attr. npb therefore recovers
-the verdict the only faithful way, the way nixpkgs-review does: **ask the
-evaluator.** After the diff, a targeted second eval (`eval::eval_availability`,
-driven from `main::run_phases`) re-imports nixpkgs over just the changed-set
-candidate attrs under a **strict** config (`STRICT_CONFIG`: `allowBroken` off,
-no `allowUnsupportedSystem`/`allowInsecure`, `allowUnfree` on to match), running
-through the same shard scheduler as `--tests`/instantiate (§6). An attr that
-**throws** there is broken/unsupported/insecure or forces such a dependency —
-exactly nixpkgs-review's `evalAttrs.nix` `tryEval` — and is marked **skipped**
-(⏩, the same masking a direct meta-block gets). This is precise and per-attr, no
-closure proxy: the evaluator's throw _is_ the answer, and it handles transitive
-_broken_ (a dep the allow-everything eval let build) as correctly as transitive
-unsupported.
+This is why there is **no `--meta`, no separate "skipped" bit, and no second
+availability eval**. An earlier design evaluated under a fixed allow-everything
+config (so meta-blocked packages still produced a drv), carried a per-attr meta
+bit via `nix-eval-jobs --meta`, and then reconstructed — with a targeted strict
+re-eval and a `transitive_block` cache — the very throws it had suppressed.
+Evaluating under the intended profile dissolves all of it: the evaluator does
+the work once, precisely, including the transitive case (whether forcing a
+derivation throws depends on _which attr's_ `meta` is forced — genuinely
+per-attr, which the evaluator gets right and a drv-closure proxy cannot). It's
+also ~15% faster (no `meta` attrset to force and emit per attr).
 
-The check is applied to **every** changed attr not directly meta-blocked, _not_
-only the ones the build policy would touch — because the skip must mask recorded
-facts exactly like a direct meta-block (§5): a default run shows ⏩ even for an
-attr an earlier `--no-skip` run built, so the report never depends on build
-history. Gating it on "would build" would let an attr with a recorded success
-slip through as ✅, the very dependence §5 forbids. `--no-skip` itself builds
-meta-blocked packages by choice, so it disables the reclassification.
-
-**The verdict is cached, because the strict eval is the one expensive step.** It
-is a pure function of `(tree, system, attr)` — the attr's meta and its
-dependencies' meta are all fixed by the tree — exactly like the full eval, so it
-lives in a `transitive_block` table keyed per-attr on the same interned
-`eval_key` as the `--tests` cache and evicted with it (§4). A warm run reads
-every candidate's verdict with one SQLite query and evaluates **nothing**; only
-_misses_ (a cold run, or an attr never checked) reach the strict eval, whose
-results are then cached. Without this a fully-cached re-run re-evaluated the
-changed set every time — a nixpkgs re-import is ~1 s, which defeated "instant
-when cached". The misses from every side and system are gathered into one
-scheduler run (one shard per `(commit, system)`, concurrency across them), each
-verdict cached under its own key; a candidate can only ever be its own key's
-attr, so no cross-key confusion is possible.
+**`nix-eval-jobs` distinguishes threw from absent, so the report keeps both.** A
+job line with an `error` and no `drvPath` is a **threw** attr; no line at all is
+a **missing** attr. The eval file records the first as a bare `attr` (no drv)
+and the second as no row, so the diff renders ⏩ (present, didn't evaluate under
+this profile) distinct from ➖ (absent) — see §8. A threw side is a pure eval
+fact, independent of build history, so §5's masking invariant holds trivially:
+the skip state can't disagree with what an earlier build learned, because there
+is no build history to disagree with.
 
 **Why the git _tree_, not the commit.** The eval is a pure function of the
 checked-out file content — a commit merely wraps a tree with parents, an author,
@@ -521,16 +517,18 @@ disagree on those drvs. npb scrubs the known offenders from the evaluator's
 environment (`SHELL` removed, so `getEnv` yields `""`, matching a hermetic
 eval) — the cache key stays honest without hashing the environment.
 
-`eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
-pure). Each attr carries its drv plus one meta bit — the **skipped** flag (meta
-broken/unsupported/insecure) — since meta is _not_ part of the drv hash, so the
-build policy and report can't recover it from the drv alone. The diff is a
-set-diff on `(attr, drv_path, skipped)` — a meta-only (un)marking changes no
-drv but is still a review event and gets a row. (An earlier design also
-sketched a _three-way_ diff against the merge base, classifying each changed
-attr as changed-by-this-side / by-the-other / by-both; it turned out not to
-matter in practice and was dropped. The merge base survives only as the
-`--no-merge` base of a report.)
+`eval(commit, system, profile)` → `{attr: AttrEval}` via `nix-eval-jobs`
+(cached, pure). Each attr carries its drv, or _no_ drv when it **threw** under
+the profile ("the throw is the signal", above); the eval file writes the latter
+as a bare `attr` line, distinct from a missing attr (no line at all). The diff
+is a set-diff on `(attr, drv_path)`, where a `None` drv means "threw": a package
+that starts or stops evaluating under the profile shows as a changed row
+(⏩↔build), while one that throws on _both_ sides is `None == None` — no change,
+not shown, so ⏩→⏩ never appears (§8). (An earlier design also sketched a
+_three-way_ diff against the merge base, classifying each changed attr as
+changed-by-this-side / by-the-other / by-both; it turned out not to matter in
+practice and was dropped. The merge base survives only as the `--no-merge` base
+of a report.)
 
 **Eval does not instantiate; the changed set is materialized before building.**
 `nix-eval-jobs` runs with `--no-instantiate`: npb needs only the `drvPath` and
@@ -707,23 +705,20 @@ reaches these — a package's `tests` is a plain attrset without
 runs a **targeted second eval** over just the changed set: a job tree `<pkg>.tests.<name>` whose per-package `tests` node is a thunk
 `nix-eval-jobs` forces in a worker (so a package that fails to evaluate errors
 only its own subtree, never the whole run — the same per-attr isolation the
-full-set walk relies on). Each test carries its own meta-blocked bit
-(broken/unsupported/insecure), and a test can be blocked while its package is not
-(an x86-only `nixosTest` hung off a cross-platform package is _unsupported_ on
-`aarch64-linux`), so the bit is tracked per test, never inferred from the
-package. Unlike a normal package, a `passthru.tests` entry is a
-`nixosTest`/`vm-test-run` derivation that bypasses `check-meta`'s `commonMeta`,
-so its raw `meta` has _no_ computed `unsupported`/`insecure` field for `--meta`
-to carry — so the tests expression **computes** the bit itself (platform support
-via `lib.meta.availableOn`, insecurity via `knownVulnerabilities`) and injects it
-into each test's meta (`build_tests_expr` in `src/eval.rs`). This lands the same
-verdict nixpkgs-review reaches by `tryEval`-ing the outPath under a strict
-config: a meta-blocked test is skipped and rendered ⏩, exactly as nixpkgs-review
-lists it under "marked broken and skipped". npb evaluates the tests on **both**
-sides and keeps a test only where its `(drv, skipped)` pair actually differs
-base→head, so the resulting rows classify (regression / fixed / new /
-skipped / …) exactly like any other attr — a delta view, a superset of
-#397's one-shot head-only build.
+full-set walk relies on). The tests eval runs under the run's profile like the
+full-set eval, so a meta-blocked _package_ throws when forced and drops all its
+tests for free. But a `passthru.tests` entry is usually a `nixosTest`/`vm-test-run`
+derivation that bypasses `check-meta`'s `commonMeta`, so evaluating it under the
+profile does _not_ make an unsupported/insecure _test_ throw. The tests
+expression reintroduces that check per test (platform support via
+`lib.meta.availableOn`, insecurity via `knownVulnerabilities`; `build_tests_expr`
+in `src/eval.rs`) and, when the profile disallows it, **drops** the test —
+replacing it with `{ }` so `nix-eval-jobs` emits no job and it renders ➖ absent
+rather than a phantom build. `--allow-unsupported`/`--allow-insecure` keep it.
+npb evaluates the tests on **both** sides and keeps a test only where its drv
+actually differs base→head, so the resulting rows classify (regression / fixed /
+new / …) exactly like any other attr — a delta view, a superset of #397's
+one-shot head-only build.
 
 This eval **is cached**, but _per package_ rather than as a whole-set file. A
 test's drv is a pure function of `(tree, system, package-attr)` — it
@@ -823,13 +818,10 @@ can change under us). Ground truth for anything a narinfo can't answer is a
 Markdown, grouped by the **delta** each attr underwent. Each side reduces to one
 of six states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependency
 failed — the transitive/cascade case, kept distinct from a direct failure), `⏩`
-skipped (meta-blocked: broken/unsupported/insecure — not attempted by default,
-like nixpkgs-review; the marking masks any recorded fact unless `--no-skip` is
-on, so a default report is stable across `--no-skip` history; a _missing_ attr
-is `➖` absent, not this), `➖`
-absent (no such attr on that side, or it no longer evaluates — a _known_ fact,
-never a `?`; in a delta view an eval breakage is visible as disappearance, so
-there is no separate eval-error state), `❔` unbuilt
+threw (present in the eval but broken/unsupported/insecure under the profile, or
+forcing such a dependency, so it didn't evaluate to a drv — §6; a pure eval fact,
+never dependent on build history, and distinct from `➖` absent), `➖`
+absent (no such attr on that side — a _known_ fact, never a `?`), `❔` unbuilt
 (has a drv but no fact yet — since builds always run, only the build phase's
 accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
@@ -871,10 +863,11 @@ on a **pinned base** and a head whose **tree** is pinned: because the eval is
 tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
 review byte-for-byte, and npb re-mints the merge itself — the command never names
 a synthetic (local-only) commit. Only report-shaping flags are echoed
-(`--no-merge`, `--no-skip`, `--no-tests`, and an explicit `-s` per system, since
-the default system is host-specific); `--retry` and the eval-sizing knobs don't
-change the changeset, so they're omitted. What varies is only how the _head_'s
-tree is recovered on another machine:
+(`--no-merge`, the profile's `--allow-broken`/`--allow-unsupported`/`--allow-insecure`,
+`--no-tests`, and an explicit `-s` per system, since the default system is
+host-specific); `--retry` and the eval-sizing knobs don't change the changeset,
+so they're omitted. What varies is only how the _head_'s tree is recovered on
+another machine:
 
 - a committed / explicit head is already a fetchable commit → `--head <sha>`;
 - otherwise (a `--pr` head or an uncommitted working tree) the head has no

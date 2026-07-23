@@ -1,10 +1,11 @@
 //! `--clean`: bound the on-disk cache by evicting eval files (DESIGN.md §4).
 //!
-//! The eval files (`<system>/<tree>.tsv.zst`) are ~98% of everything npb stores,
-//! and each is a standalone, re-derivable artifact keyed on `(tree, system)` — so
-//! the cache is bounded by dropping whole eval files, no monolith to vacuum. The
-//! last-*used* time is the file's mtime, which `eval::eval_pairs` re-stamps on
-//! every cache hit (`evalfile::touch_eval`) so a reused base eval stays warm.
+//! The eval files (`<token>/<system>/<tree>.tsv.zst`, the `<token>` naming the
+//! profile — DESIGN §4) are ~98% of everything npb stores, and each is a
+//! standalone, re-derivable artifact keyed on `(tree, profile-qualified system)`
+//! — so the cache is bounded by dropping whole eval files, no monolith to vacuum.
+//! The last-*used* time is the file's mtime, which `eval::eval_pairs` re-stamps
+//! on every cache hit (`evalfile::touch_eval`) so a reused base eval stays warm.
 //!
 //! Evicting an eval file also purges that `(tree, system)`'s `--tests` rows
 //! (`store::Store::purge_tests`): the tests cache is keyed on the same tree, so
@@ -20,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::paths::{cache_root, db_path};
+use crate::prompt::confirm;
 use crate::store::Store;
 
 /// What `--clean` reduces the eval cache to.
@@ -143,8 +145,10 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// One eval file on disk, with the `(tree, system)` it caches and the size/mtime
-/// eviction reads.
+/// One eval file on disk, with the `(tree, system)` it caches — where `system`
+/// is the profile-qualified key `<token>/<system>` (`model::Profile::qualify`),
+/// so it matches the `eval_key.system` value `purge_tests` deletes by — and the
+/// size/mtime eviction reads.
 struct Eval {
     path: PathBuf,
     tree: String,
@@ -191,39 +195,49 @@ fn victims(files: &[Eval], spec: &CleanSpec) -> Vec<usize> {
     }
 }
 
-/// Enumerate every `<system>/<tree>.tsv.zst` eval file under the cache root.
+/// Enumerate every `<token>/<system>/<tree>.tsv.zst` eval file under the cache
+/// root. The two directory levels are the profile token and the system; their
+/// join is the profile-qualified `Eval::system` key. The `npb.sqlite` file, its
+/// sidecars, and the `format-version` marker are all files at the root, so the
+/// `is_dir` guards skip them.
 fn gather(root: &std::path::Path) -> Result<Vec<Eval>> {
     let mut out = Vec::new();
     if !root.exists() {
         return Ok(out);
     }
-    for sysent in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
-        let sysent = sysent?;
-        // System subdirs only — skip `npb.sqlite` and its sidecars.
-        if !sysent.file_type()?.is_dir() {
+    for tokent in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let tokent = tokent?;
+        if !tokent.file_type()?.is_dir() {
             continue;
         }
-        let system = sysent.file_name().to_string_lossy().into_owned();
-        for f in fs::read_dir(sysent.path())? {
-            let f = f?;
-            let name = f.file_name().to_string_lossy().into_owned();
-            let Some(tree) = name.strip_suffix(".tsv.zst") else {
+        let token = tokent.file_name().to_string_lossy().into_owned();
+        for sysent in fs::read_dir(tokent.path())? {
+            let sysent = sysent?;
+            if !sysent.file_type()?.is_dir() {
                 continue;
-            };
-            let md = f.metadata()?;
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            out.push(Eval {
-                path: f.path(),
-                tree: tree.to_string(),
-                system: system.clone(),
-                size: md.len(),
-                mtime,
-            });
+            }
+            let system = format!("{token}/{}", sysent.file_name().to_string_lossy());
+            for f in fs::read_dir(sysent.path())? {
+                let f = f?;
+                let name = f.file_name().to_string_lossy().into_owned();
+                let Some(tree) = name.strip_suffix(".tsv.zst") else {
+                    continue;
+                };
+                let md = f.metadata()?;
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                out.push(Eval {
+                    path: f.path(),
+                    tree: tree.to_string(),
+                    system: system.clone(),
+                    size: md.len(),
+                    mtime,
+                });
+            }
         }
     }
     Ok(out)
@@ -260,7 +274,7 @@ pub fn clean(spec: &CleanSpec) -> Result<()> {
         human_bytes(total - freed),
     );
 
-    if !confirm("Delete these? [y/N] ")? {
+    if !confirm("Delete these? [y/N] ", false)? {
         println!("Aborted; nothing deleted.");
         return Ok(());
     }
@@ -282,27 +296,6 @@ pub fn clean(spec: &CleanSpec) -> Result<()> {
         human_bytes(total - freed),
     );
     Ok(())
-}
-
-/// Prompt on stderr and read a yes/no answer from stdin; `true` only on an
-/// explicit yes. A closed stdin (EOF, e.g. `--clean` in a pipe with no input)
-/// reads as *no* — the safe default for a destructive action.
-fn confirm(prompt: &str) -> Result<bool> {
-    use std::io::Write;
-    // Prompt on stderr so a redirected stdout keeps only the machine-ish summary.
-    eprint!("{prompt}");
-    std::io::stderr().flush()?;
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line)? == 0 {
-        eprintln!(); // move past the prompt line on EOF
-        return Ok(false);
-    }
-    Ok(is_yes(&line))
-}
-
-/// Whether a prompt answer means yes (`y`/`yes`, case- and space-insensitive).
-fn is_yes(line: &str) -> bool {
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// A byte count in binary units, e.g. `3.4 GiB` (exact `B` under 1 KiB).
@@ -437,15 +430,5 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
-    }
-
-    #[test]
-    fn confirmation_needs_an_explicit_yes() {
-        for ok in ["y", "Y", "yes", "YES", " yes \n", "y\n"] {
-            assert!(is_yes(ok), "{ok:?} should confirm");
-        }
-        for no in ["", "\n", "n", "no", "nope", "yep", "sure", "1"] {
-            assert!(!is_yes(no), "{no:?} should NOT confirm");
-        }
     }
 }

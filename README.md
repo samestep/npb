@@ -25,8 +25,8 @@ That command may not give you the same result if you run it yourself, but `npb`'
 > - ✅ = successfully built
 > - ❌ = failed to build
 > - 🚫 = dependency failed to build
-> - ⏩ = didn't try to build
 > - ❔ = couldn't try to build
+> - ⏩ = failed to evaluate
 > - ➖ = doesn't exist
 > </details>
 >
@@ -35,14 +35,6 @@ That command may not give you the same result if you run it yourself, but `npb`'
 > <details><summary>🚫 → 🚫 · 1 package</summary>
 >
 > - `lixStatic`
-> </details>
->
-> <details><summary>⏩ → ⏩ · 7 packages (4 unique)</summary>
->
-> - `haskellPackages.nix-cache-server`
-> - `lix.tests.installer` = `lixPackageSets.latest.lix.tests.installer` = `lixPackageSets.stable.lix.tests.installer` = `lixPackageSets.lix_2_95.lix.tests.installer`
-> - `lixPackageSets.git.lix.tests.installer`
-> - `lixPackageSets.lix_2_94.lix.tests.installer`
 > </details>
 >
 > <details><summary>✅ → ✅ · 76 packages (43 unique)</summary>
@@ -124,7 +116,9 @@ That command may not give you the same result if you run it yourself, but `npb`'
   - [`--patch`](#--patch)
   - [`--no-merge`](#--no-merge)
   - [`--no-tests`](#--no-tests)
-  - [`--no-skip`](#--no-skip)
+  - [`--allow-unsupported`](#--allow-unsupported)
+  - [`--allow-broken`](#--allow-broken)
+  - [`--allow-insecure`](#--allow-insecure)
   - [`--retry`](#--retry)
   - [`-s`, `--system`](#-s---system)
   - [`--clean`](#--clean)
@@ -255,12 +249,28 @@ By default, `npb` includes all `passthru.tests` for packages that changed betwee
 npb --no-tests
 ```
 
-### `--no-skip`
+### `--allow-unsupported`
 
-By default, `npb` skips packages that are marked as `unsupported`, `broken`, or `insecure`. To try to build those packages anyway:
+By default, `npb` sets [`allowUnsupportedSystem`](https://nixos.org/manual/nixpkgs/stable/#sec-allow-unsupported-system) to `false`. To set it to `true` instead:
 
 ```sh
-npb --no-skip
+npb --allow-unsupported
+```
+
+### `--allow-broken`
+
+By default, `npb` sets [`allowBroken`](https://nixos.org/manual/nixpkgs/stable/#sec-allow-broken) to `false`. To set it to `true` instead:
+
+```sh
+npb --allow-broken
+```
+
+### `--allow-insecure`
+
+By default, `npb` sets [`allowBroken`](hhttps://nixos.org/manual/nixpkgs/stable/#sec-allow-insecure) to a constant `false`. To set it to a constant `true` instead:
+
+```sh
+npb --allow-insecure
 ```
 
 ### `--retry`

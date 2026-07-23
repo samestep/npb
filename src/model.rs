@@ -57,28 +57,65 @@ pub struct Rev {
     pub display: String,
 }
 
-/// Result of evaluating one attribute on one platform at one commit.
+/// An evaluation profile: which meta-blocked packages nixpkgs' `check-meta` is
+/// told to *allow* rather than throw on (DESIGN §6). npb evaluates under the
+/// profile the user means — strict by default — so a broken/unsupported/insecure
+/// package (and anything that forces such a dependency) simply throws and falls
+/// out, precisely and for free, with no separate meta bit to reconstruct.
+/// `allowUnfree` is always on (matching nixpkgs-review), so it isn't a profile
+/// axis.
 ///
-/// Pure fact: fully determined by (tree, system, config). `drv_path` is
-/// `None` when evaluation itself errored (assertion, IFD failure, …) — distinct
-/// from a *build* failure, which is an [`Observation`]. The diff and report
-/// deliberately render an errored attr as *absent* (➖): in a delta view an
-/// eval breakage is visible as the attr disappearing, so no separate error
-/// state is needed. `skipped` folds
-/// `meta.broken` / `meta.unsupported` / `meta.insecure` into one bit — npb's
-/// analogue of nixpkgs-review's "skipped" (its meta-blocked subset; a *missing*
-/// attr is a separate state, ➖ absent): the profile's allow-flags let such a
-/// package evaluate to a drv anyway, but by default it is not *built* (like
-/// nixpkgs-review) — see [`BuildPolicy`]. This bit carries only a package's
-/// *own* meta-block; a *transitive* one (a clean package that only evaluates
-/// because a meta-blocked dependency was force-allowed) is detected separately,
-/// by a targeted strict re-eval of the changed set, and folded into the same
-/// skip (DESIGN §6).
+/// The profile is part of the eval cache key: it prefixes the on-disk system
+/// token ([`Profile::qualify`]) so evals under different profiles never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Profile {
+    pub broken: bool,
+    pub unsupported: bool,
+    pub insecure: bool,
+}
+
+impl Profile {
+    /// The canonical three-character profile token: one position each for
+    /// unsupported / broken / insecure, its letter when allowed else `-`. So
+    /// strict is `---`, allow-everything `ubi`, allow-unsupported-and-insecure
+    /// `u-i`. Deterministic and filesystem-safe — it names the profile's eval
+    /// subtree on disk.
+    pub fn token(&self) -> String {
+        let f = |on, c| if on { c } else { '-' };
+        format!(
+            "{}{}{}",
+            f(self.unsupported, 'u'),
+            f(self.broken, 'b'),
+            f(self.insecure, 'i'),
+        )
+    }
+
+    /// The storage key for an eval on `system` under this profile:
+    /// `<token>/<system>` (DESIGN §4). It is both the on-disk eval-file directory
+    /// (`evalfile::eval_path`) and the `eval_key.system` column value, so the
+    /// `--tests` cache keys on the profile for free — no schema change. The
+    /// embedded `/` makes it two path segments when joined onto the cache root.
+    pub fn qualify(&self, system: &str) -> String {
+        format!("{}/{}", self.token(), system)
+    }
+}
+
+/// Result of evaluating one attribute on one platform at one commit under a
+/// given [`Profile`].
+///
+/// Pure fact: fully determined by `(tree, system, profile)`. `drv_path` is
+/// `None` when the attr **threw** during evaluation — because it is
+/// broken/unsupported/insecure under the profile, or forces a dependency that
+/// is (nix-eval-jobs emits the attr with an `error` and no `drvPath`). The
+/// report renders such a side as ⏩ ("present, but doesn't evaluate under this
+/// profile"), distinct from a *missing* attr — no row at all — which is ➖
+/// absent. There is no separate meta bit: evaluating under the profile you mean
+/// makes the throw itself the signal (DESIGN §6), and a threw side is a pure
+/// eval fact, so it never depends on build history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrEval {
     pub attr: String,
     pub drv_path: Option<String>,
-    pub skipped: bool,
 }
 
 /// One resolved `passthru.tests` entry from a targeted test eval (`--tests`).
@@ -87,17 +124,13 @@ pub struct AttrEval {
 /// `pkg_attr` is the package the test hangs off (the attr-path's first element),
 /// `test_attr` is the full `<pkg>.tests.<name>` label, and `drv_path` is `None`
 /// when the test errored (no derivation) — the same shape the full-set walk gives
-/// an errored attr. `skipped` is the test's own meta-blocked bit (broken /
-/// unsupported-on-this-system / insecure) — a test can be unavailable even when
-/// its package is fine (e.g. an x86-only NixOS test hung off a cross-platform
-/// package on `aarch64-linux`), so it must be tracked per test, not inferred from
-/// the package.
+/// a threw attr. A test unavailable under the profile (unsupported/insecure) is
+/// dropped during eval (`build_tests_expr`), so it yields no job at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestJob {
     pub pkg_attr: String,
     pub test_attr: String,
     pub drv_path: Option<String>,
-    pub skipped: bool,
 }
 
 /// The result of a single build attempt/observation.
@@ -147,33 +180,27 @@ pub enum Decision {
     SkipOk,
     /// Only failures observed — don't waste time (unless `retry`).
     SkipFail,
-    /// Meta-blocked (broken/unsupported/insecure) and `no_skip` is off — not
-    /// attempted (like nixpkgs-review); the report shows it as ⏩ (nixpkgs-review's
-    /// "skipped").
-    Skipped,
 }
 
 /// Turns a derivation's observation history into an action.
 ///
 /// The ergonomic core (DESIGN.md §5): the cache-bypass knobs are just fields,
 /// and [`BuildPolicy::decide`] is a pure predicate over the append-only log
-/// plus whether the output is substitutable.
+/// plus whether the output is substitutable. Meta-blocked packages never reach
+/// the build policy at all — they threw during eval under the profile, so they
+/// have no drv and produce no build target (DESIGN §6).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BuildPolicy {
     /// Re-attempt a previously-failed drv (expect it might pass now).
     pub retry: bool,
-    /// Build the packages npb would otherwise skip for being meta-blocked
-    /// (broken/unsupported/insecure) — off by default, like nixpkgs-review.
-    pub no_skip: bool,
 }
 
 impl BuildPolicy {
     /// Decide whether to build `drv_path` given its observations.
     ///
-    /// `skipped` is the attr's meta-blocked (broken/unsupported/insecure) bit
-    /// from the eval. Substituter presence needs no input of its own: a cache
-    /// probe's hit is recorded as a plain `Built` observation (DESIGN.md §7),
-    /// so it decides here exactly like any other success.
+    /// Substituter presence needs no input of its own: a cache probe's hit is
+    /// recorded as a plain `Built` observation (DESIGN.md §7), so it decides
+    /// here exactly like any other success.
     ///
     /// `dep_block_stale` distinguishes the two kinds of recorded failure
     /// (DESIGN.md §5). A **direct** failure (the drv's own build failed) is
@@ -184,24 +211,11 @@ impl BuildPolicy {
     /// `dep_block_stale = true` so we re-attempt — no `--retry` needed. The
     /// caller computes staleness by re-checking the culprit's store validity
     /// (`Observation::blocker`), which the pure predicate can't do itself.
-    pub fn decide(
-        &self,
-        observations: &[Observation],
-        skipped: bool,
-        dep_block_stale: bool,
-    ) -> Decision {
+    pub fn decide(&self, observations: &[Observation], dep_block_stale: bool) -> Decision {
         let built = observations.iter().any(|o| o.outcome == Outcome::Built);
         let direct_failed = observations.iter().any(|o| o.outcome == Outcome::Failed);
         let dep_failed = observations.iter().any(|o| o.outcome == Outcome::DepFailed);
 
-        // Meta-blocked and not overridden: never attempt (checked before the
-        // other knobs, so e.g. `--retry` alone still doesn't build it), and
-        // never anything but `Skipped` — the marking masks recorded facts, so a
-        // default run behaves identically whatever earlier `--no-skip` runs
-        // learned (the report masks the same way; `report::side_state`).
-        if skipped && !self.no_skip {
-            return Decision::Skipped;
-        }
         // A trusted success short-circuits.
         if built {
             return Decision::SkipOk;
@@ -235,10 +249,7 @@ mod tests {
 
     #[test]
     fn never_observed_builds() {
-        assert_eq!(
-            BuildPolicy::default().decide(&[], false, false),
-            Decision::Build
-        );
+        assert_eq!(BuildPolicy::default().decide(&[], false), Decision::Build);
     }
 
     #[test]
@@ -246,33 +257,21 @@ mod tests {
         // A Built fact — a local build or a recorded cache hit, which the log
         // doesn't distinguish (DESIGN.md §7) — decides SkipOk.
         let o = [obs(Outcome::Built)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
-            Decision::SkipOk
-        );
+        assert_eq!(BuildPolicy::default().decide(&o, false), Decision::SkipOk);
     }
 
     #[test]
     fn only_failures_skip_unless_retry() {
         let o = [obs(Outcome::Failed)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
-            Decision::SkipFail
-        );
-        let p = BuildPolicy {
-            retry: true,
-            ..Default::default()
-        };
-        assert_eq!(p.decide(&o, false, false), Decision::Build);
+        assert_eq!(BuildPolicy::default().decide(&o, false), Decision::SkipFail);
+        let p = BuildPolicy { retry: true };
+        assert_eq!(p.decide(&o, false), Decision::Build);
     }
 
     #[test]
     fn flaky_success_wins() {
         let o = [obs(Outcome::Failed), obs(Outcome::Built)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
-            Decision::SkipOk
-        );
+        assert_eq!(BuildPolicy::default().decide(&o, false), Decision::SkipOk);
     }
 
     #[test]
@@ -281,14 +280,8 @@ mod tests {
         // culprit still fails, but re-attempted the moment the block goes stale —
         // no --retry needed. This is the self-healing property (DESIGN.md §5).
         let o = [obs(Outcome::DepFailed)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, false),
-            Decision::SkipFail
-        );
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, true),
-            Decision::Build
-        );
+        assert_eq!(BuildPolicy::default().decide(&o, false), Decision::SkipFail);
+        assert_eq!(BuildPolicy::default().decide(&o, true), Decision::Build);
     }
 
     #[test]
@@ -297,43 +290,35 @@ mod tests {
         // stale sibling dep-block must not resurrect a real direct failure.
         // --retry is the only escape.
         let o = [obs(Outcome::Failed), obs(Outcome::DepFailed)];
-        assert_eq!(
-            BuildPolicy::default().decide(&o, false, true),
-            Decision::SkipFail
-        );
-        let retry = BuildPolicy {
-            retry: true,
-            ..Default::default()
-        };
-        assert_eq!(retry.decide(&o, false, true), Decision::Build);
+        assert_eq!(BuildPolicy::default().decide(&o, true), Decision::SkipFail);
+        let retry = BuildPolicy { retry: true };
+        assert_eq!(retry.decide(&o, true), Decision::Build);
     }
 
     #[test]
-    fn skipped_stays_skipped_unless_no_skip() {
-        // Meta-blocked: never attempted by default, not even under --retry.
-        let p = BuildPolicy::default();
-        assert_eq!(p.decide(&[], true, false), Decision::Skipped);
-        let retry = BuildPolicy {
-            retry: true,
-            ..Default::default()
+    fn profile_token_and_qualify() {
+        // The three-character token: unsupported / broken / insecure, letter when
+        // allowed else `-`. Strict is all dashes; allow-everything spells `ubi`.
+        let strict = Profile {
+            broken: false,
+            unsupported: false,
+            insecure: false,
         };
-        assert_eq!(
-            retry.decide(&[obs(Outcome::Failed)], true, false),
-            Decision::Skipped
-        );
-
-        // The marking masks recorded facts: even a drv an earlier --no-skip run
-        // built (or found in the cache) stays Skipped on a default run, so its
-        // behavior doesn't depend on what past runs happened to learn.
-        let o = [obs(Outcome::Built)];
-        assert_eq!(p.decide(&o, true, false), Decision::Skipped);
-
-        // --no-skip restores the normal policy.
-        let ns = BuildPolicy {
-            no_skip: true,
-            ..Default::default()
+        let all = Profile {
+            broken: true,
+            unsupported: true,
+            insecure: true,
         };
-        assert_eq!(ns.decide(&[], true, false), Decision::Build);
-        assert_eq!(ns.decide(&o, true, false), Decision::SkipOk);
+        let ui = Profile {
+            broken: false,
+            unsupported: true,
+            insecure: true,
+        };
+        assert_eq!(strict.token(), "---");
+        assert_eq!(all.token(), "ubi");
+        assert_eq!(ui.token(), "u-i");
+        // The storage key prefixes the system with the token.
+        assert_eq!(strict.qualify("x86_64-linux"), "---/x86_64-linux");
+        assert_eq!(all.qualify("aarch64-darwin"), "ubi/aarch64-darwin");
     }
 }

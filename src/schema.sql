@@ -45,7 +45,10 @@ CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 -- of distinct keys back thousands of test rows, so this is ~25% off the whole
 -- `--tests` cache on real data (the biggest lever; DESIGN.md §4). It's also the
 -- eviction unit: dropping an eval file (`--clean`) purges its key here, cascading
--- to the rows below.
+-- to the rows below. The `system` value is the **profile-qualified** key
+-- `<token>/<system>` (`model::Profile::qualify`), so the same tree/system under
+-- different profiles interns distinct keys — the profile rides in for free, with
+-- no extra column (DESIGN.md §4, §6).
 CREATE TABLE IF NOT EXISTS eval_key (
     id     INTEGER PRIMARY KEY,
     tree   TEXT NOT NULL,
@@ -58,11 +61,8 @@ CREATE TABLE IF NOT EXISTS eval_key (
 -- each resolved `<pkg>.tests.<name>` drv (a package may contribute zero rows).
 -- Drv paths are stored *stripped* of their constant `/nix/store/` prefix and
 -- `.drv` suffix, exactly like the eval files (`evalfile::strip_drv`) — restored
--- on read.
--- `skipped` is the test's own meta-blocked bit — 0 = buildable, 1 = meta-skipped
--- (a Rust bool in `TestJob::skipped`; a test can be unsupported on this system
--- even when its package builds — an x86-only NixOS test on aarch64) — so it's
--- stored per test, not inferred from the package.
+-- on read. A test unavailable under the run's profile (unsupported/insecure) is
+-- dropped during eval, so it simply has no `test_drv` row.
 CREATE TABLE IF NOT EXISTS test_pkg (
     key_id   INTEGER NOT NULL REFERENCES eval_key (id),
     pkg_attr TEXT NOT NULL,
@@ -78,29 +78,7 @@ CREATE TABLE IF NOT EXISTS test_drv (
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
-    skipped   INTEGER NOT NULL,
     PRIMARY KEY (key_id, pkg_attr, test_attr)
-) STRICT, WITHOUT ROWID;
-
--- The transitive-meta-block cache (DESIGN.md §6). Whether a changed attr is
--- *transitively* meta-blocked — clean in its own `meta` yet throwing under
--- nixpkgs' strict config because it (or a dependency it forces) is
--- broken/unsupported/insecure — is a pure function of `(tree, system, attr)`,
--- decided by a targeted strict eval of the changed set (`eval::eval_availability`,
--- npb's analogue of nixpkgs-review's `evalAttrs.nix`). That eval re-imports
--- nixpkgs (seconds), so the per-attr verdict is cached here and read on later
--- runs instead of re-evaluating, keeping warm runs instant (DESIGN.md §4, §6).
--- Keyed on the same interned `eval_key` as the `--tests` cache and evicted with
--- it. It keys on `attr`, not a drv, because the verdict is genuinely per-attr:
--- the throw depends on which attr (hence which `meta`) is forced, so two attrs
--- sharing a drv can differ. `blocked` is 0 = builds, 1 = throws (skipped, ⏩). A
--- row exists only for an attr actually checked (evaluated); an unchecked attr is
--- simply absent and recomputed on a later run.
-CREATE TABLE IF NOT EXISTS transitive_block (
-    key_id  INTEGER NOT NULL REFERENCES eval_key (id),
-    attr    TEXT    NOT NULL,
-    blocked INTEGER NOT NULL,
-    PRIMARY KEY (key_id, attr)
 ) STRICT, WITHOUT ROWID;
 
 -- The patch-tree cache (DESIGN.md §8): maps a `--patch <A...B>` compare — its

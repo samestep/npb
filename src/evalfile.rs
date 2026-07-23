@@ -1,13 +1,16 @@
 //! The eval cache files and their diff (DESIGN.md §4, §6).
 //!
-//! Each eval is a standalone file under `<cache>/<system>/`, not SQLite rows. It's a
-//! bulk, write-once, read-as-a-whole artifact — the only thing we ever do with it
-//! is diff two of them — so a flat file is both smaller (no per-row / index
-//! overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file (drop
-//! old commits' evals) without vacuuming a monolithic DB. The format is one
-//! `attr\tdrv` line per attr, sorted by attr (empty drv = no derivation), plus a
-//! third field `!` on the few rows npb skips (meta-blocked:
-//! broken/unsupported/insecure), so the diff is a linear two-pointer merge.
+//! Each eval is a standalone file under `<cache>/<token>/<system>/`, not SQLite
+//! rows (the `<token>` names the [`Profile`] it was evaluated under — DESIGN §4).
+//! It's a bulk, write-once, read-as-a-whole artifact — the only thing we ever do
+//! with it is diff two of them — so a flat file is both smaller (no per-row /
+//! index overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file
+//! (drop old commits' evals) without vacuuming a monolithic DB. The format is one
+//! `attr\tdrv` line per attr, sorted by attr; an attr that **threw** during eval
+//! (broken/unsupported/insecure under the profile, or forcing such a dependency)
+//! has no derivation and is written as a bare `attr` with no tab — kept, distinct
+//! from a *missing* attr, which has no line at all. So the diff is a linear
+//! two-pointer merge, and a threw side can still render ⏩ against an absent one.
 //!
 //! The drv column is stored *stripped*: `/nix/store/<h>-<n>.drv` is written as
 //! just `<h>-<n>` (see `strip_drv`), since that prefix/suffix is constant across
@@ -35,13 +38,15 @@ use anyhow::{Context, Result};
 use crate::model::AttrEval;
 use crate::paths::cache_root;
 
-/// The cache file for one `(tree, system)` eval. Keyed on the git *tree*, not
-/// the commit: the eval depends only on the source content, so two commits with
-/// the same tree share one file (see [`crate::model::Rev`], DESIGN.md §6). The
-/// eval format carries no version tag: everything under `~/.cache/nix-npb` is
-/// re-derivable, so a change to the file format, the eval config (`EVAL_CONFIG`
-/// in `eval.rs`), or *how* `nix-eval-jobs` is invoked is invalidated by deleting
-/// the cache, not by coexisting versions (no migration code — see CLAUDE.md).
+/// The cache file for one eval, keyed on the git *tree* (not the commit: the
+/// eval depends only on the source content, so two commits with the same tree
+/// share one file — see [`crate::model::Rev`], DESIGN.md §6). `system` here is
+/// the **profile-qualified** system key (`<token>/<system>`, from
+/// [`crate::model::Profile::qualify`]), whose embedded `/` nests the file under
+/// its profile's subtree: `<cache>/<token>/<system>/<tree>.tsv.zst`. The eval
+/// files carry a format version out of band (a `format-version` file at the
+/// cache root, `crate::cacheversion`); a bump wipes them wholesale rather than
+/// coexisting or migrating (CLAUDE.md).
 pub fn eval_path(tree: &str, system: &str) -> Result<PathBuf> {
     Ok(cache_root()?.join(system).join(format!("{tree}.tsv.zst")))
 }
@@ -52,25 +57,19 @@ pub fn eval_path(tree: &str, system: &str) -> Result<PathBuf> {
 /// place. A crash can never leave a truncated file that would poison the cache,
 /// and concurrent writers of the same key can't tread on each other's temp.
 pub fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
-    let mut rows: Vec<(&str, &str, bool)> = attrs
+    let mut rows: Vec<(&str, Option<&str>)> = attrs
         .iter()
-        .map(|a| {
-            (
-                a.attr.as_str(),
-                a.drv_path.as_deref().map(strip_drv).unwrap_or(""),
-                a.skipped,
-            )
-        })
+        .map(|a| (a.attr.as_str(), a.drv_path.as_deref().map(strip_drv)))
         .collect();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut buf = String::with_capacity(rows.len() * 96);
-    for (attr, drv, skipped) in rows {
+    for (attr, drv) in rows {
         buf.push_str(attr);
-        buf.push('\t');
-        buf.push_str(drv);
-        // A third field only on the (few) skipped (meta-blocked) rows: `!`.
-        if skipped {
-            buf.push_str("\t!");
+        // A row with a drv is `attr\t<drv>`; a threw attr (no drv) is a bare
+        // `attr` with no tab, so "no second field" *is* the threw signal.
+        if let Some(drv) = drv {
+            buf.push('\t');
+            buf.push_str(drv);
         }
         buf.push('\n');
     }
@@ -99,8 +98,8 @@ fn read_eval(path: &Path) -> Result<String> {
 
 /// The on-disk form of a drv path: strip the constant `/nix/store/` prefix and
 /// `.drv` suffix; [`restore_drv`] re-adds them. Every drv `nix-eval-jobs` emits
-/// has this exact shape (an errored attr carries no drv and is stored as an empty
-/// field, so this is only ever called on a real path). Shared with the `--tests`
+/// has this exact shape (a threw attr carries no drv and is written as a bare
+/// `attr`, so this is only ever called on a real path). Shared with the `--tests`
 /// SQLite cache (`store.rs`), which stores its drvs stripped for the same reason.
 pub(crate) fn strip_drv(drv: &str) -> &str {
     let stripped = drv
@@ -132,20 +131,20 @@ pub fn touch_eval(path: &Path) {
     }
 }
 
-/// One parsed eval row, borrowing from its line: attr, stored-form drv, and the
-/// meta-blocked bit.
-type EvalRow<'a> = (&'a str, Option<&'a str>, bool);
+/// One parsed eval row, borrowing from its line: attr and its stored-form drv
+/// (`None` = the attr threw during eval — a bare line with no drv).
+type EvalRow<'a> = (&'a str, Option<&'a str>);
 
 /// Parse one eval-file line into an [`EvalRow`] (no allocation). The drv is
 /// left in its stored form (see [`strip_drv`]); since that encoding is
 /// injective, the merge can compare stored fields directly and only
-/// [`restore_drv`] the few rows it emits.
+/// [`restore_drv`] the few rows it emits. A line with no tab (or an empty drv
+/// field) is a threw attr: `None` drv.
 fn parse_line(l: &str) -> EvalRow<'_> {
-    let mut fields = l.splitn(3, '\t');
+    let mut fields = l.splitn(2, '\t');
     let attr = fields.next().unwrap_or(l);
     let drv = fields.next().unwrap_or("");
-    let skipped = fields.next() == Some("!");
-    (attr, if drv.is_empty() { None } else { Some(drv) }, skipped)
+    (attr, if drv.is_empty() { None } else { Some(drv) })
 }
 
 /// Parse a whole eval file's text into [`EvalRow`]s, borrowing from `buf`.
@@ -157,15 +156,17 @@ fn parse_eval(buf: &str) -> Vec<EvalRow<'_>> {
     buf.lines().map(parse_line).collect()
 }
 
-/// One changed attr between two evals: its drv and meta-blocked bit on each side
-/// (`None` = absent/no derivation there).
+/// One changed attr between two evals. Each side is three-way: a `Some` drv
+/// (evaluated to a derivation), or `None` drv with `threw = true` (present but
+/// threw under the profile — renders ⏩), or `None` drv with `threw = false`
+/// (absent — not an attribute on that side, renders ➖).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedAttr {
     pub attr: String,
     pub base_drv: Option<String>,
     pub head_drv: Option<String>,
-    pub base_skipped: bool,
-    pub head_skipped: bool,
+    pub base_threw: bool,
+    pub head_threw: bool,
 }
 
 // The diff pipeline: each file is decompressed on its own thread (the two
@@ -326,15 +327,18 @@ impl RowCursor for SliceCursor<'_> {
     }
 }
 
-/// A [`ChangedAttr`] for a row present only on the base side (skipped if it
-/// has no drv — an eval error is treated as absent).
+/// A [`ChangedAttr`] for a row present only on the base side — but only when it
+/// has a drv. A threw attr (no drv) present on just one side matches
+/// nixpkgs-review's absence (not buildable there, gone here), so it's not a
+/// review event and is dropped; a threw side is only ever *shown* opposite a
+/// built one (the `Equal` case below).
 fn base_only(r: &EvalRow) -> Option<ChangedAttr> {
     r.1.is_some().then(|| ChangedAttr {
         attr: r.0.to_string(),
         base_drv: restore_drv(r.1),
         head_drv: None,
-        base_skipped: r.2,
-        head_skipped: false,
+        base_threw: false,
+        head_threw: false,
     })
 }
 
@@ -344,16 +348,17 @@ fn head_only(r: &EvalRow) -> Option<ChangedAttr> {
         attr: r.0.to_string(),
         base_drv: None,
         head_drv: restore_drv(r.1),
-        base_skipped: false,
-        head_skipped: r.2,
+        base_threw: false,
+        head_threw: false,
     })
 }
 
-/// The changed rows between two attr-sorted sides: one [`ChangedAttr`] for
-/// each attr whose drv *or* meta-blocked bit differs (meta isn't part of the
-/// drv hash, so (un)marking a package skipped can change nothing but the bit —
-/// still a review event worth a row), via a linear two-pointer merge. Only the
-/// (few) changed rows are allocated.
+/// The changed rows between two attr-sorted sides: one [`ChangedAttr`] for each
+/// attr whose drv differs, via a linear two-pointer merge. "Threw" is encoded as
+/// a `None` drv, so the drv comparison also catches a package that starts or
+/// stops evaluating under the profile (⏩↔build) — but *both* sides threw is
+/// `None == None`, no change, so a persistently-unavailable package never shows
+/// (no ⏩→⏩; DESIGN §6, §8). Only the (few) changed rows are allocated.
 fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<ChangedAttr>> {
     let mut out = Vec::new();
     loop {
@@ -367,13 +372,14 @@ fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<Change
                 std::cmp::Ordering::Less => (base_only(&br), true, false),
                 std::cmp::Ordering::Greater => (head_only(&hr), false, true),
                 std::cmp::Ordering::Equal => {
-                    let changed = br.1 != hr.1 || br.2 != hr.2;
-                    let emit = changed.then(|| ChangedAttr {
+                    // A present row with no drv threw; the drv comparison
+                    // captures built↔threw and any rebuild alike.
+                    let emit = (br.1 != hr.1).then(|| ChangedAttr {
                         attr: br.0.to_string(),
                         base_drv: restore_drv(br.1),
                         head_drv: restore_drv(hr.1),
-                        base_skipped: br.2,
-                        head_skipped: hr.2,
+                        base_threw: br.1.is_none(),
+                        head_threw: hr.1.is_none(),
                     });
                     (emit, true, true)
                 }
@@ -394,6 +400,7 @@ fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<Change
 /// streaming both eval files through [`merge_rows`]: each side is decompressed
 /// on its own thread ([`spawn_eval_decoder`]) and consumed line-by-line
 /// ([`LineCursor`]), so the two decompressions overlap each other *and* the merge.
+/// `system` is the profile-qualified key (see [`eval_path`]).
 pub fn changed_set(base_tree: &str, head_tree: &str, system: &str) -> Result<Vec<ChangedAttr>> {
     changed_set_files(
         &eval_path(base_tree, system)?,
@@ -421,17 +428,19 @@ fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
         .expect("slice cursors are infallible")
 }
 
-/// Diff two `test_attr → (drv, skipped)` maps (the `--tests` cache's shape, full
-/// drv paths) with exactly [`diff`]'s semantics, so test rows classify
-/// (regression / fixed / new / meta-only …) like any full-set attr.
+/// Diff two `test_attr → drv` maps (the `--tests` cache's shape, full drv paths)
+/// with exactly [`diff`]'s semantics, so test rows classify (regression / fixed
+/// / new …) like any full-set attr. Only tests that resolved to a drv are cached,
+/// so every row here has a drv; a test unavailable under the profile was dropped
+/// during eval and is simply absent.
 pub fn changed_tests(
-    base: &std::collections::HashMap<String, (String, bool)>,
-    head: &std::collections::HashMap<String, (String, bool)>,
+    base: &std::collections::HashMap<String, String>,
+    head: &std::collections::HashMap<String, String>,
 ) -> Vec<ChangedAttr> {
-    fn rows(m: &std::collections::HashMap<String, (String, bool)>) -> Vec<EvalRow<'_>> {
+    fn rows(m: &std::collections::HashMap<String, String>) -> Vec<EvalRow<'_>> {
         let mut v: Vec<EvalRow<'_>> = m
             .iter()
-            .map(|(attr, (drv, skipped))| (attr.as_str(), Some(strip_drv(drv)), *skipped))
+            .map(|(attr, drv)| (attr.as_str(), Some(strip_drv(drv))))
             .collect();
         v.sort_unstable_by_key(|r| r.0);
         v
@@ -484,43 +493,35 @@ mod tests {
 
     #[test]
     fn write_eval_strips_and_parse_restores() {
-        let ae = |attr: &str, drv: Option<&str>, skipped: bool| AttrEval {
+        let ae = |attr: &str, drv: Option<&str>| AttrEval {
             attr: attr.into(),
             drv_path: drv.map(str::to_string),
-            skipped,
         };
         let attrs = [
-            ae("hello", Some("/nix/store/a-hello.drv"), false),
-            ae("br", Some("/nix/store/b-br.drv"), true),
-            ae("bad", None, false),
+            ae("hello", Some("/nix/store/a-hello.drv")),
+            ae("zed", Some("/nix/store/b-zed.drv")),
+            ae("bad", None),
         ];
         let dir = std::env::temp_dir().join(format!("npb-eval-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("e.tsv");
         write_eval(&path, &attrs).unwrap();
 
-        // On disk the drv is stripped; a no-derivation attr is an empty field;
-        // only the skipped row carries the third `!` field (sorted by attr:
-        // bad, br, hello). The file is zstd-compressed, so read it back through
-        // the same helper the diff uses.
+        // On disk the drv is stripped; a threw attr (no drv) is a bare line with
+        // no tab (sorted by attr: bad, hello, zed). The file is zstd-compressed,
+        // so read it back through the same helper the diff uses.
         let raw = read_eval(&path).unwrap();
-        assert_eq!(raw, "bad\t\nbr\tb-br\t!\nhello\ta-hello\n");
+        assert_eq!(raw, "bad\nhello\ta-hello\nzed\tb-zed\n");
 
         // Parsing + restoring recovers the original rows exactly.
         let parsed = parse_eval(&raw);
-        let restored: Vec<_> = parsed
-            .iter()
-            .map(|(a, d, br)| (*a, restore_drv(*d), *br))
-            .collect();
-        assert_eq!(restored[0], ("bad", None, false));
+        let restored: Vec<_> = parsed.iter().map(|(a, d)| (*a, restore_drv(*d))).collect();
+        assert_eq!(restored[0], ("bad", None));
         assert_eq!(
             restored[1],
-            ("br", Some("/nix/store/b-br.drv".into()), true)
+            ("hello", Some("/nix/store/a-hello.drv".into()))
         );
-        assert_eq!(
-            restored[2],
-            ("hello", Some("/nix/store/a-hello.drv".into()), false)
-        );
+        assert_eq!(restored[2], ("zed", Some("/nix/store/b-zed.drv".into())));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -529,60 +530,58 @@ mod tests {
         attr: &str,
         base: Option<&str>,
         head: Option<&str>,
-        base_skipped: bool,
-        head_skipped: bool,
+        base_threw: bool,
+        head_threw: bool,
     ) -> ChangedAttr {
         ChangedAttr {
             attr: attr.into(),
             base_drv: restore_drv(base),
             head_drv: restore_drv(head),
-            base_skipped,
-            head_skipped,
+            base_threw,
+            head_threw,
         }
     }
 
     #[test]
     fn diff_emits_only_changed_rows() {
-        // Both lists sorted by attr, as parse_eval guarantees.
+        // Both lists sorted by attr, as parse_eval guarantees. `None` = threw.
         let b = [
-            ("dropped", Some("d1"), false),
-            ("errored.base", None, false), // eval error on base only: no row
-            ("flip", Some("f1"), true),    // meta-only unmarking: row, same drv
-            ("gone.err", Some("g1"), false), // drv on base, eval error at head
-            ("rebuilt", Some("r1"), false),
-            ("same", Some("s1"), false),
+            ("bothrew", None),     // threw both sides: no change, not shown
+            ("broke", Some("k1")), // built on base, threw on head: ✅→⏩
+            ("dropped", Some("d1")),
+            ("rebuilt", Some("r1")),
+            ("same", Some("s1")),
+            ("threwbase", None), // threw on base only: not buildable, dropped
+            ("unbroke", None),   // threw on base, built on head: ⏩→build
         ];
         let h = [
-            ("added", Some("a1"), false),
-            ("errored.head", None, false), // eval error on head only: no row
-            ("flip", Some("f1"), false),
-            ("gone.err", None, false),
-            ("rebuilt", Some("r2"), false),
-            ("same", Some("s1"), false),
+            ("added", Some("a1")),
+            ("bothrew", None),
+            ("broke", None),
+            ("rebuilt", Some("r2")),
+            ("same", Some("s1")),
+            ("threwhead", None), // threw on head only: dropped
+            ("unbroke", Some("u1")),
         ];
         let got = diff(&b, &h);
         let want = vec![
             ca("added", None, Some("a1"), false, false),
+            ca("broke", Some("k1"), None, false, true),
             ca("dropped", Some("d1"), None, false, false),
-            ca("flip", Some("f1"), Some("f1"), true, false),
-            ca("gone.err", Some("g1"), None, false, false),
             ca("rebuilt", Some("r1"), Some("r2"), false, false),
+            ca("unbroke", None, Some("u1"), true, false),
         ];
         assert_eq!(got, want);
     }
 
     #[test]
     fn diff_drains_tails() {
-        // One list ends first; the other's remainder must still be emitted
-        // (with its no-drv rows skipped).
-        let b = [("a", Some("a1"), false)];
-        let h = [
-            ("a", Some("a1"), false),
-            ("y", None, false),
-            ("z", Some("z1"), true),
-        ];
-        assert_eq!(diff(&b, &h), vec![ca("z", None, Some("z1"), false, true)]);
-        assert_eq!(diff(&h, &b), vec![ca("z", Some("z1"), None, true, false)]);
+        // One list ends first; the other's remainder must still be emitted, with
+        // its threw (no-drv) rows dropped.
+        let b = [("a", Some("a1"))];
+        let h = [("a", Some("a1")), ("y", None), ("z", Some("z1"))];
+        assert_eq!(diff(&b, &h), vec![ca("z", None, Some("z1"), false, false)]);
+        assert_eq!(diff(&h, &b), vec![ca("z", Some("z1"), None, false, false)]);
         assert_eq!(diff(&[], &[]), vec![]);
     }
 
@@ -590,11 +589,11 @@ mod tests {
     fn changed_set_streams_real_files() {
         // End-to-end over the real on-disk shape: write two evals with
         // write_eval, diff them through the streaming path (decoder threads +
-        // line cursors), and expect exactly diff's semantics.
-        let ae = |attr: &str, drv: Option<&str>, skipped: bool| AttrEval {
+        // line cursors), and expect exactly diff's semantics. `threw` (None on
+        // both sides) exercises the bare-line round-trip and its suppression.
+        let ae = |attr: &str, drv: Option<&str>| AttrEval {
             attr: attr.into(),
             drv_path: drv.map(str::to_string),
-            skipped,
         };
         let dir = std::env::temp_dir().join(format!("npb-stream-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -603,26 +602,26 @@ mod tests {
         write_eval(
             &bpath,
             &[
-                ae("dropped", Some("/nix/store/d1.drv"), false),
-                ae("errored", None, false),
-                ae("rebuilt", Some("/nix/store/r1.drv"), false),
-                ae("same", Some("/nix/store/s1.drv"), false),
+                ae("dropped", Some("/nix/store/d1.drv")),
+                ae("threw", None),
+                ae("rebuilt", Some("/nix/store/r1.drv")),
+                ae("same", Some("/nix/store/s1.drv")),
             ],
         )
         .unwrap();
         write_eval(
             &hpath,
             &[
-                ae("added", Some("/nix/store/a1.drv"), true),
-                ae("errored", None, false),
-                ae("rebuilt", Some("/nix/store/r2.drv"), false),
-                ae("same", Some("/nix/store/s1.drv"), false),
+                ae("added", Some("/nix/store/a1.drv")),
+                ae("threw", None),
+                ae("rebuilt", Some("/nix/store/r2.drv")),
+                ae("same", Some("/nix/store/s1.drv")),
             ],
         )
         .unwrap();
         let got = changed_set_files(&bpath, &hpath).unwrap();
         let want = vec![
-            ca("added", None, Some("a1"), false, true),
+            ca("added", None, Some("a1"), false, false),
             ca("dropped", Some("d1"), None, false, false),
             ca("rebuilt", Some("r1"), Some("r2"), false, false),
         ];
@@ -634,27 +633,18 @@ mod tests {
 
     #[test]
     fn changed_tests_matches_diff_semantics() {
-        let m = |kv: &[(&str, &str, bool)]| {
+        let m = |kv: &[(&str, &str)]| {
             kv.iter()
-                .map(|(a, d, b)| (a.to_string(), (format!("/nix/store/{d}.drv"), *b)))
+                .map(|(a, d)| (a.to_string(), format!("/nix/store/{d}.drv")))
                 .collect::<std::collections::HashMap<_, _>>()
         };
-        let base = m(&[
-            ("pkg.tests.dropped", "d1", false),
-            ("pkg.tests.flip", "f1", true),
-            ("pkg.tests.same", "s1", false),
-        ]);
-        let head = m(&[
-            ("pkg.tests.added", "a1", false),
-            ("pkg.tests.flip", "f1", false),
-            ("pkg.tests.same", "s1", false),
-        ]);
-        // Sorted by attr, full drv paths restored, meta-only flip kept.
+        let base = m(&[("pkg.tests.dropped", "d1"), ("pkg.tests.same", "s1")]);
+        let head = m(&[("pkg.tests.added", "a1"), ("pkg.tests.same", "s1")]);
+        // Sorted by attr, full drv paths restored; only changed rows emitted.
         let got = changed_tests(&base, &head);
         let want = vec![
             ca("pkg.tests.added", None, Some("a1"), false, false),
             ca("pkg.tests.dropped", Some("d1"), None, false, false),
-            ca("pkg.tests.flip", Some("f1"), Some("f1"), true, false),
         ];
         assert_eq!(got, want);
     }

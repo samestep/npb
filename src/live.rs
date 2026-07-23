@@ -301,7 +301,7 @@ pub fn human_elapsed(d: Duration) -> String {
 // One persistent, append-only tree spanning eval → probe: every piece of
 // network or nontrivial work becomes a node the moment npb learns it needs it,
 // nothing is ever removed, and cached/no-op work never appears at all. Phases
-// (`enumerate`, `evaluate`, `tests`, `instantiate`, `check`, `probe`, and the
+// (`enumerate`, `evaluate`, `tests`, `instantiate`, `probe`, and the
 // network `fetch`/`download`) are top-level nodes; under them a system level and the
 // per-side commit `display`s. State is one of three
 // nom colors — blue waiting, yellow running, green done — carried by the label;

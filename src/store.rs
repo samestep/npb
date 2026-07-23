@@ -262,8 +262,9 @@ impl Store {
     /// `jobs`, in one transaction. Every package in `pkgs` gets a `test_pkg`
     /// marker (even those with no tests — so they're not re-evaluated); each job
     /// with a drv gets a `test_drv` row (its drv stored stripped — see
-    /// `evalfile::strip_drv`). Idempotent (`INSERT OR REPLACE`), so a re-run over
-    /// the same key is harmless.
+    /// `evalfile::strip_drv`). A job that threw (no drv) is dropped, so an
+    /// unavailable test simply has no row. Idempotent (`INSERT OR REPLACE`), so a
+    /// re-run over the same key is harmless.
     pub fn cache_test_eval(
         &mut self,
         tree: &str,
@@ -283,9 +284,9 @@ impl Store {
             if let Some(drv) = &j.drv_path {
                 tx.execute(
                     "INSERT OR REPLACE INTO test_drv \
-                     (key_id, pkg_attr, test_attr, drv_path, skipped) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![key_id, j.pkg_attr, j.test_attr, strip_drv(drv), j.skipped],
+                     (key_id, pkg_attr, test_attr, drv_path) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![key_id, j.pkg_attr, j.test_attr, strip_drv(drv)],
                 )?;
             }
         }
@@ -293,15 +294,15 @@ impl Store {
         Ok(())
     }
 
-    /// All cached test drvs for `pkgs` at this key, as `test_attr → (drv_path,
-    /// skipped)` (only tests that resolved to a derivation), with drv paths
-    /// restored to their full `/nix/store/…​.drv` form. One query for the whole set.
+    /// All cached test drvs for `pkgs` at this key, as `test_attr → drv_path`
+    /// (only tests that resolved to a derivation), with drv paths restored to
+    /// their full `/nix/store/…​.drv` form. One query for the whole set.
     pub fn tests_drvs_for(
         &self,
         tree: &str,
         system: &str,
         pkgs: &[String],
-    ) -> Result<std::collections::HashMap<String, (String, bool)>> {
+    ) -> Result<std::collections::HashMap<String, String>> {
         let mut out = std::collections::HashMap::new();
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(out);
@@ -311,7 +312,7 @@ impl Store {
         }
         let placeholders = placeholders(pkgs.len());
         let sql = format!(
-            "SELECT test_attr, drv_path, skipped FROM test_drv \
+            "SELECT test_attr, drv_path FROM test_drv \
              WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -319,89 +320,21 @@ impl Store {
             std::iter::once(key_id.to_string()).chain(pkgs.iter().cloned()),
         );
         let rows = stmt.query_map(params, |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, bool>(2)?,
-            ))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         for row in rows {
-            let (test_attr, stored, skipped) = row?;
+            let (test_attr, stored) = row?;
             let drv = restore_drv(Some(&stored)).expect("Some maps to Some");
-            out.insert(test_attr, (drv, skipped));
+            out.insert(test_attr, drv);
         }
         Ok(out)
-    }
-
-    /// Cached transitive-meta-block verdicts (DESIGN.md §6) for `attrs` at this
-    /// key, as `attr → blocked`. An attr absent from the result was never checked
-    /// (or the key isn't recorded) and must be recomputed — the same
-    /// absence-means-unknown contract as [`Store::tests_cached_pkgs`]. Keyed on
-    /// attr, not a drv, because the verdict is genuinely per-attr: the strict-eval
-    /// throw depends on which attr's `meta` is forced (§6). One query.
-    pub fn blocked_verdicts(
-        &self,
-        tree: &str,
-        system: &str,
-        attrs: &[String],
-    ) -> Result<std::collections::HashMap<String, bool>> {
-        let mut out = std::collections::HashMap::new();
-        let Some(key_id) = self.key_id(tree, system)? else {
-            return Ok(out);
-        };
-        if attrs.is_empty() {
-            return Ok(out);
-        }
-        let placeholders = placeholders(attrs.len());
-        let sql = format!(
-            "SELECT attr, blocked FROM transitive_block \
-             WHERE key_id = ?1 AND attr IN ({placeholders})",
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params = rusqlite::params_from_iter(
-            std::iter::once(key_id.to_string()).chain(attrs.iter().cloned()),
-        );
-        let rows = stmt.query_map(params, |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
-        })?;
-        for row in rows {
-            let (attr, blocked) = row?;
-            out.insert(attr, blocked);
-        }
-        Ok(out)
-    }
-
-    /// Record transitive-meta-block verdicts (`(attr, blocked)`) at this key, in
-    /// one transaction. Idempotent (`INSERT OR REPLACE`). Only *checked* attrs
-    /// (evaluated this run) belong here — an unchecked one is left uncached so a
-    /// later run rechecks it.
-    pub fn cache_blocked(
-        &mut self,
-        tree: &str,
-        system: &str,
-        verdicts: &[(String, bool)],
-    ) -> Result<()> {
-        if verdicts.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.transaction()?;
-        let key_id = Self::key_id_get_or_create(&tx, tree, system)?;
-        for (attr, blocked) in verdicts {
-            tx.execute(
-                "INSERT OR REPLACE INTO transitive_block (key_id, attr, blocked) \
-                 VALUES (?1, ?2, ?3)",
-                params![key_id, attr, blocked],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     /// Drop the caches for one `(tree, system)` — its `eval_key` row and the
-    /// `test_pkg`/`test_drv`/`transitive_block` rows that reference it — when its
-    /// eval file is evicted (`--clean`, DESIGN.md §4). Returns the number of
-    /// `test_drv` rows removed (the bulk); a no-op if the key was never recorded.
-    /// The caller [`Store::vacuum`]s once after a batch of these to return the pages.
+    /// `test_pkg`/`test_drv` rows that reference it — when its eval file is
+    /// evicted (`--clean`, DESIGN.md §4). Returns the number of `test_drv` rows
+    /// removed (the bulk); a no-op if the key was never recorded. The caller
+    /// [`Store::vacuum`]s once after a batch of these to return the pages.
     pub fn purge_tests(&mut self, tree: &str, system: &str) -> Result<usize> {
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(0);
@@ -409,7 +342,6 @@ impl Store {
         let tx = self.conn.transaction()?;
         let drvs = tx.execute("DELETE FROM test_drv WHERE key_id = ?1", [key_id])?;
         tx.execute("DELETE FROM test_pkg WHERE key_id = ?1", [key_id])?;
-        tx.execute("DELETE FROM transitive_block WHERE key_id = ?1", [key_id])?;
         tx.execute("DELETE FROM eval_key WHERE id = ?1", [key_id])?;
         tx.commit()?;
         Ok(drvs)
@@ -550,26 +482,22 @@ mod tests {
                 .is_empty()
         );
 
-        // hello has two tests (one skipped); ripgrep has none; one test
-        // errored (no drv).
+        // hello has two drv'd tests; ripgrep has none; one test errored (no drv).
         let jobs = vec![
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.run".into(),
                 drv_path: Some("/nix/store/a.drv".into()),
-                skipped: false,
             },
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.version".into(),
                 drv_path: Some("/nix/store/b.drv".into()),
-                skipped: true,
             },
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.err".into(),
                 drv_path: None,
-                skipped: false,
             },
         ];
         s.cache_test_eval(c, sys, &pkgs(&["hello", "ripgrep"]), &jobs)
@@ -582,17 +510,16 @@ mod tests {
             .unwrap();
         assert!(done.contains("hello") && done.contains("ripgrep") && !done.contains("curl"));
 
-        // hello resolves to its two drv'd tests (the errored one is not stored),
-        // each carrying its own meta-blocked bit.
+        // hello resolves to its two drv'd tests (the errored one is not stored).
         let hd = s.tests_drvs_for(c, sys, &pkgs(&["hello"])).unwrap();
         assert_eq!(hd.len(), 2);
         assert_eq!(
             hd.get("hello.tests.run"),
-            Some(&("/nix/store/a.drv".to_string(), false))
+            Some(&"/nix/store/a.drv".to_string())
         );
         assert_eq!(
             hd.get("hello.tests.version"),
-            Some(&("/nix/store/b.drv".to_string(), true))
+            Some(&"/nix/store/b.drv".to_string())
         );
         // ripgrep is cached-done but has no test drvs.
         assert!(
@@ -621,7 +548,6 @@ mod tests {
             pkg_attr: "hello".into(),
             test_attr: t.into(),
             drv_path: Some(drv.into()),
-            skipped: false,
         };
 
         // Two trees on the same system, each with one drv'd test.
@@ -667,62 +593,6 @@ mod tests {
         // Purging an unknown key is a no-op, and VACUUM after a batch is fine.
         assert_eq!(s.purge_tests("treeA", sys).unwrap(), 0);
         s.vacuum().unwrap();
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn blocked_verdict_cache_round_trip_and_purge() {
-        let dir = std::env::temp_dir().join(format!("npb-tb-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
-        let sys = "aarch64-darwin";
-        let attrs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let (a, b, c) = (
-            "matrix-synapse-plugins.matrix-synapse-ldap3".to_string(),
-            "hello".to_string(),
-            "ripgrep".to_string(),
-        );
-
-        // Nothing cached: every candidate is a miss (absent from the map).
-        assert!(
-            s.blocked_verdicts("treeA", sys, &attrs(&[&a]))
-                .unwrap()
-                .is_empty()
-        );
-
-        // Record a blocked and a clean verdict; both are definitive (`false` is a
-        // real "checked, clean" answer, not a miss).
-        s.cache_blocked("treeA", sys, &[(a.clone(), true), (b.clone(), false)])
-            .unwrap();
-        let v = s
-            .blocked_verdicts("treeA", sys, &attrs(&[&a, &b, &c]))
-            .unwrap();
-        assert_eq!(v.get(&a), Some(&true));
-        assert_eq!(v.get(&b), Some(&false));
-        assert_eq!(v.get(&c), None); // never recorded ⇒ still a miss
-
-        // A different tree shares nothing.
-        assert!(
-            s.blocked_verdicts("treeB", sys, &attrs(&[&a]))
-                .unwrap()
-                .is_empty()
-        );
-
-        // Eviction (via purge_tests) drops this key's verdicts in lockstep.
-        s.cache_blocked("treeB", sys, &[(a.clone(), true)]).unwrap();
-        s.purge_tests("treeA", sys).unwrap();
-        assert!(
-            s.blocked_verdicts("treeA", sys, &attrs(&[&a]))
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            s.blocked_verdicts("treeB", sys, &attrs(&[&a]))
-                .unwrap()
-                .get(&a),
-            Some(&true)
-        );
 
         let _ = fs::remove_dir_all(&dir);
     }

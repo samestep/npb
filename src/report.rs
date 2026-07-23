@@ -21,22 +21,17 @@ pub enum State {
     Failed,
     /// A dependency failed, so this never ran (a transitive/cascade failure).
     Blocked,
-    /// Meta-blocked (broken/unsupported/insecure) — not attempted by default,
-    /// nixpkgs-review's "skipped" (its meta-blocked subset; a *missing* attr is
-    /// `Absent`, not this). Covers both a *direct* meta-block (the attr's own
-    /// `meta`) and a *transitive* one (a clean package that throws under a strict
-    /// re-eval because it forces a meta-blocked dependency `EVAL_CONFIG`
-    /// force-allowed, DESIGN §6 — e.g. a `matrix-synapse` plugin on
-    /// `aarch64-darwin`), folded into the same bit. `--no-skip` builds it anyway
-    /// and reports the real outcome; without
-    /// the flag the marking *masks* any recorded fact, so a default run's report
-    /// doesn't depend on what earlier `--no-skip` runs happened to learn.
-    Skipped,
     /// Has a derivation but no build fact yet. Builds always run, so this is
     /// only the build phase's accepted gap (§5): a target nix never reached,
     /// with nothing verifiably failing in its closure, left unrecorded to be
     /// re-attempted next run.
     Unknown,
+    /// Present in the eval but **threw** — broken/unsupported/insecure under the
+    /// run's profile, or forcing such a dependency (DESIGN §6). It has no drv, so
+    /// it isn't built; the report shows ⏩ (nixpkgs-review's "skipped"). A
+    /// *missing* attr is `Absent` (➖), not this. Purely an eval fact, so it never
+    /// depends on build history.
+    Threw,
     /// No derivation on this side (the attr doesn't exist there).
     Absent,
 }
@@ -47,8 +42,8 @@ impl State {
         State::Built,
         State::Failed,
         State::Blocked,
-        State::Skipped,
         State::Unknown,
+        State::Threw,
         State::Absent,
     ];
 
@@ -57,7 +52,7 @@ impl State {
             State::Built => "✅",
             State::Failed => "❌",
             State::Blocked => "🚫",
-            State::Skipped => "⏩",
+            State::Threw => "⏩",
             State::Absent => "➖",
             State::Unknown => "❔",
         }
@@ -69,7 +64,7 @@ impl State {
             State::Built => "successfully built",
             State::Failed => "failed to build",
             State::Blocked => "dependency failed to build",
-            State::Skipped => "didn't try to build",
+            State::Threw => "failed to evaluate",
             State::Unknown => "couldn't try to build",
             State::Absent => "doesn't exist",
         }
@@ -77,14 +72,14 @@ impl State {
 
     /// Goodness on the build-outcome axis, higher = better: `✅` built, `➖`
     /// absent ("new" on the base side / "gone" on the head side) just under it,
-    /// then `⏩` skipped, `🚫` blocked, `❌` failed. `❔` unbuilt is off the axis
+    /// then `⏩` threw, `🚫` blocked, `❌` failed. `❔` unbuilt is off the axis
     /// — no fact to compare against — so it has no goodness; [`priority`] tiers
     /// it out before this is ever reached.
     fn goodness(self) -> i32 {
         match self {
             State::Built => 4,
             State::Absent => 3,
-            State::Skipped => 2,
+            State::Threw => 2,
             State::Blocked => 1,
             State::Failed => 0,
             State::Unknown => {
@@ -94,33 +89,31 @@ impl State {
     }
 }
 
-/// Reduce a side (its optional drv + *effective* meta-blocked bit + that drv's
-/// observations) to a state.
+/// Reduce a side (its optional drv + threw bit + that drv's observations) to a
+/// state.
 ///
-/// `skipped` masks everything but absence: a meta-blocked attr renders ⏩ even
-/// when the log holds a real fact for its drv (say, from an earlier `--no-skip`
-/// run), so a default run's report never depends on what past runs happened to
-/// learn. The caller gates the bit on the flag (`skipped && !no_skip`) — under
-/// `--no-skip` the package is built like any other and reports its real
-/// outcome. Below that, a success beats a failure (it *can* build —
-/// `flaky_success_wins`; a cache hit is recorded as the same `Built` fact,
-/// DESIGN §7), and a direct failure outranks a dependency failure (it's the
-/// more specific fact about this drv).
-pub fn side_state(drv: &Option<String>, skipped: bool, obs: &[Observation]) -> State {
-    if drv.is_none() {
-        return State::Absent;
-    }
+/// A side with a drv reduces from the log: a success beats a failure (it *can*
+/// build — `flaky_success_wins`; a cache hit is the same `Built` fact, DESIGN
+/// §7), and a direct failure outranks a dependency failure (the more specific
+/// fact about this drv). A side with no drv either **threw** under the profile
+/// (⏩) or is genuinely **absent** (➖) — the `threw` bit, a pure eval fact,
+/// distinguishes them.
+pub fn side_state(drv: &Option<String>, threw: bool, obs: &[Observation]) -> State {
     let has = |out: Outcome| obs.iter().any(|o| o.outcome == out);
-    if skipped {
-        State::Skipped
-    } else if has(Outcome::Built) {
-        State::Built
-    } else if has(Outcome::Failed) {
-        State::Failed
-    } else if has(Outcome::DepFailed) {
-        State::Blocked
+    if drv.is_some() {
+        if has(Outcome::Built) {
+            State::Built
+        } else if has(Outcome::Failed) {
+            State::Failed
+        } else if has(Outcome::DepFailed) {
+            State::Blocked
+        } else {
+            State::Unknown
+        }
+    } else if threw {
+        State::Threw
     } else {
-        State::Unknown
+        State::Absent
     }
 }
 
@@ -273,8 +266,10 @@ mod tests {
 
     #[test]
     fn state_reduction() {
-        // No drv on a side is Absent, not Unknown.
+        // No drv and didn't throw: Absent. No drv but threw under the profile:
+        // Threw (⏩) — the two no-drv cases the threw bit distinguishes.
         assert_eq!(side_state(&None, false, &[]), State::Absent);
+        assert_eq!(side_state(&None, true, &[]), State::Threw);
         // A drv with no facts is Unknown (distinct from Absent).
         let d = Some("/nix/store/x.drv".to_string());
         assert_eq!(side_state(&d, false, &[]), State::Unknown);
@@ -293,18 +288,10 @@ mod tests {
         assert_eq!(side_state(&d, false, &[obs(Outcome::Built)]), State::Built);
         let s = side_state(&d, false, &[obs(Outcome::Built), obs(Outcome::Failed)]);
         assert_eq!(s, State::Built);
-        // The effective meta-blocked bit masks recorded facts — a default run
-        // shows ⏩ even for a drv an earlier --no-skip run built or failed, so
-        // its report doesn't depend on what past runs learned. (Under --no-skip
-        // the caller passes skipped = false, exposing the real outcome.)
-        assert_eq!(side_state(&d, true, &[]), State::Skipped);
-        assert_eq!(side_state(&d, true, &[obs(Outcome::Built)]), State::Skipped);
-        assert_eq!(
-            side_state(&d, true, &[obs(Outcome::Failed)]),
-            State::Skipped
-        );
-        // No drv is still Absent, even when meta-blocked.
-        assert_eq!(side_state(&None, true, &[]), State::Absent);
+        // A side with a drv reduces from the log; the threw bit is only consulted
+        // when there's no drv, so a built drv is never masked (the diff never
+        // pairs a drv with threw = true anyway).
+        assert_eq!(side_state(&d, true, &[obs(Outcome::Built)]), State::Built);
     }
 
     #[test]
@@ -324,7 +311,7 @@ mod tests {
 
     #[test]
     fn priority_orders_worst_delta_first() {
-        use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
+        use State::{Absent, Blocked, Built, Failed, Threw, Unknown};
         let mut pairs: Vec<(State, State)> = State::ALL
             .iter()
             .flat_map(|&b| State::ALL.iter().map(move |&h| (b, h)))
@@ -347,12 +334,12 @@ mod tests {
         // The steepest fall leads; a regression outranks unchanged, which
         // outranks any improvement.
         assert_eq!(pairs[0], (Built, Failed));
-        assert!(at((Built, Skipped)) < at((Built, Built)));
+        assert!(at((Built, Threw)) < at((Built, Built)));
         assert!(at((Built, Built)) < at((Failed, Built)));
         // Equal deltas break by a worse current state: Δ=-2 lands
         // ⏩→❌ before ➖→🚫 before ✅→⏩.
-        assert!(at((Skipped, Failed)) < at((Absent, Blocked)));
-        assert!(at((Absent, Blocked)) < at((Built, Skipped)));
+        assert!(at((Threw, Failed)) < at((Absent, Blocked)));
+        assert!(at((Absent, Blocked)) < at((Built, Threw)));
         // No measured delta (either side Unknown) sinks to a final contiguous tier.
         let first_unknown = pairs
             .iter()
@@ -401,11 +388,11 @@ mod tests {
                 Some("/b/d2"),
                 Some("/h/d2"),
             ),
-            // newly skipped (meta), distinct from dep-blocked
+            // newly threw under the profile, distinct from dep-blocked
             entry(
                 "brk",
                 State::Built,
-                State::Skipped,
+                State::Threw,
                 Some("/b/k"),
                 Some("/h/k"),
             ),

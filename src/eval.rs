@@ -9,7 +9,7 @@
 //! `nix-eval-jobs` output is parsed by streaming NDJSON straight off the child's
 //! stdout (never buffering the whole, meta-heavy output).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -24,48 +24,32 @@ use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
 use crate::live;
-use crate::model::{AttrEval, Rev, TestJob};
+use crate::model::{AttrEval, Profile, Rev, TestJob};
 
-/// The one nixpkgs config every eval runs under. npb owns the config
-/// (DESIGN.md §6), which is what makes the eval cache key just
-/// `(tree, system)` — changing this line changes the attr→drv map, so cached
-/// evals must be discarded (a one-off cleanup of the eval files and `--tests`
-/// rows, not the whole `~/.cache/nix-npb` — the observation log keys on
-/// drvpaths and stays valid, §1). The allow-flags are
-/// on so meta-blocked packages still yield a drv + meta rather than throwing —
-/// we want their drvpath and the option to build them anyway.
-///
-/// One consequence: the allow-flags also let a package with clean `meta` but a
-/// meta-blocked *dependency* evaluate (a `matrix-synapse` plugin pulling in
-/// Linux-only `matrix-synapse-unwrapped` on `aarch64-darwin`), where nixpkgs'
-/// strict config would throw. That's a phantom rebuild no real user of the
-/// platform can build, so it's undone at the changed-set level by a targeted
-/// strict re-eval ([`eval_availability`], DESIGN §6), not by changing this config.
-const EVAL_CONFIG: &str = "{ allowBroken = true; allowUnfree = true; \
-                             allowUnsupportedSystem = true; allowInsecurePredicate = _: true; }";
-
-/// The config for the transitive-meta-block check ([`eval_availability`], DESIGN
-/// §6), matching nixpkgs-review's stricter walk: unsupported/insecure *not*
-/// allowed and `allowBroken` off, so a changed package that is (or forces a
-/// dependency that is) broken/unsupported/insecure **throws** when evaluated —
-/// exactly the packages nixpkgs-review's `nix-env`/`evalAttrs` drop. `allowUnfree`
-/// matches [`EVAL_CONFIG`] so an unfree dependency isn't mistaken for a block.
-/// Unlike [`EVAL_CONFIG`] this config is *not* a stored-format input (it drives a
-/// per-attr verdict cached in SQLite, keyed on the eval, not the eval files), so
-/// it isn't frozen the way [`EVAL_CONFIG`] is (§1).
-const STRICT_CONFIG: &str = "{ allowUnfree = true; }";
+/// The nixpkgs `config` attrset for a [`Profile`] (DESIGN.md §6). npb evaluates
+/// under the profile the user means — strict by default — so a
+/// broken/unsupported/insecure package (and anything forcing such a dependency)
+/// throws and falls out, precisely and for free; the throw *is* the signal, so
+/// there's no `--meta` and no post-hoc reclassification. `allowUnfree` is always
+/// on (matching nixpkgs-review); the three allow-flags are added only when the
+/// profile permits them. The profile is part of the eval cache key
+/// ([`Profile::qualify`]), so different profiles never share an eval file.
+fn profile_config(profile: Profile) -> String {
+    let mut s = String::from("{ allowUnfree = true;");
+    if profile.broken {
+        s.push_str(" allowBroken = true;");
+    }
+    if profile.unsupported {
+        s.push_str(" allowUnsupportedSystem = true;");
+    }
+    if profile.insecure {
+        s.push_str(" allowInsecurePredicate = _: true;");
+    }
+    s.push_str(" }");
+    s
+}
 
 // --- nix-eval-jobs output ---------------------------------------------------
-
-/// The slice of `meta` we consume (from `--meta`): the availability bits
-/// nixpkgs' check-meta computes. [`EVAL_CONFIG`]'s allow-flags let these packages
-/// evaluate to a drv anyway; the bits say they shouldn't be *built* by default.
-#[derive(Deserialize, Default)]
-struct RawMeta {
-    broken: Option<bool>,
-    unsupported: Option<bool>,
-    insecure: Option<bool>,
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,26 +59,17 @@ struct RawJob {
     /// (which nix-eval-jobs quotes when an element contains a `.`) when a clean,
     /// dotted label is wanted — see the test eval.
     attr_path: Vec<String>,
-    /// `None` when evaluation of the attr errored (the job line carries an
-    /// `error` message instead, which we don't keep — re-evaluating reproduces it).
+    /// `None` when evaluation of the attr **threw** (the job line carries an
+    /// `error` message instead, which we don't keep — re-evaluating reproduces
+    /// it). Under the run's profile, that's exactly a broken/unsupported/insecure
+    /// attr, or one forcing such a dependency (DESIGN §6).
     drv_path: Option<String>,
-    meta: Option<RawMeta>,
-}
-
-/// Fold `--meta`'s availability bits into npb's single "skipped" bit (its
-/// meta-blocked analogue of nixpkgs-review's "skipped"): marked broken *or*
-/// unsupported-on-this-system *or* insecure. A missing `meta` (an errored attr
-/// carries none) reads as not-skipped. Shared by the full-set walk and the
-/// targeted test eval so both classify meta the same way.
-fn meta_skipped(meta: &RawMeta) -> bool {
-    meta.broken == Some(true) || meta.unsupported == Some(true) || meta.insecure == Some(true)
 }
 
 fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     AttrEval {
         attr: raw.attr,
         drv_path: raw.drv_path,
-        skipped: meta_skipped(&raw.meta.unwrap_or_default()),
     }
 }
 
@@ -107,7 +82,6 @@ fn raw_to_test_job(raw: RawJob) -> TestJob {
     TestJob {
         pkg_attr: raw.attr_path.first().cloned().unwrap_or_default(),
         test_attr: raw.attr_path.join("."),
-        skipped: meta_skipped(&raw.meta.unwrap_or_default()),
         drv_path: raw.drv_path,
     }
 }
@@ -135,20 +109,14 @@ fn nix_string_list(items: &[String]) -> String {
         .collect()
 }
 
-/// Build the whole-package-set Nix expression `nix-eval-jobs` walks. The
-/// revision's source is fetched by `builtins.fetchGit` at `rev` (a commit — real
-/// or the synthetic one minted for the working tree; the eval depends only on
-/// the tree it resolves to, which is why the cache keys on the tree, not this
-/// commit — see [`Rev`]). Interpolants are escaped via [`nix_escape`] (the repo
-/// path in particular is user input, `--nixpkgs`).
-fn build_expr(repo: &Path, rev: &str, system: &str) -> String {
-    build_expr_cfg(repo, rev, system, EVAL_CONFIG)
-}
-
-/// [`build_expr`] with an explicit nixpkgs `config`. Only the full-eval config
-/// ([`EVAL_CONFIG`]) is a frozen stored-format input; the transitive-block check
-/// uses [`STRICT_CONFIG`] here (DESIGN §6), never touching the cached eval files.
-fn build_expr_cfg(repo: &Path, rev: &str, system: &str, config: &str) -> String {
+/// Build the whole-package-set Nix expression `nix-eval-jobs` walks, under the
+/// nixpkgs `config` of the run's [`Profile`] ([`profile_config`]). The revision's
+/// source is fetched by `builtins.fetchGit` at `rev` (a commit — real or the
+/// synthetic one minted for the working tree; the eval depends only on the tree
+/// it resolves to, which is why the cache keys on the tree, not this commit — see
+/// [`Rev`]). Interpolants are escaped via [`nix_escape`] (the repo path in
+/// particular is user input, `--nixpkgs`).
+fn build_expr(repo: &Path, rev: &str, system: &str, config: &str) -> String {
     format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
          {{ system = \"{}\"; config = {config}; }}",
@@ -190,10 +158,6 @@ fn stream_jobs<T>(
     // the last few lines for the fatal-error diagnostic below; draining it (vs. an
     // undrained pipe) also can't deadlock while we stream stdout.
 
-    // `--meta` costs ~15% (each package's meta attrset is forced and emitted),
-    // but it's what carries `broken`/`unsupported`/`insecure` — the bits the
-    // build policy needs to skip meta-blocked packages by default.
-
     // nix-eval-jobs takes the expression inline (`--expr E`) or as a file-path
     // positional. The `--tests` expression lists every changed package, so on a
     // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn);
@@ -213,13 +177,7 @@ fn stream_jobs<T>(
     let workers_s = workers.to_string();
     let max_s = per_worker_mb.to_string();
     let mut cmd = Command::new("nix-eval-jobs");
-    cmd.args([
-        "--meta",
-        "--workers",
-        &workers_s,
-        "--max-memory-size",
-        &max_s,
-    ]);
+    cmd.args(["--workers", &workers_s, "--max-memory-size", &max_s]);
     // `--no-instantiate` evaluates without writing the `.drv` files. npb only
     // needs the drvPath + outputs (both emitted regardless), so skipping the
     // writes is ~40% faster and avoids instantiating the ~114k attrs it never
@@ -319,40 +277,46 @@ fn stream_jobs<T>(
 /// `passthru.tests` — a derivation (emitted as `<pkg>.tests`) or an attrset made
 /// recursable (emitted as `<pkg>.tests.<name>`); anything else yields no jobs.
 ///
-/// **Computed meta-blocked bit.** A `passthru.tests` entry is usually a
+/// **Profile-aware availability.** A `passthru.tests` entry is usually a
 /// `nixosTest`/`vm-test-run` derivation, which does *not* pass through nixpkgs'
-/// `check-meta` `commonMeta`, so — unlike a normal package — its raw `meta`
-/// carries no computed `unsupported`/`insecure` field (only whatever the test
-/// framework set, e.g. `platforms`). So `--meta` alone can't tell us a test is
-/// meta-blocked. `mark` computes it here — platform support via
-/// `lib.meta.availableOn`, insecurity via `knownVulnerabilities` — and injects
-/// `unsupported`/`insecure` into each test derivation's `meta`, so the same fold
-/// the full-set walk uses (`meta_skipped`) also classifies tests, matching
-/// nixpkgs-review's "marked broken and skipped" (which gets the same answer by
-/// `tryEval`-ing the outPath under a strict config). `mark` stops at
-/// derivations, so it never forces a derivation's internals, and each recursed
-/// leaf is wrapped in `tryEval` so one throwing test errors only itself — the
-/// per-leaf isolation nix-eval-jobs would otherwise give the untransformed tree.
-fn build_tests_expr(repo: &Path, rev: &str, system: &str, attrs: &[String]) -> String {
+/// `check-meta` `commonMeta` — so, unlike a normal package, evaluating it under
+/// the profile config does *not* make it throw when it's unsupported on this
+/// system or insecure. `mark` reintroduces that check per test: platform support
+/// via `lib.meta.availableOn`, insecurity via `knownVulnerabilities`. A test
+/// unavailable under the run's profile is **dropped** — replaced by `{ }`, so
+/// nix-eval-jobs emits no job for it and it renders ➖ absent (rather than a
+/// phantom build). Under `--allow-unsupported`/`--allow-insecure` the respective
+/// check is disabled and the test is kept. `mark` stops at derivations (never
+/// forces their internals), and each recursed leaf is wrapped in `tryEval` so one
+/// test that throws when forced is passed through untouched to error on its own —
+/// the per-leaf isolation nix-eval-jobs would otherwise give the untransformed
+/// tree. The package itself still evaluates under the profile config, so a
+/// meta-blocked *package* throws when forced here and drops all its tests for free.
+fn build_tests_expr(
+    repo: &Path,
+    rev: &str,
+    system: &str,
+    attrs: &[String],
+    profile: Profile,
+) -> String {
     let list = nix_string_list(attrs);
+    let nixbool = |b| if b { "true" } else { "false" };
     const TEMPLATE: &str = r#"
 let
   pkgs = @PKGS@;
   lib = pkgs.lib;
   host = pkgs.stdenv.hostPlatform;
   attrs = [ @ATTRS@];
-  # Inject the *computed* meta-blocked bits (see build_tests_expr doc) into every
-  # test derivation, recursing through `tests` sub-attrsets. Stops at derivations
-  # (never forces their internals); each recursed leaf goes through `tryEval`, so
-  # a test that throws when forced is passed through untouched to error on its own.
+  # Drop tests unavailable under the run's profile (see build_tests_expr doc),
+  # recursing through `tests` sub-attrsets. Stops at derivations (never forces
+  # their internals); each recursed leaf goes through `tryEval`, so a test that
+  # throws when forced is passed through untouched to error on its own.
   mark = t:
     if lib.isDerivation t then
-      t // {
-        meta = (t.meta or { }) // {
-          unsupported = !(lib.meta.availableOn host t);
-          insecure = (t.meta.knownVulnerabilities or [ ]) != [ ];
-        };
-      }
+      (if (!(lib.meta.availableOn host t) && !@ALLOW_UNSUP@)
+          || ((t.meta.knownVulnerabilities or [ ]) != [ ] && !@ALLOW_INSEC@)
+       then { }
+       else t)
     else if lib.isAttrs t then
       lib.mapAttrs (_: v: let r = builtins.tryEval (mark v); in if r.success then r.value else v) t
       // { recurseForDerivations = true; }
@@ -374,8 +338,13 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 // { recurseForDerivations = true; }
 "#;
     TEMPLATE
-        .replace("@PKGS@", &build_expr(repo, rev, system))
+        .replace(
+            "@PKGS@",
+            &build_expr(repo, rev, system, &profile_config(profile)),
+        )
         .replace("@ATTRS@", &list)
+        .replace("@ALLOW_UNSUP@", nixbool(profile.unsupported))
+        .replace("@ALLOW_INSEC@", nixbool(profile.insecure))
 }
 
 /// Evaluate the `passthru.tests` of several `(commit, system, packages)`
@@ -407,6 +376,7 @@ pub fn eval_tests(
     requests: &[(Rev, String, Vec<String>)],
     nodes: Vec<Arc<live::Node>>,
     opts: EvalOpts,
+    profile: Profile,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<TestJob>>> {
     if requests.is_empty() {
@@ -448,7 +418,7 @@ pub fn eval_tests(
         handle,
         |gi, label, pkgs, on_item| {
             let (rev, system) = meta[gi];
-            let expr = build_tests_expr(repo, &rev.commit, system, pkgs);
+            let expr = build_tests_expr(repo, &rev.commit, system, pkgs, profile);
             stream_jobs(
                 &expr,
                 1,
@@ -679,8 +649,11 @@ fn add_phase(
 /// space the shards partition. Cheap (well under a second warm): forcing
 /// `attrNames` touches no derivations. The literal `recurseForDerivations`
 /// key is dropped to mirror how `nix-eval-jobs` skips it when walking a set.
-fn enumerate_names(repo: &Path, rev: &str, system: &str) -> Result<Vec<String>> {
-    let expr = format!("builtins.attrNames ({})", build_expr(repo, rev, system));
+fn enumerate_names(repo: &Path, rev: &str, system: &str, config: &str) -> Result<Vec<String>> {
+    let expr = format!(
+        "builtins.attrNames ({})",
+        build_expr(repo, rev, system, config)
+    );
     let out = scrub_env(
         Command::new("nix-instantiate").args(["--eval", "--strict", "--json", "-E", &expr]),
     )
@@ -703,12 +676,12 @@ fn enumerate_names(repo: &Path, rev: &str, system: &str) -> Result<Vec<String>> 
 /// per-attr in the worker, so walk semantics and error isolation match the
 /// monolithic root exactly — validated byte-for-byte against a whole-set eval
 /// (DESIGN §6).
-fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String]) -> String {
+fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], config: &str) -> String {
     let list = nix_string_list(names);
     format!(
         "let pkgs = {}; in builtins.listToAttrs \
          (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
-        build_expr(repo, rev, system)
+        build_expr(repo, rev, system, config)
     )
 }
 
@@ -728,7 +701,7 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &
     format!(
         "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
          (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
-        build_expr_cfg(repo, rev, system, config)
+        build_expr(repo, rev, system, config)
     )
 }
 
@@ -786,6 +759,7 @@ pub fn instantiate_prepare(
 pub fn instantiate_execute(
     repo: &Path,
     inst: Instantiate,
+    profile: Profile,
     handle: live::LiveHandle<'_>,
 ) -> Result<()> {
     let Instantiate { requests, nodes } = inst;
@@ -811,7 +785,7 @@ pub fn instantiate_execute(
         handle,
         |gi, label, paths, on_item| {
             let (rev, system) = meta[gi];
-            let expr = select_expr(repo, &rev.commit, system, paths, EVAL_CONFIG);
+            let expr = select_expr(repo, &rev.commit, system, paths, &profile_config(profile));
             // Streamed rows are discarded (mapped to `()`); the `.drv` writes are
             // the point. The per-job callback drives the live count.
             stream_jobs(
@@ -826,107 +800,6 @@ pub fn instantiate_execute(
         },
         |_, _| Ok(()),
     )
-}
-
-/// Decide the *transitively* meta-blocked changed attrs (DESIGN §6). For each
-/// request `(rev, system, attrs)`, evaluate those attr paths at
-/// `(rev.commit, system)` under [`STRICT_CONFIG`] and return, per request, the
-/// attrs that **threw** — broken/unsupported/insecure, or forcing such a
-/// dependency — exactly the packages nixpkgs-review's stricter walk drops.
-///
-/// This is the targeted analogue of nixpkgs-review's second eval
-/// (`evalAttrs.nix`), narrowed to the changed set. npb's full eval runs
-/// allow-everything so meta-blocked packages still yield a drv (§6) — which can't
-/// reveal that a *dependency* is blocked — so the evaluator is asked directly
-/// here: precise and per-attr (the throw depends on which attr's `meta` is
-/// forced), with no closure guesswork. A clean attr comes back with a `drvPath`;
-/// a thrown one carries only an `error`, so `drv_path` is `None`.
-///
-/// Same shard scheduler as [`eval_tests`]/[`instantiate_execute`] — one shard per
-/// request, concurrency across requests, the light [`SLOT_MEM_MB`] budget (these
-/// are ordinary workers, not the heavy `--tests` ones). Callers pass only the
-/// attrs whose verdict isn't already cached (`store::Store::blocked_verdicts`);
-/// an all-empty `requests` does nothing.
-pub fn eval_availability(
-    repo: &Path,
-    requests: &[(Rev, String, Vec<String>)],
-    opts: EvalOpts,
-    tree: &live::Tree,
-    handle: live::LiveHandle<'_>,
-) -> Result<Vec<HashSet<String>>> {
-    if requests.iter().all(|(_, _, a)| a.is_empty()) {
-        return Ok(requests.iter().map(|_| HashSet::new()).collect());
-    }
-    let slots = default_slots(SLOT_MEM_MB, opts.slots);
-    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
-    let groups: Vec<(String, String)> = requests
-        .iter()
-        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
-        .collect();
-    let nodes = add_phase(tree, "check", &groups, Leaf::Count);
-    let labels: Vec<String> = requests
-        .iter()
-        .map(|(rev, sys, _)| format!("check {} ({sys})", rev.display))
-        .collect();
-    let items: Vec<Vec<String>> = requests.iter().map(|(_, _, a)| a.clone()).collect();
-    let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
-    // One shard per request (size at the largest), like instantiate: the cost is
-    // the per-key nixpkgs import, so sub-slicing a handful of attrs buys nothing.
-    let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    // Per request, the attrs that evaluated cleanly (a drv — i.e. did not throw).
-    let clean: Vec<Mutex<HashSet<String>>> = (0..requests.len())
-        .map(|_| Mutex::new(HashSet::new()))
-        .collect();
-
-    run_shards(
-        nodes,
-        labels,
-        items,
-        shard_size,
-        slots,
-        // One streamed job per requested attr (clean *and* thrown attrs each emit
-        // a line), so `items.len()` is the denominator.
-        true,
-        handle,
-        |gi, label, attrs, on_item| {
-            let (rev, system) = meta[gi];
-            let expr = select_expr(repo, &rev.commit, system, attrs, STRICT_CONFIG);
-            // `attrPath` (unquoted, joined) matches the requested path even when
-            // it contains a `.` that nix-eval-jobs would quote in `attr`.
-            stream_jobs(
-                &expr,
-                1,
-                per_worker_mb,
-                false,
-                label,
-                |raw| (raw.attr_path.join("."), raw.drv_path.is_some()),
-                || on_item(1),
-            )
-        },
-        |gi, rows| {
-            let mut set = clean[gi].lock().unwrap();
-            for (attr, present) in rows {
-                if present {
-                    set.insert(attr);
-                }
-            }
-            Ok(())
-        },
-    )?;
-
-    // Blocked = requested attrs that did not come back clean (they threw).
-    Ok(requests
-        .iter()
-        .enumerate()
-        .map(|(gi, (_, _, attrs))| {
-            let clean = clean[gi].lock().unwrap();
-            attrs
-                .iter()
-                .filter(|a| !clean.contains(*a))
-                .cloned()
-                .collect()
-        })
-        .collect())
 }
 
 // --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
@@ -1143,16 +1016,21 @@ fn run_shards<T: Send>(
 /// are held there too), so an interrupted eval re-runs from scratch rather than
 /// resuming; when an eval's last shard lands, its rows are assembled and
 /// written as the one cached file.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_pairs(
     repo: &Path,
     pairs: &[(Rev, String)],
     opts: EvalOpts,
+    profile: Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
-    // Called with a `system` the moment one of its eval files lands, so the
+    // Called with a bare `system` the moment one of its eval files lands, so the
     // caller can compute that system's diff and show its `tests` early (DESIGN §9).
     on_eval_done: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
+    // The nixpkgs config every shard evaluates under, and the profile token that
+    // prefixes each eval file's system key on disk (`Profile::qualify`).
+    let config = profile_config(profile);
     let mut todo: Vec<usize> = Vec::new();
     // Systems with a cache hit this run — signalled to `on_eval_done` once the
     // eval nodes exist (below), so their `tests` can appear early while the cold
@@ -1163,7 +1041,7 @@ pub fn eval_pairs(
     // concurrently — harmless (the write is atomic) but 2× the work.
     let mut seen = std::collections::HashSet::new();
     for (i, (rev, system)) in pairs.iter().enumerate() {
-        let path = eval_path(&rev.tree, system)?;
+        let path = eval_path(&rev.tree, &profile.qualify(system))?;
         if path.exists() {
             // A cache hit: mark the file used now so LRU eviction (`--clean`,
             // DESIGN.md §4) keeps a frequently-reused eval (e.g. a shared base)
@@ -1239,7 +1117,7 @@ pub fn eval_pairs(
         handle,
         |gi, _label, _slice, on_item| {
             let (rev, system) = meta[gi];
-            let names = enumerate_names(repo, &rev.commit, system)?;
+            let names = enumerate_names(repo, &rev.commit, system, &config)?;
             on_item(names.len());
             Ok(names)
         },
@@ -1269,7 +1147,7 @@ pub fn eval_pairs(
         // Evaluate one shard by streaming its own one-worker `nix-eval-jobs`.
         |gi, label, names, on_item| {
             let (rev, system) = meta[gi];
-            let expr = shard_expr(repo, &rev.commit, system, names);
+            let expr = shard_expr(repo, &rev.commit, system, names, &config);
             stream_jobs(
                 &expr,
                 1,
@@ -1285,7 +1163,7 @@ pub fn eval_pairs(
         // system to land lets the caller diff it and reveal its `tests` (§9).
         |gi, rows| {
             let (rev, system) = meta[gi];
-            write_eval(&eval_path(&rev.tree, system)?, &rows)?;
+            write_eval(&eval_path(&rev.tree, &profile.qualify(system))?, &rows)?;
             on_eval_done(system);
             Ok(())
         },
@@ -1302,6 +1180,7 @@ pub fn eval_two(
     head: &Rev,
     systems: &[String],
     opts: EvalOpts,
+    profile: Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
     on_eval_done: &(dyn Fn(&str) + Sync),
@@ -1314,7 +1193,7 @@ pub fn eval_two(
         pairs.push((base.clone(), s.clone()));
         pairs.push((head.clone(), s.clone()));
     }
-    eval_pairs(repo, &pairs, opts, tree, handle, on_eval_done)
+    eval_pairs(repo, &pairs, opts, profile, tree, handle, on_eval_done)
 }
 
 #[cfg(test)]
@@ -1334,40 +1213,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_success_skipped_and_error_lines() {
-        // Any of meta.broken/unsupported/insecure folds into the one `skipped`
-        // bit; an errored attr has no drvPath (and no meta). Unknown fields
-        // (system, fatal, …) are simply ignored.
+    fn parses_success_and_threw_lines() {
+        // Under the profile config, an attr either resolves to a `drvPath` or
+        // **threw** — the job line then carries an `error` and no `drvPath`, so
+        // `drv_path` is `None`. There is no `meta`. Unknown fields (system,
+        // fatal, …) are simply ignored.
         let stdout = concat!(
-            r#"{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/a-hello.drv","meta":{"broken":false,"unsupported":false},"system":"aarch64-linux"}"#,
-            "\n",
-            r#"{"attr":"br","attrPath":["br"],"drvPath":"/nix/store/b-br.drv","meta":{"broken":true}}"#,
-            "\n",
-            r#"{"attr":"unsup","attrPath":["unsup"],"drvPath":"/nix/store/c-unsup.drv","meta":{"unsupported":true}}"#,
+            r#"{"attr":"hello","attrPath":["hello"],"drvPath":"/nix/store/a-hello.drv","system":"aarch64-linux"}"#,
             "\n",
             r#"{"attr":"bad","attrPath":["bad"],"error":"boom","fatal":false}"#,
             "\n",
         );
         let attrs = parse_jobs(stdout.as_bytes()).unwrap();
-        assert_eq!(attrs.len(), 4);
+        assert_eq!(attrs.len(), 2);
 
         assert_eq!(attrs[0].attr, "hello");
         assert_eq!(attrs[0].drv_path.as_deref(), Some("/nix/store/a-hello.drv"));
-        assert!(!attrs[0].skipped);
 
-        assert!(attrs[1].skipped);
-        assert!(attrs[1].drv_path.is_some());
-        assert!(attrs[2].skipped);
+        assert_eq!(attrs[1].attr, "bad");
+        assert_eq!(attrs[1].drv_path, None); // threw
+    }
 
-        assert_eq!(attrs[3].attr, "bad");
-        assert_eq!(attrs[3].drv_path, None);
-        assert!(!attrs[3].skipped);
+    #[test]
+    fn profile_config_reflects_the_allow_flags() {
+        // Strict allows only unfree; each axis adds exactly its allow-flag.
+        let strict = Profile {
+            broken: false,
+            unsupported: false,
+            insecure: false,
+        };
+        assert_eq!(profile_config(strict), "{ allowUnfree = true; }");
+        let all = Profile {
+            broken: true,
+            unsupported: true,
+            insecure: true,
+        };
+        let c = profile_config(all);
+        assert!(c.contains("allowBroken = true"));
+        assert!(c.contains("allowUnsupportedSystem = true"));
+        assert!(c.contains("allowInsecurePredicate = _: true"));
     }
 
     #[test]
     fn full_expr_fetches_and_imports() {
         let repo = Path::new("/repo");
-        let full = build_expr(repo, "abc123", "aarch64-linux");
+        let full = build_expr(repo, "abc123", "aarch64-linux", "{ allowBroken = true; }");
         assert!(full.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
         assert!(full.contains("allowBroken = true"));
     }
@@ -1394,6 +1284,7 @@ mod tests {
             "abc123",
             "aarch64-linux",
             &["hello".into(), "with\"quote".into()],
+            "{ allowUnfree = true; }",
         );
         // The same import as the whole-set walk, narrowed via listToAttrs,
         // names escaped.
