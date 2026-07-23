@@ -207,9 +207,12 @@ fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<b
 /// unchanged PR makes this a near-free "up to date" fetch, and the tree-keyed
 /// eval/build caches still hit (DESIGN §6), so only the pointer is refreshed.
 ///
-/// The default (merge) shape reuses GitHub's `merge` commit verbatim — it *is*
-/// the head merged onto the base — so there's no local merge, and the diff is
-/// exactly what ofborg/Hydra evaluate. `--no-merge` diffs from the merge-base of
+/// The default (merge) shape mints npb's *own* merge of the base tip (`merge^1`)
+/// and PR head (`merge^2`); GitHub's test-merge tree is discarded rather than
+/// adopted, so a diff-based repro can re-merge to the identical tree — a
+/// soundness requirement (see the body and DESIGN §6). The delta is the head
+/// merged onto the current base, the same shape ofborg/Hydra evaluate.
+/// `--no-merge` diffs from the merge-base of
 /// `merge^1` and the PR head (the PR's fork point on its real base branch).
 /// GitHub keeps the `merge` ref only while a PR is open — even a conflicting
 /// open PR keeps a (stale) one — so a *missing* `merge` ref means the PR is
