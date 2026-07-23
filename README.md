@@ -267,7 +267,7 @@ npb --allow-broken
 
 ### `--allow-insecure`
 
-By default, `npb` sets [`allowBroken`](hhttps://nixos.org/manual/nixpkgs/stable/#sec-allow-insecure) to a constant `false`. To set it to a constant `true` instead:
+By default, `npb` sets [`allowInsecurePredicate`](https://nixos.org/manual/nixpkgs/stable/#sec-allow-insecure) to a constant `false`. To set it to a constant `true` instead:
 
 ```sh
 npb --allow-insecure
