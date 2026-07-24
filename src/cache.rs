@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -145,58 +145,75 @@ fn drv_outputs_many(drvs: &[String]) -> HashMap<String, Vec<String>> {
     map
 }
 
-/// Probe several drvs at once, returning `drv -> substitutable?`. First resolves
-/// every drv's outputs in a couple of batched `nix derivation show` calls
-/// ([`drv_outputs_many`]), then a shared cursor hands each of
-/// [`PROBE_CONCURRENCY`] workers the next drv, all sharing one pooled agent so
-/// the wall time is `ceil(n / workers)` *reused-connection* round-trips.
+/// Probe several drvs at once, returning `drv -> substitutable?`. Runs as a
+/// pipeline: a producer thread resolves each drv's output paths in batched
+/// `nix derivation show` calls ([`drv_outputs_many`]) and feeds `(drv, outputs)`
+/// to a pool of [`PROBE_CONCURRENCY`] workers that HEAD each output on the
+/// substituter, all sharing one pooled agent so connections are reused. The two
+/// halves **overlap**: the network HEADs start the moment the *first* chunk
+/// resolves rather than after the whole set, so on a cold changed set of tens of
+/// thousands of drvs the wall time is ~`max(resolve, probe)` and `progress`
+/// climbs from the first second instead of sitting at zero through a minute of
+/// upfront resolution.
 ///
 /// A drv is substitutable iff ALL its outputs are in the cache — the recorded
 /// `Cache`/`Built` fact stands for the whole drv, and one missing output of a
 /// multi-output drv (a partial upload, an evicting substituter) would still
-/// force a local build. A drv absent from the resolved map (not in the store,
-/// or floating CA) probes as not-substitutable: the safe direction.
+/// force a local build. A drv whose outputs don't resolve (not in the store, or
+/// floating CA) probes as not-substitutable: the safe direction.
 ///
-/// `progress(1)` is called as each drv resolves, so a caller can render progress
-/// for this otherwise-silent (and, on a first run over a big changed set,
-/// minute-long) network phase.
+/// `progress(1)` is called as each drv is probed, so a caller can render
+/// progress for this otherwise-silent network phase.
 pub fn in_cache_many(drvs: &[String], progress: &(dyn Fn(usize) + Sync)) -> HashMap<String, bool> {
     if drvs.is_empty() {
         return HashMap::new();
     }
-    let outputs = drv_outputs_many(drvs);
     let agent = ureq::AgentBuilder::new()
         .max_idle_connections(PROBE_CONCURRENCY)
         .max_idle_connections_per_host(PROBE_CONCURRENCY)
         .timeout(Duration::from_secs(15))
         .build();
-    let cursor = AtomicUsize::new(0);
-    let workers = PROBE_CONCURRENCY.min(drvs.len());
-    let results: Vec<(String, bool)> = thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let (agent, outputs, cursor) = (&agent, &outputs, &cursor);
-                s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some(drv) = drvs.get(i) else { break };
-                        let sub = outputs.get(drv).is_some_and(|outs| {
-                            !outs.is_empty() && outs.iter().all(|o| output_in_cache(agent, o))
-                        });
-                        local.push((drv.clone(), sub));
-                        progress(1);
+    // Resolved `(drv, its output paths)` flow from the producer to the probe
+    // workers over this queue; the workers share the receiver behind a mutex.
+    let (tx, rx) = mpsc::channel::<(String, Vec<String>)>();
+    let rx = Mutex::new(rx);
+    let out = Mutex::new(HashMap::new());
+    thread::scope(|s| {
+        // Producer: resolve outputs chunk by chunk and feed the queue. A drv that
+        // doesn't resolve is still sent (with no outputs) so it records a result
+        // (not substitutable). Dropping `tx` at the end closes the queue.
+        s.spawn(move || {
+            for chunk in drvs.chunks(DERIVATION_SHOW_CHUNK) {
+                let outputs = drv_outputs_many(chunk);
+                for drv in chunk {
+                    let outs = outputs.get(drv).cloned().unwrap_or_default();
+                    if tx.send((drv.clone(), outs)).is_err() {
+                        return;
                     }
-                    local
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
+                }
+            }
+        });
+        // Consumers: HEAD each drv's outputs. The lock is held only to dequeue —
+        // the HEADs run unlocked, so the workers probe concurrently.
+        let workers = PROBE_CONCURRENCY.min(drvs.len());
+        for _ in 0..workers {
+            let (agent, rx, out) = (&agent, &rx, &out);
+            s.spawn(move || {
+                loop {
+                    // Dequeue under the lock, then drop it *before* the HEADs so the
+                    // workers probe concurrently (not one at a time). `recv` blocks
+                    // until an item arrives or the producer drops `tx` and the queue
+                    // drains, which ends the loop.
+                    let next = rx.lock().unwrap().recv();
+                    let Ok((drv, outs)) = next else { break };
+                    let sub = !outs.is_empty() && outs.iter().all(|o| output_in_cache(agent, o));
+                    out.lock().unwrap().insert(drv, sub);
+                    progress(1);
+                }
+            });
+        }
     });
-    results.into_iter().collect()
+    out.into_inner().unwrap()
 }
 
 #[cfg(test)]
