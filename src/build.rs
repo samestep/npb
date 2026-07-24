@@ -95,7 +95,12 @@ const VERB_W: usize = 8;
 fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
-    nix.arg("build").args(&installables).args([
+    nix.arg("build").args([
+        // Installables come over stdin (`--stdin`, one per line, written below),
+        // not argv: a mass-rebuild changed set is tens of thousands of `<drv>^*`
+        // and would blow past `ARG_MAX` ("Argument list too long") on the command
+        // line. Still ONE `nix build` — nix schedules the whole set together.
+        "--stdin",
         "--keep-going",
         // No ./result* out-links: they'd litter the cwd (the user's nixpkgs
         // checkout) and pin every built output as a GC root — npb keeps no
@@ -108,10 +113,26 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
         "nix-command",
     ]);
     let mut nix = nix
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning nix build")?;
+    // Feed the installables to nix's stdin from a separate thread: nix reads the
+    // whole list (to EOF) before building, and the list can be megabytes, so
+    // writing it inline while we're not yet draining stderr could deadlock (both
+    // pipes full). The thread writes each `<drv>^*` line then drops the handle,
+    // whose close is the EOF nix waits for.
+    let writer = {
+        let mut stdin = nix.stdin.take().expect("stdin is piped");
+        thread::spawn(move || -> std::io::Result<()> {
+            for inst in &installables {
+                stdin.write_all(inst.as_bytes())?;
+                stdin.write_all(b"\n")?;
+            }
+            Ok(())
+        })
+    };
     // nom renders the colored, redrawn build tree — but only when we'd colorize
     // at all (it honors neither NO_COLOR (#129) nor a non-TTY). Otherwise we parse
     // the same internal-json stream (unchanged — that's what records outcomes and
@@ -193,6 +214,16 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
     let _ = nix.wait().context("waiting for nix build")?;
     if let Some(mut nom) = nom {
         let _ = nom.wait();
+    }
+    // Join the stdin feeder. A BrokenPipe is expected when nix exited early or we
+    // killed it above — it stopped reading, and the outcomes recorded from its
+    // stderr are authoritative regardless. Surface any *other* write failure, but
+    // only when the stream itself was clean (else that error is the real one).
+    match writer.join() {
+        Ok(Err(e)) if e.kind() != std::io::ErrorKind::BrokenPipe && streamed.is_ok() => {
+            return Err(e).context("feeding installables to nix build");
+        }
+        _ => {}
     }
     streamed?;
     Ok(())
