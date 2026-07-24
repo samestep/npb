@@ -162,11 +162,15 @@ fn drv_outputs_many(drvs: &[String]) -> HashMap<String, Vec<String>> {
 /// force a local build. A drv whose outputs don't resolve (not in the store, or
 /// floating CA) probes as not-substitutable: the safe direction.
 ///
-/// `on_result` runs on the **caller's** thread (the workers only feed it over a
-/// channel), one verdict at a time — so it may own non-`Sync` state such as the
-/// SQLite store, and record each hit *as it lands* rather than batching at the
-/// end. That is what lets a ^C mid-probe keep the hits found so far (DESIGN §7).
-pub fn in_cache_many(drvs: &[String], mut on_result: impl FnMut(&str, bool)) {
+/// `on_batch` runs on the **caller's** thread (the workers only feed it over a
+/// channel), each call handed a *coalesced burst* of verdicts: the consumer
+/// blocks for one, then drains everything already buffered into the same slice.
+/// So the caller may own non-`Sync` state such as the SQLite store, and commit a
+/// whole burst of hits in one transaction rather than one autocommit per hit
+/// (fsync-bound; DESIGN §7) or one batch at the very end (a ^C would lose it
+/// all). The coalescing is self-tuning: when writes lag, the buffer fills and
+/// batches grow; when verdicts trickle in, batches shrink toward one.
+pub fn in_cache_many(drvs: &[String], mut on_batch: impl FnMut(&[(String, bool)])) {
     if drvs.is_empty() {
         return;
     }
@@ -218,10 +222,15 @@ pub fn in_cache_many(drvs: &[String], mut on_result: impl FnMut(&str, bool)) {
         // Drop this thread's sender so `res_rx` ends once every worker's clone is
         // gone (all probing done).
         drop(res_tx);
-        // Consumer (this thread): report each verdict as it lands. Single-
-        // threaded, so `on_result` needn't be `Sync` and can mutate the store.
-        for (drv, sub) in res_rx {
-            on_result(&drv, sub);
+        // Consumer (this thread): block for one verdict, then drain whatever else
+        // has buffered into the same batch and hand it off. Single-threaded, so
+        // `on_batch` needn't be `Sync` and can mutate the store.
+        while let Ok(first) = res_rx.recv() {
+            let mut batch = vec![first];
+            while let Ok(v) = res_rx.try_recv() {
+                batch.push(v);
+            }
+            on_batch(&batch);
         }
     });
 }

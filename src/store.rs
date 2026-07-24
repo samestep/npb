@@ -122,6 +122,29 @@ impl Store {
         Ok(())
     }
 
+    /// Append a `Built` observation for each of `drvs` (cache hits, DESIGN.md §7)
+    /// in **one transaction** — the batched form of [`add_observation`] for the
+    /// probe. Its hits would otherwise be one autocommit apiece, and in WAL mode
+    /// each commit `fsync`s the WAL (~200 rows/s), so a mass rebuild's tens of
+    /// thousands of hits cost ~minutes of pure `fsync`; one transaction amortizes
+    /// that to a single sync. A hit carries no blocker (NULL), and drv paths are
+    /// stored stripped, exactly as [`add_observation`] writes them.
+    pub fn record_cache_hits(&mut self, drvs: &[&str]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO observation (drv_path, outcome, blocker) \
+                 VALUES (?1, ?2, NULL)",
+            )?;
+            let built = outcome_code(Outcome::Built);
+            for drv in drvs {
+                stmt.execute(params![strip_drv(drv), built])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// All observations for a derivation, oldest first.
     pub fn load_observations(&self, drv_path: &str) -> Result<Vec<Observation>> {
         Ok(self
