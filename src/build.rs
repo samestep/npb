@@ -22,6 +22,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -195,24 +198,58 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
     Ok(())
 }
 
+/// How many `nix-store --check-validity` chunks to run at once. These are
+/// independent daemon queries; the daemon parallelizes validity lookups and
+/// plateaus around here (measured ~2.7x over sequential on a mass rebuild's
+/// checks, flat past ~8), while the cap keeps npb from spawning a hundred
+/// `nix-store` processes on a huge changed set.
+const CHECK_VALIDITY_CONCURRENCY: usize = 8;
+
 /// Which of `paths` are NOT valid in the local store (i.e. weren't built).
 fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
     if paths.is_empty() {
         return Ok(HashSet::new());
     }
-    // Prints the invalid subset; exits non-zero when some are invalid, which is
-    // expected — parse stdout regardless. Chunked to stay under ARG_MAX; validity
-    // is per-path independent, so the invalid set is the union over the chunks.
-    let mut invalid = HashSet::new();
-    for chunk in paths.chunks(NIX_STORE_ARG_CHUNK) {
-        let out = Command::new("nix-store")
-            .args(["--check-validity", "--print-invalid"])
-            .args(chunk)
-            .output()
-            .context("running nix-store --check-validity")?;
-        invalid.extend(cache::lines(&out.stdout));
+    // `--print-invalid` prints the invalid subset (exits non-zero when some are
+    // invalid — expected, so parse stdout regardless). Chunked to stay under
+    // ARG_MAX, and the chunks run concurrently: validity is per-path independent,
+    // so the invalid set is the union over the chunks, and on a mass-rebuild
+    // changed set (~400k drvs, ~100 chunks) the serial spawns were ~16s of the
+    // pre-probe wait — the daemon happily serves them in parallel.
+    let chunks: Vec<&[String]> = paths.chunks(NIX_STORE_ARG_CHUNK).collect();
+    let cursor = AtomicUsize::new(0);
+    let invalid = Mutex::new(HashSet::new());
+    let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let workers = CHECK_VALIDITY_CONCURRENCY.min(chunks.len());
+    thread::scope(|s| {
+        for _ in 0..workers {
+            let (cursor, chunks, invalid, err) = (&cursor, &chunks, &invalid, &err);
+            s.spawn(move || {
+                loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(i) else { break };
+                    match Command::new("nix-store")
+                        .args(["--check-validity", "--print-invalid"])
+                        .args(*chunk)
+                        .output()
+                    {
+                        Ok(out) => invalid.lock().unwrap().extend(cache::lines(&out.stdout)),
+                        Err(e) => {
+                            *err.lock().unwrap() = Some(
+                                anyhow::Error::from(e)
+                                    .context("running nix-store --check-validity"),
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = err.into_inner().unwrap() {
+        return Err(e);
     }
-    Ok(invalid)
+    Ok(invalid.into_inner().unwrap())
 }
 
 /// The build closure of `drvs` as a set of store paths — every input `.drv`
