@@ -27,8 +27,10 @@ use crate::prompt::confirm;
 /// The current eval-cache format version. Bump when the eval-file layout or an
 /// eval-derived table changes incompatibly; the bump wipes the old eval cache on
 /// first run (see [`ensure_current`]). Version 1 introduced profile-qualified
-/// eval keys (`<token>/<system>`) and dropped the eval-file meta bit.
-const CURRENT: u32 = 1;
+/// eval keys (`<token>/<system>`) and dropped the eval-file meta bit. Version 2
+/// added `allowAliases = false` to the eval config, dropping redundant alias
+/// attrs (e.g. `claude-code-bin`) from every eval.
+const CURRENT: u32 = 2;
 
 /// The version-marker file at the cache root.
 fn version_path() -> Result<PathBuf> {

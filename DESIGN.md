@@ -356,7 +356,10 @@ nixpkgs source _tree_, the platform, and the nixpkgs _config_ (allowlists like
 …). The trap is letting a user pass arbitrary Nix as config — that isn't cleanly
 hashable. `npb` avoids it by **deriving the config from a bounded profile**:
 three boolean axes (`--allow-broken` / `--allow-unsupported` / `--allow-insecure`),
-with `allowUnfree` always on (matching nixpkgs-review). That's eight hashable
+with `allowUnfree` always on and `allowAliases` always off (both matching
+nixpkgs-review; `allowAliases = false` drops redundant alias attrs like
+`claude-code-bin`, which resolve to the same drv as their target, so ofborg /
+nixpkgs-review / npb all see the same package set). That's eight hashable
 values, not arbitrary Nix. On disk the profile is a three-character token — one
 position per axis, its letter when allowed else `-` (`---` strict, `ubi`
 allow-everything, `u-i` unsupported+insecure) — prefixed onto the system to form

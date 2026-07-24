@@ -31,11 +31,16 @@ use crate::model::{AttrEval, Profile, Rev, TestJob};
 /// broken/unsupported/insecure package (and anything forcing such a dependency)
 /// throws and falls out, precisely and for free; the throw *is* the signal, so
 /// there's no `--meta` and no post-hoc reclassification. `allowUnfree` is always
-/// on (matching nixpkgs-review); the three allow-flags are added only when the
-/// profile permits them. The profile is part of the eval cache key
-/// ([`Profile::qualify`]), so different profiles never share an eval file.
+/// on and `allowAliases` always off (both matching nixpkgs-review): aliases like
+/// `claude-code-bin` resolve to the same drv as their target, so evaluating them
+/// only adds a redundant attr to the changed set (collapsed onto its target's
+/// line in the report, but still noise); `allowAliases = false` makes them throw
+/// and fall out at eval, exactly as ofborg/nixpkgs-review see the package set.
+/// The three allow-flags are added only when the profile permits them. The
+/// profile is part of the eval cache key ([`Profile::qualify`]), so different
+/// profiles never share an eval file.
 fn profile_config(profile: Profile) -> String {
-    let mut s = String::from("{ allowUnfree = true;");
+    let mut s = String::from("{ allowUnfree = true; allowAliases = false;");
     if profile.broken {
         s.push_str(" allowBroken = true;");
     }
@@ -1242,7 +1247,10 @@ mod tests {
             unsupported: false,
             insecure: false,
         };
-        assert_eq!(profile_config(strict), "{ allowUnfree = true; }");
+        assert_eq!(
+            profile_config(strict),
+            "{ allowUnfree = true; allowAliases = false; }"
+        );
         let all = Profile {
             broken: true,
             unsupported: true,
