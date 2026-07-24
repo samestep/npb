@@ -31,6 +31,12 @@ use crate::live;
 use crate::model::{BuildPolicy, Decision, Observation, Outcome};
 use crate::store::Store;
 
+/// Store paths per `nix-store` invocation — keeps the argv well under `ARG_MAX`
+/// on a huge changed set (a staging-next mass rebuild would otherwise fail with
+/// `Argument list too long`), while still collapsing thousands of paths into a
+/// handful of subprocess spawns. Mirrors `cache::DERIVATION_SHOW_CHUNK`.
+const NIX_STORE_ARG_CHUNK: usize = 4096;
+
 /// One derivation to consider building. Produced from either an explicit eval
 /// or a diff's changed set. A meta-blocked package never becomes a target: it
 /// threw during eval under the profile, so it has no drv (DESIGN §6).
@@ -195,13 +201,18 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
         return Ok(HashSet::new());
     }
     // Prints the invalid subset; exits non-zero when some are invalid, which is
-    // expected — parse stdout regardless.
-    let out = Command::new("nix-store")
-        .args(["--check-validity", "--print-invalid"])
-        .args(paths)
-        .output()
-        .context("running nix-store --check-validity")?;
-    Ok(cache::lines(&out.stdout).into_iter().collect())
+    // expected — parse stdout regardless. Chunked to stay under ARG_MAX; validity
+    // is per-path independent, so the invalid set is the union over the chunks.
+    let mut invalid = HashSet::new();
+    for chunk in paths.chunks(NIX_STORE_ARG_CHUNK) {
+        let out = Command::new("nix-store")
+            .args(["--check-validity", "--print-invalid"])
+            .args(chunk)
+            .output()
+            .context("running nix-store --check-validity")?;
+        invalid.extend(cache::lines(&out.stdout));
+    }
+    Ok(invalid)
 }
 
 /// The build closure of `drvs` as a set of store paths — every input `.drv`
@@ -213,18 +224,24 @@ fn drv_closure(drvs: &[&str]) -> Result<HashSet<String>> {
     if drvs.is_empty() {
         return Ok(HashSet::new());
     }
-    let out = Command::new("nix-store")
-        .args(["--query", "--requisites"])
-        .args(drvs)
-        .output()
-        .context("running nix-store --query --requisites")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "nix-store --query --requisites failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    // Chunked to stay under ARG_MAX; the requisites of a set of drvs is the
+    // union of each drv's requisites, so unioning the per-chunk output is exact.
+    let mut reqs = HashSet::new();
+    for chunk in drvs.chunks(NIX_STORE_ARG_CHUNK) {
+        let out = Command::new("nix-store")
+            .args(["--query", "--requisites"])
+            .args(chunk)
+            .output()
+            .context("running nix-store --query --requisites")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "nix-store --query --requisites failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        reqs.extend(cache::lines(&out.stdout));
     }
-    Ok(cache::lines(&out.stdout).into_iter().collect())
+    Ok(reqs)
 }
 
 /// Did this drv's build succeed — are all its outputs valid in the local

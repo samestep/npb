@@ -66,6 +66,14 @@ fn placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// Maximum items to bind into one `IN (…)` clause. SQLite caps the number of
+/// bound parameters per statement (`SQLITE_MAX_VARIABLE_NUMBER` — 999 on older
+/// builds, 32766 on newer), and a whole changed set can exceed it: a
+/// staging-next mass rebuild is tens of thousands of drvs. So the `IN (…)`
+/// queries chunk their keys and merge the results. Kept well under even the
+/// historical 999 limit, with headroom for a leading `key_id` param.
+const IN_CHUNK: usize = 900;
+
 pub struct Store {
     conn: Connection,
 }
@@ -132,36 +140,39 @@ impl Store {
     ) -> Result<std::collections::HashMap<String, Vec<Observation>>> {
         let mut out: std::collections::HashMap<String, Vec<Observation>> =
             std::collections::HashMap::new();
-        if drv_paths.is_empty() {
-            return Ok(out);
-        }
-        // `WHERE drv_path IN (?,?,…)` with one placeholder per drv.
-        let placeholders = placeholders(drv_paths.len());
-        let sql = format!(
-            "SELECT drv_path, outcome, blocker \
-             FROM observation WHERE drv_path IN ({placeholders}) ORDER BY id",
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        // The column is stored stripped, so match against the stripped query keys.
-        let params = rusqlite::params_from_iter(drv_paths.iter().map(|d| strip_drv(d)));
-        let rows = stmt.query_map(params, |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (stored_drv, outcome, blocker) = row?;
-            let drv_path = restore_drv(Some(&stored_drv)).expect("Some maps to Some");
-            out.entry(drv_path.clone()).or_default().push(Observation {
-                drv_path,
-                outcome: outcome_from_code(outcome)?,
-                blocker: blocker
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.split('\n').map(restore_out).collect())
-                    .unwrap_or_default(),
-            });
+        // `WHERE drv_path IN (?,?,…)` with one placeholder per drv, chunked to
+        // stay under SQLite's bound-parameter cap (see `IN_CHUNK`). Chunks share
+        // one `ORDER BY id`, so the per-drv "oldest first" order holds within
+        // each chunk; a drv's rows never split across chunks (chunks partition
+        // the key set), so appending chunk by chunk preserves it overall.
+        for chunk in drv_paths.chunks(IN_CHUNK) {
+            let placeholders = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT drv_path, outcome, blocker \
+                 FROM observation WHERE drv_path IN ({placeholders}) ORDER BY id",
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            // The column is stored stripped, so match against the stripped query keys.
+            let params = rusqlite::params_from_iter(chunk.iter().map(|d| strip_drv(d)));
+            let rows = stmt.query_map(params, |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (stored_drv, outcome, blocker) = row?;
+                let drv_path = restore_drv(Some(&stored_drv)).expect("Some maps to Some");
+                out.entry(drv_path.clone()).or_default().push(Observation {
+                    drv_path,
+                    outcome: outcome_from_code(outcome)?,
+                    blocker: blocker
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.split('\n').map(restore_out).collect())
+                        .unwrap_or_default(),
+                });
+            }
         }
         Ok(out)
     }
@@ -239,21 +250,22 @@ impl Store {
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(out); // key never recorded ⇒ nothing cached
         };
-        if pkgs.is_empty() {
-            return Ok(out);
-        }
-        let placeholders = placeholders(pkgs.len());
-        let sql = format!(
-            "SELECT pkg_attr FROM test_pkg \
-             WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params = rusqlite::params_from_iter(
-            std::iter::once(key_id.to_string()).chain(pkgs.iter().cloned()),
-        );
-        let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
-        for row in rows {
-            out.insert(row?);
+        // Chunked under SQLite's bound-parameter cap (see `IN_CHUNK`); the
+        // leading `key_id` is one extra param per chunk, well within the margin.
+        for chunk in pkgs.chunks(IN_CHUNK) {
+            let placeholders = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT pkg_attr FROM test_pkg \
+                 WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(
+                std::iter::once(key_id.to_string()).chain(chunk.iter().cloned()),
+            );
+            let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
+            for row in rows {
+                out.insert(row?);
+            }
         }
         Ok(out)
     }
@@ -307,25 +319,26 @@ impl Store {
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(out);
         };
-        if pkgs.is_empty() {
-            return Ok(out);
-        }
-        let placeholders = placeholders(pkgs.len());
-        let sql = format!(
-            "SELECT test_attr, drv_path FROM test_drv \
-             WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params = rusqlite::params_from_iter(
-            std::iter::once(key_id.to_string()).chain(pkgs.iter().cloned()),
-        );
-        let rows = stmt.query_map(params, |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (test_attr, stored) = row?;
-            let drv = restore_drv(Some(&stored)).expect("Some maps to Some");
-            out.insert(test_attr, drv);
+        // Chunked under SQLite's bound-parameter cap (see `IN_CHUNK`); the
+        // leading `key_id` is one extra param per chunk, well within the margin.
+        for chunk in pkgs.chunks(IN_CHUNK) {
+            let placeholders = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT test_attr, drv_path FROM test_drv \
+                 WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(
+                std::iter::once(key_id.to_string()).chain(chunk.iter().cloned()),
+            );
+            let rows = stmt.query_map(params, |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (test_attr, stored) = row?;
+                let drv = restore_drv(Some(&stored)).expect("Some maps to Some");
+                out.insert(test_attr, drv);
+            }
         }
         Ok(out)
     }
@@ -420,6 +433,44 @@ mod tests {
                 .blocker
                 .is_empty()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_observations_many_chunks_past_sql_var_limit() {
+        // A large changed set (a staging-next mass rebuild) yields more drvs
+        // than SQLite's bound-parameter cap, which once overflowed a single
+        // `drv_path IN (…)` query ("too many SQL variables"). Loading > IN_CHUNK
+        // drvs must chunk, lose nothing, and keep per-drv "oldest first" order.
+        let dir = std::env::temp_dir().join(format!("npb-chunk-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
+
+        let n = IN_CHUNK * 2 + 5; // spans three chunks
+        let drv = |i: usize| format!("/nix/store/d{i}.drv");
+        for i in 0..n {
+            // Two observations per drv, oldest (Failed) then newest (Built).
+            for outcome in [Outcome::Failed, Outcome::Built] {
+                s.add_observation(&Observation {
+                    drv_path: drv(i),
+                    outcome,
+                    blocker: Vec::new(),
+                })
+                .unwrap();
+            }
+        }
+
+        let refs: Vec<String> = (0..n).map(drv).collect();
+        let ref_slices: Vec<&str> = refs.iter().map(String::as_str).collect();
+        let got = s.load_observations_many(&ref_slices).unwrap();
+        assert_eq!(got.len(), n);
+        for i in 0..n {
+            let obs = &got[&drv(i)];
+            assert_eq!(obs.len(), 2);
+            assert_eq!(obs[0].outcome, Outcome::Failed); // oldest first, per drv
+            assert_eq!(obs[1].outcome, Outcome::Built);
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
