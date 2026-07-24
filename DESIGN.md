@@ -802,8 +802,13 @@ failure). A hit is recorded as a plain `Built` observation — deliberately
 indistinguishable from a local success, so the one flakiness rule (a success
 outranks failures) covers both — and a later run
 skips the probe; a miss records nothing (re-probing is cheap, and cache state
-can change under us). Ground truth for anything a narinfo can't answer is a
-**local build** (§5).
+can change under us). Each hit is **committed the moment it lands** (its own
+autocommit), not batched at the end of the phase — the probe analogue of §5's
+per-outcome commit — so a ^C mid-probe keeps the hits found so far and a restart
+re-probes only the rest. The probe pipeline resolves outputs and HEADs
+concurrently across workers, but the verdicts stream back to a single thread
+that owns the store, so the append stays serialized without a batch. Ground
+truth for anything a narinfo can't answer is a **local build** (§5).
 
 > Why not Hydra? The public hydra.nixos.org API has **no reverse index** from a
 > store path to a build (search is name-keyed, 500s on paths; no `/store-path`

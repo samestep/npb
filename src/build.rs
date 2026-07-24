@@ -562,40 +562,39 @@ fn probe_candidates(store: &Store, targets: &[Target]) -> Result<Vec<String>> {
     Ok(to_probe)
 }
 
-/// Record a `Built` observation for each probed drv that was a hit — cache
-/// presence and a local build are the same success fact (DESIGN §7).
-fn record_hits(
-    store: &mut Store,
-    to_probe: &[String],
-    probed: &HashMap<String, bool>,
-) -> Result<()> {
-    for drv in to_probe {
-        if probed.get(drv).copied().unwrap_or(false) {
-            store.add_observation(&Observation {
-                drv_path: drv.clone(),
-                outcome: Outcome::Built,
-                blocker: Vec::new(),
-            })?;
-        }
+/// Record one probe verdict: a hit becomes a `Built` observation (cache
+/// presence and a local build are the same success fact, DESIGN §7); a miss
+/// records nothing (re-probing is cheap and cache state can change). Committed
+/// the moment the verdict lands (each observation is its own autocommit), so a
+/// ^C keeps the hits probed so far and a restart skips them — the probe analogue
+/// of the build phase's per-outcome commit (§5). The first write error is
+/// captured into `result` because the probe drain is a `FnMut` that can't return
+/// one; later verdicts are then skipped and the error surfaces after the drain.
+fn record_probe_hit(store: &mut Store, drv: &str, hit: bool, result: &mut Result<()>) {
+    if hit && result.is_ok() {
+        *result = store.add_observation(&Observation {
+            drv_path: drv.to_string(),
+            outcome: Outcome::Built,
+            blocker: Vec::new(),
+        });
     }
-    Ok(())
 }
 
-/// Gather any missing cache facts for `targets`, reporting each resolved drv via
-/// `progress`. Idempotent: a fully-known set probes nothing. The display-less
-/// form used by [`build_targets_at`] (facts are normally already probed by the
-/// tree phase below, so this is a no-op there).
-fn probe_and_record(
-    store: &mut Store,
-    targets: &[Target],
-    progress: &(dyn Fn(usize) + Sync),
-) -> Result<()> {
+/// Gather any missing cache facts for `targets`, reporting each probed drv via
+/// `progress` and recording its hit as it lands. Idempotent: a fully-known set
+/// probes nothing. The display-less form used by [`build_targets_at`] (facts are
+/// normally already probed by the tree phase below, so this is a no-op there).
+fn probe_and_record(store: &mut Store, targets: &[Target], progress: &dyn Fn(usize)) -> Result<()> {
     let to_probe = probe_candidates(store, targets)?;
     if to_probe.is_empty() {
         return Ok(());
     }
-    let probed = cache::in_cache_many(&to_probe, progress);
-    record_hits(store, &to_probe, &probed)
+    let mut result = Ok(());
+    cache::in_cache_many(&to_probe, |drv, hit| {
+        progress(1);
+        record_probe_hit(store, drv, hit, &mut result);
+    });
+    result
 }
 
 /// A prepared narinfo probe: its (blue) tree node, the drvs to probe, and the
@@ -637,12 +636,15 @@ pub fn probe_execute(probe: Probe) -> Result<()> {
         node,
     } = probe;
     node.set_running();
-    let bump = {
-        let n = node.clone();
-        move |k: usize| n.add_count(k as i64)
-    };
-    let probed = cache::in_cache_many(&to_probe, &bump);
-    record_hits(&mut store, &to_probe, &probed)?;
+    // Record each hit the instant it lands, so a ^C keeps the hits probed so far
+    // and a restart skips them (DESIGN §5, §7); the driver bump keeps the node
+    // climbing over the same verdicts.
+    let mut result = Ok(());
+    cache::in_cache_many(&to_probe, |drv, hit| {
+        node.add_count(1);
+        record_probe_hit(&mut store, drv, hit, &mut result);
+    });
+    result?;
     node.set_done();
     Ok(())
 }
@@ -919,6 +921,40 @@ mod tests {
             outcome: Outcome::DepFailed,
             blocker: blocker.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// A probe hit is committed the moment it lands (its own autocommit) and a
+    /// miss records nothing — so a ^C mid-probe keeps the hits found so far, and
+    /// a restart no longer re-probes them (they drop out of `probe_candidates`).
+    #[test]
+    fn record_probe_hit_commits_hits_so_a_restart_skips_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("npb.sqlite");
+        let mut s = Store::open(&db).unwrap();
+        let mut result = Ok(());
+
+        record_probe_hit(&mut s, "/nix/store/hit.drv", true, &mut result);
+        record_probe_hit(&mut s, "/nix/store/miss.drv", false, &mut result);
+        result.unwrap();
+
+        // The hit is a durable `Built` fact; the miss recorded nothing.
+        let hit = s.load_observations("/nix/store/hit.drv").unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].outcome, Outcome::Built);
+        assert!(
+            s.load_observations("/nix/store/miss.drv")
+                .unwrap()
+                .is_empty()
+        );
+
+        // A drv with a recorded hit is no longer a probe candidate — exactly the
+        // restart-skip this fix is about; the miss still is.
+        let cands = probe_candidates(
+            &s,
+            &[target("/nix/store/hit.drv"), target("/nix/store/miss.drv")],
+        )
+        .unwrap();
+        assert_eq!(cands, vec!["/nix/store/miss.drv".to_string()]);
     }
 
     /// `drvs_to_materialize` must mirror pass 1's `Decision::Build`, from the log

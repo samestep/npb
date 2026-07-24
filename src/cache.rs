@@ -145,16 +145,16 @@ fn drv_outputs_many(drvs: &[String]) -> HashMap<String, Vec<String>> {
     map
 }
 
-/// Probe several drvs at once, returning `drv -> substitutable?`. Runs as a
-/// pipeline: a producer thread resolves each drv's output paths in batched
-/// `nix derivation show` calls ([`drv_outputs_many`]) and feeds `(drv, outputs)`
-/// to a pool of [`PROBE_CONCURRENCY`] workers that HEAD each output on the
-/// substituter, all sharing one pooled agent so connections are reused. The two
-/// halves **overlap**: the network HEADs start the moment the *first* chunk
-/// resolves rather than after the whole set, so on a cold changed set of tens of
-/// thousands of drvs the wall time is ~`max(resolve, probe)` and `progress`
-/// climbs from the first second instead of sitting at zero through a minute of
-/// upfront resolution.
+/// Probe several drvs at once, reporting each verdict via `on_result(drv,
+/// substitutable)`. Runs as a pipeline: a producer thread resolves each drv's
+/// output paths in batched `nix derivation show` calls ([`drv_outputs_many`])
+/// and feeds `(drv, outputs)` to a pool of [`PROBE_CONCURRENCY`] workers that
+/// HEAD each output on the substituter, all sharing one pooled agent so
+/// connections are reused. The two halves **overlap**: the network HEADs start
+/// the moment the *first* chunk resolves rather than after the whole set, so on
+/// a cold changed set of tens of thousands of drvs the wall time is
+/// ~`max(resolve, probe)` and verdicts stream in from the first second instead
+/// of after a minute of upfront resolution.
 ///
 /// A drv is substitutable iff ALL its outputs are in the cache — the recorded
 /// `Cache`/`Built` fact stands for the whole drv, and one missing output of a
@@ -162,11 +162,13 @@ fn drv_outputs_many(drvs: &[String]) -> HashMap<String, Vec<String>> {
 /// force a local build. A drv whose outputs don't resolve (not in the store, or
 /// floating CA) probes as not-substitutable: the safe direction.
 ///
-/// `progress(1)` is called as each drv is probed, so a caller can render
-/// progress for this otherwise-silent network phase.
-pub fn in_cache_many(drvs: &[String], progress: &(dyn Fn(usize) + Sync)) -> HashMap<String, bool> {
+/// `on_result` runs on the **caller's** thread (the workers only feed it over a
+/// channel), one verdict at a time — so it may own non-`Sync` state such as the
+/// SQLite store, and record each hit *as it lands* rather than batching at the
+/// end. That is what lets a ^C mid-probe keep the hits found so far (DESIGN §7).
+pub fn in_cache_many(drvs: &[String], mut on_result: impl FnMut(&str, bool)) {
     if drvs.is_empty() {
-        return HashMap::new();
+        return;
     }
     let agent = ureq::AgentBuilder::new()
         .max_idle_connections(PROBE_CONCURRENCY)
@@ -174,46 +176,54 @@ pub fn in_cache_many(drvs: &[String], progress: &(dyn Fn(usize) + Sync)) -> Hash
         .timeout(Duration::from_secs(15))
         .build();
     // Resolved `(drv, its output paths)` flow from the producer to the probe
-    // workers over this queue; the workers share the receiver behind a mutex.
-    let (tx, rx) = mpsc::channel::<(String, Vec<String>)>();
-    let rx = Mutex::new(rx);
-    let out = Mutex::new(HashMap::new());
+    // workers (shared receiver behind a mutex); each worker's verdict then flows
+    // back to this thread over `res` for `on_result` to consume in order.
+    let (jobs_tx, jobs_rx) = mpsc::channel::<(String, Vec<String>)>();
+    let jobs_rx = Mutex::new(jobs_rx);
+    let (res_tx, res_rx) = mpsc::channel::<(String, bool)>();
     thread::scope(|s| {
-        // Producer: resolve outputs chunk by chunk and feed the queue. A drv that
-        // doesn't resolve is still sent (with no outputs) so it records a result
-        // (not substitutable). Dropping `tx` at the end closes the queue.
+        // Producer: resolve outputs chunk by chunk and feed the worker queue. A
+        // drv that doesn't resolve is still sent (with no outputs) so it yields a
+        // verdict (not substitutable). Dropping `jobs_tx` closes the queue.
         s.spawn(move || {
             for chunk in drvs.chunks(DERIVATION_SHOW_CHUNK) {
                 let outputs = drv_outputs_many(chunk);
                 for drv in chunk {
                     let outs = outputs.get(drv).cloned().unwrap_or_default();
-                    if tx.send((drv.clone(), outs)).is_err() {
+                    if jobs_tx.send((drv.clone(), outs)).is_err() {
                         return;
                     }
                 }
             }
         });
-        // Consumers: HEAD each drv's outputs. The lock is held only to dequeue —
-        // the HEADs run unlocked, so the workers probe concurrently.
+        // Workers: HEAD each drv's outputs and forward the verdict. The lock is
+        // held only to dequeue — the HEADs run unlocked, so the workers probe
+        // concurrently.
         let workers = PROBE_CONCURRENCY.min(drvs.len());
         for _ in 0..workers {
-            let (agent, rx, out) = (&agent, &rx, &out);
+            let (agent, jobs_rx, res_tx) = (&agent, &jobs_rx, res_tx.clone());
             s.spawn(move || {
                 loop {
-                    // Dequeue under the lock, then drop it *before* the HEADs so the
-                    // workers probe concurrently (not one at a time). `recv` blocks
-                    // until an item arrives or the producer drops `tx` and the queue
-                    // drains, which ends the loop.
-                    let next = rx.lock().unwrap().recv();
+                    // `recv` blocks until a job arrives or the producer drops
+                    // `jobs_tx` and the queue drains, which ends the loop.
+                    let next = jobs_rx.lock().unwrap().recv();
                     let Ok((drv, outs)) = next else { break };
                     let sub = !outs.is_empty() && outs.iter().all(|o| output_in_cache(agent, o));
-                    out.lock().unwrap().insert(drv, sub);
-                    progress(1);
+                    if res_tx.send((drv, sub)).is_err() {
+                        break;
+                    }
                 }
             });
         }
+        // Drop this thread's sender so `res_rx` ends once every worker's clone is
+        // gone (all probing done).
+        drop(res_tx);
+        // Consumer (this thread): report each verdict as it lands. Single-
+        // threaded, so `on_result` needn't be `Sync` and can mutate the store.
+        for (drv, sub) in res_rx {
+            on_result(&drv, sub);
+        }
     });
-    out.into_inner().unwrap()
 }
 
 #[cfg(test)]
