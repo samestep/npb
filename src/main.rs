@@ -1464,6 +1464,8 @@ mod tests {
             // A side that threw carries no drv, so it contributes no target; the
             // built head side still does.
             ca("threw-base", None, Some("/d/only-head"), true, false),
+            // ⏩→➖ (threw, then gone): no drv on either side, so no target at all.
+            ca("threw-gone", None, None, true, false),
         ];
         let targets = assemble_targets(&[("sys".into(), changed)]);
         let drvs: HashSet<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();

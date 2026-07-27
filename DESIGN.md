@@ -527,7 +527,13 @@ as a bare `attr` line, distinct from a missing attr (no line at all). The diff
 is a set-diff on `(attr, drv_path)`, where a `None` drv means "threw": a package
 that starts or stops evaluating under the profile shows as a changed row
 (⏩↔build), while one that throws on _both_ sides is `None == None` — no change,
-not shown, so ⏩→⏩ never appears (§8). (An earlier design also sketched a
+not shown, so ⏩→⏩ never appears (§8). A row present on only _one_ side is a
+change whether or not it has a drv there, so a package that threw and then
+vanished (or appeared already throwing) still reports — ⏩→➖ and ➖→⏩ (§8). An
+earlier version dropped those two, reasoning that an attr nixpkgs-review could
+never build either side isn't a review event; but "this broken package is gone
+now" is a real delta, and suppressing it made the report silently narrower than
+its own state model. (An earlier design also sketched a
 _three-way_ diff against the merge base, classifying each changed attr as
 changed-by-this-side / by-the-other / by-both; it turned out not to matter in
 practice and was dropped. The merge base survives only as the `--no-merge` base
@@ -841,6 +847,10 @@ accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
+Of the 6 × 6 = 36 pairs, **34** can appear in a report: every combination except
+the two the diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no
+change, §6) and ➖→➖ (an attr in neither eval is never a row). Every other pair,
+including ⏩→➖ and ➖→⏩, is reachable.
 Sections are ordered **worst-delta-first**: each state has a goodness on the
 build-outcome axis (`✅` > `⏩` > `🚫` > `❌`, with `➖` absent slotted just under
 `✅` as _new_/_gone_), and a section sorts by the signed delta

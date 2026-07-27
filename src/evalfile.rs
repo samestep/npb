@@ -327,30 +327,30 @@ impl RowCursor for SliceCursor<'_> {
     }
 }
 
-/// A [`ChangedAttr`] for a row present only on the base side — but only when it
-/// has a drv. A threw attr (no drv) present on just one side matches
-/// nixpkgs-review's absence (not buildable there, gone here), so it's not a
-/// review event and is dropped; a threw side is only ever *shown* opposite a
-/// built one (the `Equal` case below).
-fn base_only(r: &EvalRow) -> Option<ChangedAttr> {
-    r.1.is_some().then(|| ChangedAttr {
+/// A [`ChangedAttr`] for a row present only on the base side. The row may have no
+/// drv — it **threw** under the profile — which is still a change worth reporting
+/// (⏩→➖: broken here, gone there), so the threw bit rides along and the row is
+/// emitted like any other. Only a row that threw on *both* sides is suppressed
+/// (the `Equal` case below).
+fn base_only(r: &EvalRow) -> ChangedAttr {
+    ChangedAttr {
         attr: r.0.to_string(),
         base_drv: restore_drv(r.1),
         head_drv: None,
-        base_threw: false,
+        base_threw: r.1.is_none(),
         head_threw: false,
-    })
+    }
 }
 
 /// [`base_only`]'s mirror for a row present only on the head side.
-fn head_only(r: &EvalRow) -> Option<ChangedAttr> {
-    r.1.is_some().then(|| ChangedAttr {
+fn head_only(r: &EvalRow) -> ChangedAttr {
+    ChangedAttr {
         attr: r.0.to_string(),
         base_drv: None,
         head_drv: restore_drv(r.1),
         base_threw: false,
-        head_threw: false,
-    })
+        head_threw: r.1.is_none(),
+    }
 }
 
 /// The changed rows between two attr-sorted sides: one [`ChangedAttr`] for each
@@ -358,7 +358,10 @@ fn head_only(r: &EvalRow) -> Option<ChangedAttr> {
 /// a `None` drv, so the drv comparison also catches a package that starts or
 /// stops evaluating under the profile (⏩↔build) — but *both* sides threw is
 /// `None == None`, no change, so a persistently-unavailable package never shows
-/// (no ⏩→⏩; DESIGN §6, §8). Only the (few) changed rows are allocated.
+/// (no ⏩→⏩; DESIGN §6, §8). A row on only one side is a change whether or not it
+/// has a drv there, so an attr that threw and then vanished (or appeared already
+/// throwing) still reports, as ⏩→➖ / ➖→⏩. Only the (few) changed rows are
+/// allocated.
 fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<ChangedAttr>> {
     let mut out = Vec::new();
     loop {
@@ -366,11 +369,11 @@ fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<Change
         // borrow the cursors, then act once the borrows are released.
         let (emit, adv_b, adv_h) = match (b.row(), h.row()) {
             (None, None) => break,
-            (Some(br), None) => (base_only(&br), true, false),
-            (None, Some(hr)) => (head_only(&hr), false, true),
+            (Some(br), None) => (Some(base_only(&br)), true, false),
+            (None, Some(hr)) => (Some(head_only(&hr)), false, true),
             (Some(br), Some(hr)) => match br.0.cmp(hr.0) {
-                std::cmp::Ordering::Less => (base_only(&br), true, false),
-                std::cmp::Ordering::Greater => (head_only(&hr), false, true),
+                std::cmp::Ordering::Less => (Some(base_only(&br)), true, false),
+                std::cmp::Ordering::Greater => (Some(head_only(&hr)), false, true),
                 std::cmp::Ordering::Equal => {
                     // A present row with no drv threw; the drv comparison
                     // captures built↔threw and any rebuild alike.
@@ -551,7 +554,7 @@ mod tests {
             ("dropped", Some("d1")),
             ("rebuilt", Some("r1")),
             ("same", Some("s1")),
-            ("threwbase", None), // threw on base only: not buildable, dropped
+            ("threwbase", None), // threw on base, gone on head: ⏩→➖
             ("unbroke", None),   // threw on base, built on head: ⏩→build
         ];
         let h = [
@@ -560,7 +563,7 @@ mod tests {
             ("broke", None),
             ("rebuilt", Some("r2")),
             ("same", Some("s1")),
-            ("threwhead", None), // threw on head only: dropped
+            ("threwhead", None), // absent on base, threw on head: ➖→⏩
             ("unbroke", Some("u1")),
         ];
         let got = diff(&b, &h);
@@ -569,6 +572,8 @@ mod tests {
             ca("broke", Some("k1"), None, false, true),
             ca("dropped", Some("d1"), None, false, false),
             ca("rebuilt", Some("r1"), Some("r2"), false, false),
+            ca("threwbase", None, None, true, false),
+            ca("threwhead", None, None, false, true),
             ca("unbroke", None, Some("u1"), true, false),
         ];
         assert_eq!(got, want);
@@ -576,13 +581,70 @@ mod tests {
 
     #[test]
     fn diff_drains_tails() {
-        // One list ends first; the other's remainder must still be emitted, with
-        // its threw (no-drv) rows dropped.
+        // One list ends first; the other's remainder must still be emitted, its
+        // threw (no-drv) rows included — one-sided, so ➖ opposite ⏩.
         let b = [("a", Some("a1"))];
         let h = [("a", Some("a1")), ("y", None), ("z", Some("z1"))];
-        assert_eq!(diff(&b, &h), vec![ca("z", None, Some("z1"), false, false)]);
-        assert_eq!(diff(&h, &b), vec![ca("z", Some("z1"), None, false, false)]);
+        assert_eq!(
+            diff(&b, &h),
+            vec![
+                ca("y", None, None, false, true),
+                ca("z", None, Some("z1"), false, false),
+            ]
+        );
+        assert_eq!(
+            diff(&h, &b),
+            vec![
+                ca("y", None, None, true, false),
+                ca("z", Some("z1"), None, false, false),
+            ]
+        );
         assert_eq!(diff(&[], &[]), vec![]);
+    }
+
+    /// The diff's reachable side *shapes* — what DESIGN §8's "34 of the 36 state
+    /// pairs" rests on. Each side is one of three shapes (has a drv / present but
+    /// threw / no such attr), and every pairing is a changed row except the two
+    /// the diff cannot see: threw on both sides (`None == None`, no change) and
+    /// absent on both (no row to walk at all).
+    #[test]
+    fn every_side_shape_pairs_except_threw_threw_and_absent_absent() {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Shape {
+            Drv,
+            Threw,
+            Absent,
+        }
+        use Shape::{Absent, Drv, Threw};
+        let rows = |shape: Shape, drv: &'static str| -> Vec<EvalRow<'static>> {
+            match shape {
+                Drv => vec![("p", Some(drv))],
+                Threw => vec![("p", None)],
+                Absent => vec![],
+            }
+        };
+        let mut pairs = 0;
+        for b in [Drv, Threw, Absent] {
+            for h in [Drv, Threw, Absent] {
+                let got = diff(&rows(b, "b1"), &rows(h, "h1"));
+                if (b, h) == (Threw, Threw) || (b, h) == (Absent, Absent) {
+                    assert!(got.is_empty(), "{b:?}→{h:?} should be no change: {got:?}");
+                    continue;
+                }
+                assert_eq!(got.len(), 1, "{b:?}→{h:?} should be one changed row");
+                // The threw bit is set exactly on a side that's present without a
+                // drv — that's what tells the report ⏩ from ➖.
+                assert_eq!(got[0].base_threw, b == Threw, "{b:?}→{h:?}");
+                assert_eq!(got[0].head_threw, h == Threw, "{b:?}→{h:?}");
+                assert_eq!(got[0].base_drv.is_some(), b == Drv, "{b:?}→{h:?}");
+                assert_eq!(got[0].head_drv.is_some(), h == Drv, "{b:?}→{h:?}");
+                // A side with a drv reduces to any of the four build states
+                // (`report::side_state`); a threw or absent side is that one state.
+                let states = |s: Shape| if s == Drv { 4 } else { 1 };
+                pairs += states(b) * states(h);
+            }
+        }
+        assert_eq!(pairs, 34, "reachable (base, head) report state pairs");
     }
 
     #[test]
@@ -590,7 +652,8 @@ mod tests {
         // End-to-end over the real on-disk shape: write two evals with
         // write_eval, diff them through the streaming path (decoder threads +
         // line cursors), and expect exactly diff's semantics. `threw` (None on
-        // both sides) exercises the bare-line round-trip and its suppression.
+        // both sides) exercises the bare-line round-trip and its suppression;
+        // `vanished` (None on one side only) the ⏩→➖ row that does survive.
         let ae = |attr: &str, drv: Option<&str>| AttrEval {
             attr: attr.into(),
             drv_path: drv.map(str::to_string),
@@ -604,6 +667,7 @@ mod tests {
             &[
                 ae("dropped", Some("/nix/store/d1.drv")),
                 ae("threw", None),
+                ae("vanished", None),
                 ae("rebuilt", Some("/nix/store/r1.drv")),
                 ae("same", Some("/nix/store/s1.drv")),
             ],
@@ -624,6 +688,7 @@ mod tests {
             ca("added", None, Some("a1"), false, false),
             ca("dropped", Some("d1"), None, false, false),
             ca("rebuilt", Some("r1"), Some("r2"), false, false),
+            ca("vanished", None, None, true, false),
         ];
         assert_eq!(got, want);
         // A missing file must error (through the in-band producer error).

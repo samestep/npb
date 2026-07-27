@@ -340,6 +340,11 @@ mod tests {
         // ⏩→❌ before ➖→🚫 before ✅→⏩.
         assert!(at((Threw, Failed)) < at((Absent, Blocked)));
         assert!(at((Absent, Blocked)) < at((Built, Threw)));
+        // ⏩↔➖ pairs are ordinary deltas on the same axis (➖ sits just above ⏩):
+        // a package that appears already throwing is a regression, one that threw
+        // and then vanished an improvement.
+        assert!(at((Absent, Threw)) < at((Built, Built)));
+        assert!(at((Built, Built)) < at((Threw, Absent)));
         // No measured delta (either side Unknown) sinks to a final contiguous tier.
         let first_unknown = pairs
             .iter()
