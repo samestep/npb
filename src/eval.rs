@@ -375,20 +375,18 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 /// off the slot count directly backs off concurrent heavy workers — real memory
 /// control — and each key's single worker recycles its heap per package at the
 /// restart cap. Concurrency is across keys (only ~2 per system), started at the
-/// heavy-worker budget ([`TESTS_SLOT_MEM_MB`]) and honoring `--eval-slots`.
+/// heavy-worker budget ([`TESTS_SLOT_MEM_MB`]).
 pub fn eval_tests(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
     nodes: Vec<Arc<live::Node>>,
-    opts: EvalOpts,
     profile: Profile,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<TestJob>>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-    let slots = default_slots(TESTS_SLOT_MEM_MB, opts.slots);
-    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
+    let slots = default_slots(TESTS_SLOT_MEM_MB);
     // One shard per key: sizing at the largest request makes every group exactly
     // one shard (no split), so each key re-imports nixpkgs just once.
     let shard_size = requests
@@ -427,7 +425,7 @@ pub fn eval_tests(
             stream_jobs(
                 &expr,
                 1,
-                per_worker_mb,
+                DEFAULT_WORKER_MEM_MB,
                 false,
                 label,
                 raw_to_test_job,
@@ -475,25 +473,8 @@ const TESTS_SLOT_MEM_MB: u64 = DEFAULT_WORKER_MEM_MB;
 /// import (a few seconds each); smaller ones requeue more cheaply and balance
 /// better. Measured across all three RAM sizes, ~800–1600 is a flat best (fewer
 /// redundant imports, peak still bounded by the RAM ceiling); the old 400 left
-/// 20–30% on the table. Overridable per run with `--shard-size`.
+/// 20–30% on the table.
 const NAMES_PER_SHARD: usize = 1024;
-
-/// Optional overrides for the eval scheduler; `None` = auto from the machine's
-/// invariants (see [`eval_slots`]).
-#[derive(Debug, Clone, Copy, Default, clap::Args)]
-pub struct EvalOpts {
-    /// Concurrent shard evaluations (default: min(cores, total RAM / ~2 GiB)).
-    #[arg(long = "eval-slots")]
-    pub slots: Option<u64>,
-    /// Per-`nix-eval-jobs`-worker heap cap, MiB (default: 4096).
-    #[arg(long)]
-    pub worker_mem_mb: Option<u64>,
-    /// Top-level attr names per full-eval shard (default: 1024). Larger = fewer
-    /// redundant nixpkgs imports but coarser load-balancing; the sweet spot
-    /// scales with the worker count.
-    #[arg(long)]
-    pub shard_size: Option<usize>,
-}
 
 /// A fatal `nix-eval-jobs` abort (non-zero exit): the streamed output was
 /// truncated and discarded. A marker type so the scheduler can recognize it
@@ -576,31 +557,26 @@ fn physical_mem_mb() -> u64 {
         .unwrap_or(8192)
 }
 
-/// The number of concurrent shard jobs to start with: the user's
-/// `--eval-slots` if given, else bounded by the machine's *invariants* — one
-/// worker per slot, so cores, and total RAM divided by a per-slot budget
-/// ([`SLOT_MEM_MB`], ~2 GiB — the *typical* worker footprint, deliberately below
-/// the 4 GiB restart cap since only the few giant subtrees approach it). The
-/// dynamic part of RAM is handled by feedback, not planning: the queue sheds
-/// slots when a shard is OOM-killed ([`eval_pairs`]).
-fn eval_slots(cores: usize, mem_mb: u64, per_slot_mb: u64, user: Option<u64>) -> usize {
-    match user {
-        Some(s) => (s as usize).max(1),
-        None => cores.min((mem_mb / per_slot_mb.max(1)).max(1) as usize),
-    }
+/// The number of concurrent shard jobs to start with, bounded by the machine's
+/// *invariants* — one worker per slot, so cores, and total RAM divided by a
+/// per-slot budget ([`SLOT_MEM_MB`], ~2 GiB — the *typical* worker footprint,
+/// deliberately below the 4 GiB restart cap since only the few giant subtrees
+/// approach it). The dynamic part of RAM is handled by feedback, not planning:
+/// the queue sheds slots when a shard is OOM-killed ([`eval_pairs`]).
+fn eval_slots(cores: usize, mem_mb: u64, per_slot_mb: u64) -> usize {
+    cores.min((mem_mb / per_slot_mb.max(1)).max(1) as usize)
 }
 
 /// [`eval_slots`] wired to this machine's invariants — the starting slot count
-/// every scheduler run uses (the user's `--eval-slots` when set, else auto from
-/// cores and RAM divided by `per_slot_mb`). Callers pass the per-slot budget for
-/// their workload: [`SLOT_MEM_MB`] for the light full-set/instantiate workers,
+/// every scheduler run uses. Callers pass the per-slot budget for their
+/// workload: [`SLOT_MEM_MB`] for the light full-set/instantiate workers,
 /// [`TESTS_SLOT_MEM_MB`] for the heavy `--tests` workers. `eval_slots` stays a
 /// standalone pure fn so its unit test can pin the arithmetic.
-fn default_slots(per_slot_mb: u64, user: Option<u64>) -> usize {
+fn default_slots(per_slot_mb: u64) -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    eval_slots(cores, total_mem_mb(), per_slot_mb, user)
+    eval_slots(cores, total_mem_mb(), per_slot_mb)
 }
 
 /// What a phase's commit leaves show in the number column: nothing (a state
@@ -768,7 +744,7 @@ pub fn instantiate_execute(
     handle: live::LiveHandle<'_>,
 ) -> Result<()> {
     let Instantiate { requests, nodes } = inst;
-    let slots = default_slots(SLOT_MEM_MB, None);
+    let slots = default_slots(SLOT_MEM_MB);
     let labels: Vec<String> = requests
         .iter()
         .map(|(rev, system, _)| format!("{} {system}", rev.display))
@@ -1025,7 +1001,6 @@ fn run_shards<T: Send>(
 pub fn eval_pairs(
     repo: &Path,
     pairs: &[(Rev, String)],
-    opts: EvalOpts,
     profile: Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
@@ -1063,10 +1038,9 @@ pub fn eval_pairs(
         return Ok(());
     }
 
-    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
     // Count slots at the ~2 GiB typical footprint, but each worker keeps the
-    // 4 GiB restart cap (`per_worker_mb`) — the two are deliberately decoupled.
-    let slots = default_slots(SLOT_MEM_MB, opts.slots);
+    // 4 GiB restart cap ([`DEFAULT_WORKER_MEM_MB`]) — the two are deliberately decoupled.
+    let slots = default_slots(SLOT_MEM_MB);
 
     // One shard group per `(tree, system)` for both phases below; `meta` keeps
     // the identifying `(rev, system)` per group (the rev supplies fetchGit's
@@ -1141,7 +1115,7 @@ pub fn eval_pairs(
         eval_nodes,
         labels,
         items,
-        opts.shard_size.unwrap_or(NAMES_PER_SHARD),
+        NAMES_PER_SHARD,
         slots,
         // No denominator: `nix-eval-jobs` descends into `recurseForDerivations`
         // sets (haskellPackages, the python sets, …), so it streams far more drvs
@@ -1156,7 +1130,7 @@ pub fn eval_pairs(
             stream_jobs(
                 &expr,
                 1,
-                per_worker_mb,
+                DEFAULT_WORKER_MEM_MB,
                 false,
                 label,
                 raw_to_attr_eval,
@@ -1184,7 +1158,6 @@ pub fn eval_two(
     base: &Rev,
     head: &Rev,
     systems: &[String],
-    opts: EvalOpts,
     profile: Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
@@ -1198,7 +1171,7 @@ pub fn eval_two(
         pairs.push((base.clone(), s.clone()));
         pairs.push((head.clone(), s.clone()));
     }
-    eval_pairs(repo, &pairs, opts, profile, tree, handle, on_eval_done)
+    eval_pairs(repo, &pairs, profile, tree, handle, on_eval_done)
 }
 
 #[cfg(test)]
@@ -1274,15 +1247,15 @@ mod tests {
     fn eval_slots_from_invariants() {
         const G: u64 = 1024;
         // Core-bound when RAM is plentiful; RAM-bound (total / per-slot budget)
-        // when it isn't; never zero; --eval-slots wins verbatim (floored at 1).
+        // when it isn't; never zero.
         // At the default SLOT_MEM_MB (~2 GiB) the three benchmark boxes get:
-        assert_eq!(eval_slots(32, 62 * G, SLOT_MEM_MB, None), 31); // amd64 (core-bound near 32)
-        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB, None), 15); // aarch64-linux
-        assert_eq!(eval_slots(18, 16 * G, SLOT_MEM_MB, None), 8); //  darwin
-        assert_eq!(eval_slots(18, 256 * G, SLOT_MEM_MB, None), 18); // core-bound
-        assert_eq!(eval_slots(4, 2 * G, SLOT_MEM_MB, None), 1); //    never zero
-        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB, Some(3)), 3); // --eval-slots wins
-        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB, Some(0)), 1);
+        assert_eq!(eval_slots(32, 62 * G, SLOT_MEM_MB), 31); // amd64 (core-bound near 32)
+        assert_eq!(eval_slots(18, 31 * G, SLOT_MEM_MB), 15); // aarch64-linux
+        assert_eq!(eval_slots(18, 16 * G, SLOT_MEM_MB), 8); //  darwin
+        assert_eq!(eval_slots(18, 256 * G, SLOT_MEM_MB), 18); // core-bound
+        assert_eq!(eval_slots(4, 2 * G, SLOT_MEM_MB), 1); //    never zero
+        // The heavy `--tests` budget (4 GiB/slot) trims the same boxes further.
+        assert_eq!(eval_slots(18, 31 * G, TESTS_SLOT_MEM_MB), 7);
     }
 
     #[test]

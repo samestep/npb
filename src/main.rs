@@ -993,7 +993,6 @@ fn run_phases(
     base: &Rev,
     head: &Rev,
     systems: &[String],
-    opts: eval::EvalOpts,
     profile: Profile,
     policy: BuildPolicy,
     tests: bool,
@@ -1051,9 +1050,7 @@ fn run_phases(
     // when eval starts fire once `eval_two` has created the eval nodes (so `tests`
     // still sorts below `evaluate`). The sweep then catches the fully-cached run,
     // where `eval_two` creates no nodes and fires nothing at all.
-    eval::eval_two(
-        repo, base, head, systems, opts, profile, tree, handle, &process,
-    )?;
+    eval::eval_two(repo, base, head, systems, profile, tree, handle, &process)?;
     for sys in systems {
         process(sys);
     }
@@ -1075,7 +1072,7 @@ fn run_phases(
     // scheduler pass, cache the results, then fold each system's test rows into
     // its changed set — classified (regression / fixed / new / …) like any attr.
     if tests {
-        let jobs_per = eval::eval_tests(repo, &requests, nodes, opts, profile, handle)?;
+        let jobs_per = eval::eval_tests(repo, &requests, nodes, profile, handle)?;
         let mut acc = accum.lock().unwrap();
         for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
             acc.store
@@ -1179,7 +1176,6 @@ fn run(cli: Cli) -> Result<()> {
         insecure: cli.allow_insecure,
     };
     let policy = BuildPolicy { retry: cli.retry };
-    let opts = eval::EvalOpts::default();
     let repo = resolve_repo(cli.path)?;
 
     let systems = resolve_systems(cli.system);
@@ -1285,7 +1281,7 @@ fn run(cli: Cli) -> Result<()> {
             ensure_distinct_trees(&base, &head)?;
 
             let (per_system_changed, targets) = run_phases(
-                &repo, &base, &head, &systems, opts, profile, policy, tests, &tree, handle,
+                &repo, &base, &head, &systems, profile, policy, tests, &tree, handle,
             )?;
             Ok((
                 base,

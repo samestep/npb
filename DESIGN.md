@@ -452,8 +452,7 @@ fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, on
 whole-set eval but a **shard**: a ~1024-name slice of one eval's top-level attr
 names — enumerated by one cheap `builtins.attrNames` call per pair, itself run
 through this same scheduler as a single-shard group so a multi-system run's
-enumerations overlap behind the shared display (the ~1024 is overridable with
-`--shard-size`) — evaluated by its own one-worker `nix-eval-jobs` over the same
+enumerations overlap behind the shared display — evaluated by its own one-worker `nix-eval-jobs` over the same
 import narrowed via `listToAttrs` — validated byte-for-byte to reproduce the
 monolithic walk (thunks force per-attr in the worker, so error isolation is
 identical). Bigger shards amortize the per-shard nixpkgs re-import; ~800–1600 is
@@ -501,7 +500,7 @@ perfect-packing bound at 15 slots).
 > tail win at 15 slots is eaten by the same overhead. Splitting only makes
 > sense with a time model that knows each subtree's construction cost, or
 > upstream support for sharing a constructed set across workers — revisit
-> there, not with attr-count heuristics. `--eval-slots` overrides the starting slot count.
+> there, not with attr-count heuristics.
 
 > Two earlier schemes are recorded for context. A _planner_ divided measured
 > available RAM into per-eval worker slots — but that snapshot lies (free RAM
@@ -758,7 +757,7 @@ memory-bearing unit AIMD could never shrink. With the key as the atom, backing
 off the slot count backs off concurrent heavy workers directly — real memory
 control — the starting count is budgeted at the heavy-worker footprint
 (`TESTS_SLOT_MEM_MB`, the worker restart cap, not the full-set eval's lighter
-per-slot figure) and honors `--eval-slots`, and each key's single worker recycles
+per-slot figure), and each key's single worker recycles
 its heap per package at that cap. It gets the same live scheduler display as
 every other phase, minus the shard `NN%`: `tests` is one shard per key (above),
 so a shard-progress percentage could only ever read 0/50/100 — exactly what the
