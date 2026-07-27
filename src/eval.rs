@@ -9,12 +9,12 @@
 //! `nix-eval-jobs` output is parsed by streaming NDJSON straight off the child's
 //! stdout (never buffering the whole, meta-heavy output).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -183,11 +183,13 @@ fn stream_jobs<T>(
     let max_s = per_worker_mb.to_string();
     let mut cmd = Command::new("nix-eval-jobs");
     cmd.args(["--workers", &workers_s, "--max-memory-size", &max_s]);
-    // `--no-instantiate` evaluates without writing the `.drv` files. npb only
-    // needs the drvPath + outputs (both emitted regardless), so skipping the
-    // writes is ~40% faster and avoids instantiating the ~114k attrs it never
-    // builds. The small changed set is instantiated on demand before building
-    // (see [`instantiate`]), which the build and the narinfo probe both need.
+    // `--no-instantiate` evaluates without writing the `.drv` files. The full-set
+    // walk only needs the drvPath + outputs (both emitted regardless), so skipping
+    // the writes is ~40% faster and avoids instantiating the ~114k attrs it never
+    // builds; the changed set is materialized later, by [`instantiate_execute`].
+    // The two targeted evals do want the writes ([`eval_tests`] as it goes,
+    // [`instantiate_execute`] by definition) — a `drvPath` is the same either way,
+    // so this only decides whether the recipe lands in the store.
     if !instantiate {
         cmd.arg("--no-instantiate");
     }
@@ -234,21 +236,19 @@ fn stream_jobs<T>(
     // Integrity gate. Per-attr eval errors are emitted *in band* as JSON
     // (`{"attr":…,"error":…}`) and do NOT affect the exit code — a complete
     // full-set eval exits 0 even with thousands of `throw`n attrs. A non-zero
-    // exit means a *fatal* abort: a worker died mid-eval (most often an OOM
-    // SIGKILL when the workers' memory caps oversubscribe RAM), in which case
-    // the streamed output is silently TRUNCATED — we got some attrs but not
-    // all. Caching that would poison every future diff/report with phantom
-    // "removed" packages, so we refuse it outright rather than trust a partial.
-    // The [`EvalAborted`] marker is what lets the scheduler requeue the shard.
+    // exit means a *fatal* abort: a worker died mid-eval, in which case the
+    // streamed output is silently TRUNCATED — we got some attrs but not all.
+    // Caching that would poison every future diff/report with phantom "removed"
+    // packages, so we refuse it outright rather than trust a partial. The
+    // [`EvalAborted`] payload is what lets the scheduler recover (its ladder in
+    // [`run_shards`]) and, when it can't, say what actually happened.
     if !status.success() {
-        return Err(anyhow::Error::new(EvalAborted).context(format!(
-            "nix-eval-jobs did not finish evaluating {label}: it exited \
-             {status} after streaming {} attr(s), so the result is truncated and \
-             will NOT be cached. A worker most likely died — commonly out-of-memory. \
-             Last stderr:\n{}",
-            attrs.len(),
+        return Err(anyhow::Error::new(EvalAborted {
+            status: status.to_string(),
+            streamed: attrs.len(),
             stderr_tail,
-        )));
+        })
+        .context(format!("nix-eval-jobs did not finish evaluating {label}")));
     }
     Ok(attrs)
 }
@@ -362,20 +362,30 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 /// cached (see `main`); an empty/all-empty `requests` does no work.
 ///
 /// **The scheduling atom is the `(commit, system)` key — one shard per request,
-/// never sub-sliced — exactly like [`instantiate_execute`] and for the same
-/// reason (DESIGN §6).** Both phases share the cost structure: the dominant cost
-/// is the per-key nixpkgs-spine re-import, and the changed set is only a handful
-/// of packages, so splitting a key's packages across shards would just re-pay
-/// that import per shard while multiplying the concurrent heavy workers. And here
-/// each worker is *heavy* — a `nixosTest` ≈ a whole NixOS system — so that
-/// oversubscribes RAM: the old `total/(2·slots)` sub-slicing started
+/// never sub-sliced *up front* — exactly like [`instantiate_execute`] and for the
+/// same reason (DESIGN §6).** Both phases share the cost structure: the dominant
+/// cost is the per-key nixpkgs-spine re-import, and the changed set is only a
+/// handful of packages, so splitting a key's packages across shards would just
+/// re-pay that import per shard while multiplying the concurrent heavy workers.
+/// And here each worker is *heavy* — a `nixosTest` ≈ a whole NixOS system — so
+/// that oversubscribes RAM: the old `total/(2·slots)` sub-slicing started
 /// `2·slots` workers and cascaded into OOM, then requeued a fat shard forever
 /// once slots bottomed out at 1 (the shard, not the concurrency, was the
 /// memory-bearing unit AIMD couldn't shrink). With the key as the atom, backing
-/// off the slot count directly backs off concurrent heavy workers — real memory
-/// control — and each key's single worker recycles its heap per package at the
-/// restart cap. Concurrency is across keys (only ~2 per system), started at the
-/// heavy-worker budget ([`TESTS_SLOT_MEM_MB`]).
+/// off the slot count directly backs off concurrent heavy workers, and each key's
+/// single worker recycles its heap once it passes the restart cap. Concurrency is
+/// across keys (only ~2 per system), started at the heavy-worker budget
+/// ([`TESTS_SLOT_MEM_MB`]) — which is also why splitting is what the *recovery*
+/// ladder reaches for at one slot ([`run_shards`]): with so few keys, shedding
+/// slots runs out of room long before the memory does. Splitting up front was the
+/// mistake; splitting in response to a death, with no concurrency left to
+/// multiply, is the only lever with range.
+///
+/// It also **instantiates as it goes** (below): these are the same drvs the
+/// changed test rows will need materialized, so writing each `.drv` here costs
+/// store I/O on an evaluation just performed, where deferring it to
+/// [`instantiate_execute`] costs that whole `nixosTest` evaluation a second
+/// time.
 pub fn eval_tests(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
@@ -401,7 +411,7 @@ pub fn eval_tests(
     // grouped scheduler run, after all eval.
     let labels: Vec<String> = requests
         .iter()
-        .map(|(rev, system, _)| format!("tests {} ({system})", rev.display))
+        .map(|(rev, system, _)| format!("{} {system}", rev.display))
         .collect();
     let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
     let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
@@ -410,6 +420,7 @@ pub fn eval_tests(
         .collect();
 
     run_shards(
+        "tests",
         nodes,
         labels,
         items,
@@ -426,7 +437,13 @@ pub fn eval_tests(
                 &expr,
                 1,
                 DEFAULT_WORKER_MEM_MB,
-                false,
+                // Instantiate as we go: these are the drvs the changed test rows
+                // will need materialized, and writing each `.drv` now costs the
+                // store I/O on a `nixosTest` evaluation just performed, where
+                // leaving it to the `instantiate` phase costs that whole
+                // evaluation again (DESIGN §6). No cached fact changes —
+                // `--no-instantiate` never altered a `drvPath`.
+                true,
                 label,
                 raw_to_test_job,
                 || on_item(1),
@@ -436,6 +453,11 @@ pub fn eval_tests(
             results[gi].lock().unwrap().extend(rows);
             Ok(())
         },
+        // No salvage: a `test_pkg` marker written for a package whose test list
+        // only half streamed would cache a truncated set at that key forever, and
+        // telling the complete packages from the frontier one means leaning on
+        // nix-eval-jobs' dispatch order (DESIGN §6). The key is re-run whole.
+        None,
     )?;
 
     Ok(results
@@ -452,21 +474,27 @@ pub fn eval_tests(
 /// and thrash on re-imports. Distinct from the slot-count budget below.
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 
-/// RAM budget per slot, used only to *count* the starting slots (see
-/// [`eval_slots`]) — not a memory cap. A typical shard's worker holds only
-/// ~1–1.5 GiB; just the few giant subtrees spike toward the 4 GiB cap. So
-/// counting slots at the cap badly under-parallelizes (a 31 GiB box got 7
-/// workers when it had 18 cores); ~2 GiB matches the measured best worker counts
-/// across 62/31/16 GiB machines, and AIMD backs off if a run overshoots RAM.
+/// RAM budget per slot for the **full-set eval**, used only to *count* the
+/// starting slots (see [`eval_slots`]) — not a memory cap. A typical shard's
+/// worker holds only ~1–1.5 GiB; just the few giant subtrees spike toward the
+/// 4 GiB cap. So counting slots at the cap badly under-parallelizes (a 31 GiB box
+/// got 7 workers when it had 18 cores); ~2 GiB matches the measured best worker
+/// counts across 62/31/16 GiB machines, and AIMD backs off if a run overshoots
+/// RAM. The two targeted phases are heavier per job and use
+/// [`TESTS_SLOT_MEM_MB`].
 const SLOT_MEM_MB: u64 = 2048;
 
-/// Per-slot RAM budget for the `--tests` eval, distinct from [`SLOT_MEM_MB`]
-/// because a `passthru.tests` worker is far heavier: each `nixosTest` pulls in a
-/// whole NixOS system, so its worker genuinely approaches the [`DEFAULT_WORKER_MEM_MB`]
-/// restart cap rather than sitting well under it like a full-set worker. Counting
-/// a tests slot at the *typical* full-set footprint (2 GiB) is what started 15
-/// heavy workers on a 31 GiB box and cascaded into OOM; budgeting at the cap
-/// starts a memory-safe count (~7 on that box) and AIMD trims from there.
+/// Per-slot RAM budget for the two targeted evals — `--tests` and
+/// [`instantiate_execute`], which instantiates what `--tests` did not — distinct
+/// from [`SLOT_MEM_MB`] because their workers are far heavier: each `nixosTest`
+/// pulls in a whole NixOS system, so a worker genuinely reaches the
+/// [`DEFAULT_WORKER_MEM_MB`] restart cap instead of sitting well under it like a
+/// full-set worker. Counting such a slot at the *typical* full-set footprint
+/// (2 GiB) is what started 15 heavy workers on a 31 GiB box and cascaded into
+/// OOM. Budgeting at the cap starts a memory-safe count (~7 on that box) — and is
+/// still optimistic, since the cap is a recycle *threshold*: a measured lone
+/// worker peaked at ~5.3 GiB against it (DESIGN §6). In these phases the atom
+/// count (≤2 shards per system) usually binds before either figure does.
 const TESTS_SLOT_MEM_MB: u64 = DEFAULT_WORKER_MEM_MB;
 
 /// Top-level attr names per shard. Larger shards amortize the per-job nixpkgs
@@ -477,16 +505,49 @@ const TESTS_SLOT_MEM_MB: u64 = DEFAULT_WORKER_MEM_MB;
 const NAMES_PER_SHARD: usize = 1024;
 
 /// A fatal `nix-eval-jobs` abort (non-zero exit): the streamed output was
-/// truncated and discarded. A marker type so the scheduler can recognize it
-/// through the anyhow chain and requeue the shard at reduced concurrency.
+/// truncated and discarded. The scheduler recognizes it through the anyhow chain
+/// to drive its recovery ladder ([`run_shards`]), and it carries the *diagnostic*
+/// rather than a marker, because an abort is **not** always an out-of-memory kill
+/// — `nix-eval-jobs` also exits non-zero on a fatal eval error (a
+/// `StackOverflowError` job is emitted and then kills the run). So a note
+/// summarizes what the child actually reported ([`EvalAborted::summary`]) and the
+/// give-up path surfaces the whole tail, instead of either one guessing.
 #[derive(Debug)]
-struct EvalAborted;
+struct EvalAborted {
+    /// The child's exit status, rendered (`exit status: 1`, `signal: 9 (SIGKILL)`).
+    status: String,
+    /// How many jobs had streamed before the output was cut off.
+    streamed: usize,
+    /// The tail of the child's stderr (its ring buffer, `stream_jobs`).
+    stderr_tail: String,
+}
+
+impl EvalAborted {
+    /// A one-line cause for a progress note: the exit status plus the last
+    /// non-blank line of stderr, which for a worker death is `nix-eval-jobs`' own
+    /// verdict ("evaluation worker got killed by SIGKILL, maybe memory limit
+    /// reached?", "possible infinite recursion", …).
+    fn summary(&self) -> String {
+        match self
+            .stderr_tail
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+        {
+            Some(last) => format!("{} — {}", self.status, last.trim()),
+            None => self.status.clone(),
+        }
+    }
+}
 
 impl std::fmt::Display for EvalAborted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "nix-eval-jobs aborted before finishing (output truncated)"
+            "{} after streaming {} job(s), so the result is truncated and will \
+             NOT be cached. A worker died; the exit status above and this stderr \
+             tail are what it reported, not a guess:\n{}",
+            self.status, self.streamed, self.stderr_tail
         )
     }
 }
@@ -569,9 +630,9 @@ fn eval_slots(cores: usize, mem_mb: u64, per_slot_mb: u64) -> usize {
 
 /// [`eval_slots`] wired to this machine's invariants — the starting slot count
 /// every scheduler run uses. Callers pass the per-slot budget for their
-/// workload: [`SLOT_MEM_MB`] for the light full-set/instantiate workers,
-/// [`TESTS_SLOT_MEM_MB`] for the heavy `--tests` workers. `eval_slots` stays a
-/// standalone pure fn so its unit test can pin the arithmetic.
+/// workload: [`SLOT_MEM_MB`] for the light full-set walk, [`TESTS_SLOT_MEM_MB`]
+/// for the two heavy targeted evals. `eval_slots` stays a standalone pure fn so
+/// its unit test can pin the arithmetic.
 fn default_slots(per_slot_mb: u64) -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
@@ -689,8 +750,19 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &
 /// A prepared instantiate: its (blue) tree nodes and the non-empty requests they
 /// pair with, from [`instantiate_prepare`], ready for [`instantiate_execute`].
 pub struct Instantiate {
-    requests: Vec<(Rev, String, Vec<String>)>,
+    requests: Vec<InstRequest>,
     nodes: Vec<Arc<live::Node>>,
+}
+
+/// One side to instantiate: which attr paths, and the drv each one evaluates to.
+/// The drvs are what make an aborted pass recoverable — they are the phase's
+/// durable record, so `run_shards` can ask the store which recipes a dead worker
+/// had already written and retry only the rest (DESIGN §6).
+pub struct InstRequest {
+    pub rev: Rev,
+    pub system: String,
+    /// `(attr path, its drv path)`, in the order the phase will request them.
+    pub attrs: Vec<(String, String)>,
 }
 
 /// Create the `instantiate` phase's (blue) nodes for the requests with something
@@ -698,23 +770,19 @@ pub struct Instantiate {
 /// caller can reveal the `probe` node — which sorts *below* `instantiate` — while
 /// this phase is still only blue, so both appear at once (DESIGN §9). `None` when
 /// there's nothing to instantiate.
-pub fn instantiate_prepare(
-    tree: &live::Tree,
-    requests: &[(Rev, String, Vec<String>)],
-) -> Option<Instantiate> {
+pub fn instantiate_prepare(tree: &live::Tree, requests: Vec<InstRequest>) -> Option<Instantiate> {
     // Drop the sides with nothing to instantiate (a diff side can have no
     // buildable changed attrs) so they don't clutter the display.
-    let requests: Vec<(Rev, String, Vec<String>)> = requests
-        .iter()
-        .filter(|(_, _, p)| !p.is_empty())
-        .cloned()
+    let requests: Vec<InstRequest> = requests
+        .into_iter()
+        .filter(|r| !r.attrs.is_empty())
         .collect();
     if requests.is_empty() {
         return None;
     }
     let groups: Vec<(String, String)> = requests
         .iter()
-        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
+        .map(|r| (r.system.clone(), r.rev.display.clone()))
         .collect();
     let nodes = add_phase(tree, "instantiate", &groups, Leaf::Count);
     Some(Instantiate { requests, nodes })
@@ -742,20 +810,40 @@ pub fn instantiate_execute(
     inst: Instantiate,
     profile: Profile,
     handle: live::LiveHandle<'_>,
+    absent: &(dyn Fn(&[String]) -> Result<HashSet<String>> + Sync),
 ) -> Result<()> {
     let Instantiate { requests, nodes } = inst;
-    let slots = default_slots(SLOT_MEM_MB);
+    // Budgeted at the heavy-worker figure like `--tests`, not the light full-set
+    // one: a residual pass (a package whose tests another review cached at this
+    // tree, its `.drv` since collected) still evaluates `nixosTest`s. In practice
+    // the atom count — one shard per side, so ≤2 per system — binds first.
+    let slots = default_slots(TESTS_SLOT_MEM_MB);
     let labels: Vec<String> = requests
         .iter()
-        .map(|(rev, system, _)| format!("{} {system}", rev.display))
+        .map(|r| format!("{} {}", r.rev.display, r.system))
         .collect();
-    let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
-    let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
+    let items: Vec<Vec<String>> = requests
+        .iter()
+        .map(|r| r.attrs.iter().map(|(attr, _)| attr.clone()).collect())
+        .collect();
     // A shard per request: sizing at the largest request makes every group
-    // exactly one shard (no split), so each pair re-imports nixpkgs just once.
+    // exactly one shard, so each pair re-imports nixpkgs just once — until an
+    // abort splits one (`run_shards`' ladder), which is the whole point of paying
+    // that import per shard rather than looping on a slice that doesn't fit.
     let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    // Per group, `attr -> drv`, for the abort re-check below.
+    let drvs: Vec<HashMap<&str, &str>> = requests
+        .iter()
+        .map(|r| {
+            r.attrs
+                .iter()
+                .map(|(a, d)| (a.as_str(), d.as_str()))
+                .collect()
+        })
+        .collect();
 
     run_shards(
+        "instantiate",
         nodes,
         labels,
         items,
@@ -765,8 +853,14 @@ pub fn instantiate_execute(
         true,
         handle,
         |gi, label, paths, on_item| {
-            let (rev, system) = meta[gi];
-            let expr = select_expr(repo, &rev.commit, system, paths, &profile_config(profile));
+            let r = &requests[gi];
+            let expr = select_expr(
+                repo,
+                &r.rev.commit,
+                &r.system,
+                paths,
+                &profile_config(profile),
+            );
             // Streamed rows are discarded (mapped to `()`); the `.drv` writes are
             // the point. The per-job callback drives the live count.
             stream_jobs(
@@ -780,28 +874,99 @@ pub fn instantiate_execute(
             )
         },
         |_, _| Ok(()),
+        // The durable record: a `.drv` a dead worker had already written is in the
+        // store and content-addressed, hence as good as one this pass wrote (§6),
+        // so a retry owes only the attrs whose recipe is still missing.
+        Some(&|gi: usize, paths: &[String]| {
+            let wanted: Vec<String> = paths
+                .iter()
+                .filter_map(|a| drvs[gi].get(a.as_str()).map(|d| (*d).to_string()))
+                .collect();
+            let missing = absent(&wanted)?;
+            Ok(paths
+                .iter()
+                .filter(|a| {
+                    drvs[gi]
+                        .get(a.as_str())
+                        .is_none_or(|d| missing.contains(*d))
+                })
+                .cloned()
+                .collect())
+        }),
     )
 }
 
 // --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
 
 /// One group of shards run together: one leaf node in the progress tree, one
-/// assembled result. Its `items` (top-level names for the full eval, changed
-/// packages for `--tests`) are sliced into shards; the shard counters drive the
-/// AIMD scheduler, while progress is reflected onto `node` for the display.
+/// assembled result. Its items (top-level names for the full eval, changed
+/// packages for `--tests`) are sliced into shards, which own them from then on;
+/// the shard counters drive the AIMD scheduler, while progress is reflected onto
+/// `node` for the display.
 struct ShardGroup<T> {
     node: Arc<live::Node>,
-    items: Vec<String>,
-    shards_total: usize,
+    items_total: usize,
+    /// Shards this group is split into — *mutable*, because an abort at one slot
+    /// splits a shard in two ([`run_shards`]), and the completion check (and a
+    /// percent node's denominator) must follow.
+    shards_total: AtomicUsize,
     shards_done: AtomicUsize,
+    /// Set when a shard completed by re-derivation rather than by streaming its
+    /// rows (`instantiate`'s salvage, DESIGN §6): the streamed tally then
+    /// understates the work actually done, so the node's count is pinned to the
+    /// item total instead of to the assembled rows.
+    salvaged: AtomicBool,
     rows: Mutex<Vec<T>>,
 }
 
-/// A queued unit of work: a slice of one group's items.
+/// A queued unit of work: some of one group's items. Owned (not a range into the
+/// group) so a retry can carry an arbitrary *subset* — the still-absent recipes
+/// after an abort, or one half of a shard being split.
 struct Shard {
     group: usize,
-    items: std::ops::Range<usize>,
+    items: Vec<String>,
 }
+
+/// What an abort does next — the recovery ladder of [`run_shards`] as a pure
+/// decision over three numbers: how many of the shard's items a retry still owes
+/// (`left`), how many it had (`items`), and the current slot count. Kept
+/// standalone so the rung *ordering* and — the property that matters — the
+/// ladder's **bottom** are unit-testable without a scheduler or a Nix store.
+#[derive(Debug, PartialEq, Eq)]
+enum Recovery {
+    /// Rung 0, best case: the dead pass had already produced everything this
+    /// shard owed, so book it done (`instantiate`'s salvage).
+    Done,
+    /// Rung 0: it produced *some* of it. Retry just the remainder — real progress,
+    /// so nothing backs off. Strictly smaller each time, hence not a cycle.
+    Retry,
+    /// Rung 1: halve the slot count (from, to) and retry the shard as-is.
+    Slots(usize, usize),
+    /// Rung 2: out of concurrency to shed — split the shard at this index.
+    Split(usize),
+    /// Rung 3: one item, one slot, still dead. Report it.
+    GiveUp,
+}
+
+fn recovery(left: usize, items: usize, slots: usize) -> Recovery {
+    if left == 0 {
+        Recovery::Done
+    } else if left < items {
+        Recovery::Retry
+    } else if slots > 1 {
+        Recovery::Slots(slots, (slots / 2).max(1))
+    } else if items > 1 {
+        Recovery::Split(items / 2)
+    } else {
+        Recovery::GiveUp
+    }
+}
+
+/// A phase's **durable-record** hook: given a group and a shard's items, which of
+/// them a retry still owes after an abort (DESIGN §6). Only `instantiate` has one
+/// — it re-queries store validity — so [`run_shards`] takes it as an `Option`,
+/// where `None` reads as "nothing a partial pass leaves behind is salvageable".
+type Remaining<'a> = dyn Fn(usize, &[String]) -> Result<Vec<String>> + Sync + 'a;
 
 /// Run a set of shard groups through one bounded, AIMD-controlled worker pool,
 /// reflecting progress onto each group's [`live::Node`] in the shared tree
@@ -815,14 +980,35 @@ struct Shard {
 /// rows; DESIGN §4); this owns only the scheduling and the node updates. The
 /// outer `with_live` in `run` owns the refresher that redraws the tree.
 ///
-/// `eval_shard(group, label, items, on_item)` evaluates one shard's item slice
-/// to its rows, calling `on_item(n)` as items surface (bumps the node count); it
-/// may return an [`EvalAborted`] error to have the shard requeued at reduced
-/// concurrency (a note is emitted above the tree via `handle`), or any other
-/// error to fail the whole run. `on_group_complete` fires the moment a group's
-/// last shard lands, with the group's assembled rows.
+/// `eval_shard(group, label, items, on_item)` evaluates one shard's items to its
+/// rows, calling `on_item(n)` as items surface (bumps the node count); it may
+/// return an [`EvalAborted`] error to put the shard on the recovery ladder
+/// below, or any other error to fail the whole run. `on_group_complete` fires the
+/// moment a group's last shard lands, with the group's assembled rows.
+///
+/// **The recovery ladder (DESIGN §6).** An abort means a `nix-eval-jobs` worker
+/// died, so its stream was truncated and the shard's rows are gone. What to do
+/// about it is a finite sequence, tried in order — finite so the loop terminates
+/// by construction, and ordered so each step makes the retry *different work*
+/// rather than a re-roll of the same dice:
+///
+/// 0. **Re-derive what is still outstanding** through `remaining`, the phase's
+///    durable-record hook. `None` (`evaluate`, `--tests`) means nothing a partial
+///    pass leaves behind is salvageable, so every item is still owed.
+///    `instantiate` re-queries store validity, where an aborted pass's `.drv`
+///    writes survive: an empty answer completes the shard outright, and a smaller
+///    one is requeued as-is — real progress, so no back-off at all.
+/// 1. **Halve the slot count** (AIMD multiplicative decrease), while > 1.
+/// 2. **Halve the shard**, once slots are at 1 and there is more than one item.
+///    The reasons not to sub-slice a key are about the happy path (re-paid
+///    imports, multiplied heavy workers); neither applies to one serial worker
+///    responding to a failure, where a smaller slice can only lower the peak.
+/// 3. **Fail, naming the item**, when a single item still aborts — surfacing
+///    `nix-eval-jobs`' own diagnostic, since a machine that cannot evaluate it
+///    will not evaluate it on the next attempt either.
 #[allow(clippy::too_many_arguments)]
 fn run_shards<T: Send>(
+    phase: &str,
     nodes: Vec<Arc<live::Node>>,
     labels: Vec<String>,
     items: Vec<Vec<String>>,
@@ -832,41 +1018,41 @@ fn run_shards<T: Send>(
     handle: live::LiveHandle<'_>,
     eval_shard: impl Fn(usize, &str, &[String], &(dyn Fn(usize) + Sync)) -> Result<Vec<T>> + Sync,
     on_group_complete: impl Fn(usize, Vec<T>) -> Result<()> + Sync,
+    remaining: Option<&Remaining<'_>>,
 ) -> Result<()> {
     let shard_size = shard_size.max(1);
+    let mut queue: VecDeque<Shard> = VecDeque::new();
     let groups: Vec<ShardGroup<T>> = nodes
         .into_iter()
         .zip(items)
-        .map(|(node, items)| {
+        .enumerate()
+        .map(|(gi, (node, items))| {
+            let items_total = items.len();
             if known_total {
-                node.set_total(items.len() as i64);
+                node.set_total(items_total as i64);
             }
-            let shards_total = items.len().div_ceil(shard_size);
+            let mut shards_total = 0;
+            for chunk in items.chunks(shard_size) {
+                queue.push_back(Shard {
+                    group: gi,
+                    items: chunk.to_vec(),
+                });
+                shards_total += 1;
+            }
             // Set the shard denominator up front so a percent node's `NN%` is
             // correct from the first frame (not 100% until the first shard lands).
             node.set_shards_total(shards_total);
             ShardGroup {
                 node,
-                shards_total,
-                items,
+                items_total,
+                shards_total: AtomicUsize::new(shards_total),
                 shards_done: AtomicUsize::new(0),
+                salvaged: AtomicBool::new(false),
                 rows: Mutex::new(Vec::new()),
             }
         })
         .collect();
 
-    let mut queue: VecDeque<Shard> = VecDeque::new();
-    for (gi, g) in groups.iter().enumerate() {
-        let mut s = 0;
-        while s < g.items.len() {
-            let e = (s + shard_size).min(g.items.len());
-            queue.push_back(Shard {
-                group: gi,
-                items: s..e,
-            });
-            s = e;
-        }
-    }
     if queue.is_empty() {
         return Ok(());
     }
@@ -924,27 +1110,20 @@ fn run_shards<T: Send>(
                         continue;
                     };
                     let g = &groups[shard.group];
-                    let slice = &g.items[shard.items.clone()];
+                    let label = &labels[shard.group];
+                    let set_fatal = |err: anyhow::Error| {
+                        let mut lock = q.lock().unwrap();
+                        if lock.fatal.is_none() {
+                            lock.fatal = Some(err);
+                        }
+                    };
 
                     g.node.set_running();
                     g.node.shard_started();
                     let outcome = (|| -> Result<()> {
                         let on_item = |n: usize| g.node.stream(n as i64);
-                        let rows = eval_shard(shard.group, &labels[shard.group], slice, &on_item)?;
-                        g.rows.lock().unwrap().extend(rows);
-                        let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        // Advance a percent node's shard-progress readout (a no-op
-                        // for count-less / plain-count nodes).
-                        g.node.shard_progress(done);
-                        if done == g.shards_total {
-                            let rows = std::mem::take(&mut *g.rows.lock().unwrap());
-                            let n = rows.len() as i64;
-                            on_group_complete(shard.group, rows)?;
-                            // Pin a plain count to the assembled total (the streamed
-                            // tally can drift), then mark the group done.
-                            g.node.group_done(n);
-                        }
-                        Ok(())
+                        let rows = eval_shard(shard.group, label, &shard.items, &on_item)?;
+                        finish_shard(g, shard.group, rows, &on_group_complete)
                     })();
                     g.node.shard_finished();
 
@@ -957,22 +1136,100 @@ fn run_shards<T: Send>(
                                 target.store(t + 1, Ordering::Relaxed);
                             }
                         }
-                        Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
-                            let t = target.load(Ordering::Relaxed);
-                            let nt = (t / 2).max(1);
-                            target.store(nt, Ordering::Relaxed);
-                            successes.store(0, Ordering::Relaxed);
-                            handle.note(&format!(
-                                "  a shard of {} aborted — likely out of memory; \
-                                 requeued, slots {t} -> {nt}",
-                                labels[shard.group],
-                            ));
-                            q.lock().unwrap().queue.push_back(shard);
-                        }
+                        // Any error that isn't an abort fails the whole run.
+                        Err(e) if e.downcast_ref::<EvalAborted>().is_none() => set_fatal(e),
+                        // An abort walks the recovery ladder (see this fn's docs).
                         Err(e) => {
-                            let mut g = q.lock().unwrap();
-                            if g.fatal.is_none() {
-                                g.fatal = Some(e);
+                            let ab = e
+                                .downcast_ref::<EvalAborted>()
+                                .expect("the arm above matched every non-abort error");
+                            successes.store(0, Ordering::Relaxed);
+                            let n = shard.items.len();
+                            // Rung 0: what does this shard still owe? A phase with a
+                            // durable record answers from it; the others owe it all.
+                            // Each shrinking answer requeues a strictly smaller
+                            // shard, so this can't cycle: it reaches empty (done) or
+                            // unchanged (the ladder proper, below).
+                            let left = match remaining {
+                                Some(f) => match f(shard.group, &shard.items) {
+                                    Ok(left) => left,
+                                    Err(err) => {
+                                        set_fatal(err.context(
+                                            "re-checking what an aborted shard still owed",
+                                        ));
+                                        continue;
+                                    }
+                                },
+                                None => shard.items.clone(),
+                            };
+                            let cause = ab.summary();
+                            match recovery(left.len(), n, target.load(Ordering::Relaxed)) {
+                                Recovery::Done => {
+                                    handle.note(&format!(
+                                        "  {phase}: {label} aborted ({cause}) — but all \
+                                         {n} had already landed, so there is nothing \
+                                         left to redo",
+                                    ));
+                                    g.salvaged.store(true, Ordering::Relaxed);
+                                    if let Err(err) =
+                                        finish_shard(g, shard.group, Vec::new(), &on_group_complete)
+                                    {
+                                        set_fatal(err);
+                                        continue;
+                                    }
+                                    q.lock().unwrap().outstanding -= 1;
+                                }
+                                Recovery::Retry => {
+                                    handle.note(&format!(
+                                        "  {phase}: {label} aborted ({cause}); {} of {n} \
+                                         had landed, retrying the remaining {}",
+                                        n - left.len(),
+                                        left.len(),
+                                    ));
+                                    q.lock().unwrap().queue.push_back(Shard {
+                                        group: shard.group,
+                                        items: left,
+                                    });
+                                }
+                                Recovery::Slots(from, to) => {
+                                    target.store(to, Ordering::Relaxed);
+                                    handle.note(&format!(
+                                        "  {phase}: {label} aborted ({cause}); requeued, \
+                                         slots {from} -> {to}",
+                                    ));
+                                    q.lock().unwrap().queue.push_back(shard);
+                                }
+                                Recovery::Split(at) => {
+                                    // The two halves replace this shard, so the group
+                                    // gains one shard (and a percent node its
+                                    // denominator); the queue mutex publishes the new
+                                    // count and the pushes together, so a worker that
+                                    // picks up a half sees both.
+                                    let mut items = shard.items;
+                                    let tail = items.split_off(at);
+                                    handle.note(&format!(
+                                        "  {phase}: {label} aborted ({cause}) at one \
+                                         slot; splitting {n} items into {} + {}",
+                                        items.len(),
+                                        tail.len(),
+                                    ));
+                                    let total = g.shards_total.fetch_add(1, Ordering::Relaxed) + 1;
+                                    g.node.set_shards_total(total);
+                                    let mut lock = q.lock().unwrap();
+                                    lock.outstanding += 1;
+                                    for items in [items, tail] {
+                                        lock.queue.push_back(Shard {
+                                            group: shard.group,
+                                            items,
+                                        });
+                                    }
+                                }
+                                Recovery::GiveUp => set_fatal(e.context(format!(
+                                    "{phase}: {label} could not evaluate `{}` — it \
+                                     aborted alone, at one slot, with nothing left to \
+                                     split or salvage",
+                                    shard.items[0],
+                                ))),
                             }
                         }
                     }
@@ -985,6 +1242,39 @@ fn run_shards<T: Send>(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Book one shard as done: fold its rows into the group and advance the group's
+/// shard progress; on the *last* shard, hand the assembled rows to
+/// `on_group_complete` and mark the node done. Reading `shards_total` here is safe
+/// under `Relaxed` because a split publishes it before pushing the halves under
+/// the queue mutex, so any worker that ran a half acquired that write with it.
+///
+/// The node's final count is the assembled row count — the streamed tally can
+/// drift — *unless* a shard completed by re-derivation (`instantiate`'s salvage),
+/// whose work produced no rows here: then the item total is the honest number.
+fn finish_shard<T>(
+    g: &ShardGroup<T>,
+    gi: usize,
+    rows: Vec<T>,
+    on_group_complete: &(impl Fn(usize, Vec<T>) -> Result<()> + Sync),
+) -> Result<()> {
+    g.rows.lock().unwrap().extend(rows);
+    let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
+    // Advance a percent node's shard-progress readout (a no-op for count-less /
+    // plain-count nodes).
+    g.node.shard_progress(done);
+    if done == g.shards_total.load(Ordering::Relaxed) {
+        let rows = std::mem::take(&mut *g.rows.lock().unwrap());
+        let count = if g.salvaged.load(Ordering::Relaxed) {
+            g.items_total as i64
+        } else {
+            rows.len() as i64
+        };
+        on_group_complete(gi, rows)?;
+        g.node.group_done(count);
+    }
+    Ok(())
 }
 
 /// Ensure every `(commit, system)` pair has a cached eval file, via **one
@@ -1085,6 +1375,7 @@ pub fn eval_pairs(
     let enumerated: Vec<Mutex<Vec<String>>> =
         (0..meta.len()).map(|_| Mutex::new(Vec::new())).collect();
     run_shards(
+        "enumerate",
         enum_nodes,
         labels.clone(),
         // One placeholder item per group ⇒ exactly one shard per pair.
@@ -1104,6 +1395,9 @@ pub fn eval_pairs(
             *enumerated[gi].lock().unwrap() = names;
             Ok(())
         },
+        // One `builtins.attrNames` call per pair: nothing partial to salvage, and
+        // nothing to split either (its single item is the whole call).
+        None,
     )?;
     let items: Vec<Vec<String>> = enumerated
         .into_iter()
@@ -1112,6 +1406,7 @@ pub fn eval_pairs(
 
     // Phase 2: shard-evaluate every pair's enumerated names into its cached file.
     run_shards(
+        "evaluate",
         eval_nodes,
         labels,
         items,
@@ -1146,6 +1441,11 @@ pub fn eval_pairs(
             on_eval_done(system);
             Ok(())
         },
+        // No salvage: a shard's rows live in memory until its eval file is written
+        // whole (nothing transient on disk, above), and one top-level name fans
+        // out into an unknown number of them, so a truncated stream can't be
+        // attributed per item at all. The shard is re-run, split if it must be.
+        None,
     )
 }
 
@@ -1256,6 +1556,27 @@ mod tests {
         assert_eq!(eval_slots(4, 2 * G, SLOT_MEM_MB), 1); //    never zero
         // The heavy `--tests` budget (4 GiB/slot) trims the same boxes further.
         assert_eq!(eval_slots(18, 31 * G, TESTS_SLOT_MEM_MB), 7);
+    }
+
+    #[test]
+    fn recovery_ladder_is_ordered_and_bottoms_out() {
+        use Recovery::*;
+        // Rung 0 outranks every back-off: work a dead pass already landed is never
+        // redone, however many slots are running.
+        assert_eq!(recovery(0, 36, 4), Done);
+        assert_eq!(recovery(0, 1, 1), Done);
+        assert_eq!(recovery(16, 36, 4), Retry);
+        // Then concurrency, halved to 1 …
+        assert_eq!(recovery(36, 36, 4), Slots(4, 2));
+        assert_eq!(recovery(36, 36, 2), Slots(2, 1));
+        // … then the atom, halved until a single item is left (both halves always
+        // non-empty, so this makes progress) …
+        assert_eq!(recovery(36, 36, 1), Split(18));
+        assert_eq!(recovery(3, 3, 1), Split(1));
+        assert_eq!(recovery(2, 2, 1), Split(1));
+        // … and only then does it stop. A bottom rung is what makes the requeue
+        // loop terminate by construction rather than spin (DESIGN §6).
+        assert_eq!(recovery(1, 1, 1), GiveUp);
     }
 
     #[test]

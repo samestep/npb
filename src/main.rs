@@ -1104,21 +1104,28 @@ fn run_phases(
     // makes a re-run of a report with still-to-build rows (e.g. `❔` targets nix
     // couldn't reach) skip the import while still building them (§6).
     let need = build::drvs_needing_instantiation(build::drvs_to_materialize(&targets, policy)?)?;
-    let mut inst: Vec<(Rev, String, Vec<String>)> = Vec::new();
+    let mut inst: Vec<eval::InstRequest> = Vec::new();
     for (sys, changed) in &per_system_changed {
+        // Each requested attr rides with its drv, so an aborted pass can be
+        // retried against what it actually wrote (§6, `absent_drvs` below).
         let mut base_attrs = Vec::new();
         let mut head_attrs = Vec::new();
         for c in changed {
-            let wants = |drv: &Option<String>| drv.as_ref().is_some_and(|d| need.contains(d));
-            if wants(&c.base_drv) {
-                base_attrs.push(c.attr.clone());
-            }
-            if wants(&c.head_drv) {
-                head_attrs.push(c.attr.clone());
-            }
+            let wanted = |drv: &Option<String>| {
+                drv.as_ref()
+                    .filter(|d| need.contains(*d))
+                    .map(|d| (c.attr.clone(), d.clone()))
+            };
+            base_attrs.extend(wanted(&c.base_drv));
+            head_attrs.extend(wanted(&c.head_drv));
         }
-        inst.push((base.clone(), sys.clone(), base_attrs));
-        inst.push((head.clone(), sys.clone(), head_attrs));
+        for (rev, attrs) in [(base, base_attrs), (head, head_attrs)] {
+            inst.push(eval::InstRequest {
+                rev: rev.clone(),
+                system: sys.clone(),
+                attrs,
+            });
+        }
     }
     // Reveal both `instantiate` and `probe` as blue nodes up front — the probe
     // candidate set (and thus its total) is known from the log the moment the
@@ -1126,10 +1133,12 @@ fn run_phases(
     // `instantiate` to finish before appearing (DESIGN §9). Prepare both (probe's
     // node sorts below instantiate's), then run in order: the probe's HTTP HEADs
     // read each drv's outputs from its `.drv`, so they must follow instantiation.
-    let inst = eval::instantiate_prepare(tree, &inst);
+    let inst = eval::instantiate_prepare(tree, inst);
     let probe = build::probe_prepare(&targets, tree)?;
     if let Some(inst) = inst {
-        eval::instantiate_execute(repo, inst, profile, handle)?;
+        eval::instantiate_execute(repo, inst, profile, handle, &|drvs| {
+            build::absent_drvs(drvs)
+        })?;
     }
     if let Some(probe) = probe {
         build::probe_execute(probe)?;

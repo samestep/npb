@@ -590,11 +590,22 @@ pub fn drvs_needing_instantiation(need: HashSet<String>) -> Result<HashSet<Strin
     if need.is_empty() {
         return Ok(need);
     }
-    // `invalid_paths` returns the subset that is *not* valid in the store — for a
-    // `.drv`, exactly the recipes still absent, which are the ones to instantiate.
     let paths: Vec<String> = need.iter().cloned().collect();
-    let absent = invalid_paths(&paths)?;
+    let absent = absent_drvs(&paths)?;
     Ok(retain_absent(need, &absent))
+}
+
+/// Which of these `.drv`s are **not** yet valid store paths — the recipes still
+/// to write. One `nix-store --check-validity`, no evaluation. Besides deciding
+/// what [`drvs_needing_instantiation`] hands the instantiate phase up front, this
+/// is that phase's **retry** rule: an aborted `nix-eval-jobs` still wrote every
+/// recipe it got to, and a written recipe is content-addressed, so re-asking the
+/// store is how a retry owes only what a dead worker actually left behind rather
+/// than re-evaluating the lot (DESIGN §6).
+pub fn absent_drvs(paths: &[String]) -> Result<HashSet<String>> {
+    // `--print-invalid` prints the invalid subset — for a `.drv`, exactly the
+    // recipes still absent.
+    invalid_paths(paths)
 }
 
 /// Keep only the drvs whose `.drv` is absent (present in `absent`) — the recipes

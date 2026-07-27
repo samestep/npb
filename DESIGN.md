@@ -467,9 +467,11 @@ under-parallelizes). Invariants only (total RAM further capped by any cgroup
 memory limit the
 process runs under: a container's ceiling is as much a configured promise as
 the DIMMs). The dynamic part of RAM is handled by feedback, TCP-style
-(AIMD), instead of measurement: a shard that aborts (in practice a worker
-OOM-kill, caught by the integrity gate) is simply **requeued** while the slot
-count halves; sustained success creeps it back up. The requeue is in-memory —
+(AIMD), instead of measurement: a shard that aborts (a worker died — commonly an
+OOM kill — caught by the integrity gate) is **requeued** while the slot count
+halves; sustained success creeps it back up. What happens when halving is not
+enough, and when requeueing the whole atom is the wrong response at all, is the
+next two subsections' concern. The requeue is in-memory —
 the aborted shard goes back on the queue and completed shards' rows are held in
 memory until assembly — so an in-run worker OOM is transparent, but a
 whole-process interruption (^C, crash) discards the in-flight eval, which
@@ -486,9 +488,13 @@ degenerate case — a machine that fits only one worker — is just the queue at
 one slot, not a special phase. The costs: each shard job re-imports the
 nixpkgs spine (a few seconds; single-digit percent of a shard's runtime at
 this size), and a giant single subtree (`haskellPackages`, `linuxKernel`, the
-python package sets, ~20k attrs each) is one indivisible ~minute shard that
-bounds the makespan once slots ≥ total-work/max-shard (measured 1.39× over the
-perfect-packing bound at 15 slots).
+python package sets, ~20k attrs each) is **one name** — it rides inside a
+1024-name shard alongside ~1023 others, and `nix-eval-jobs` fans it out
+internally, so it is an indivisible ~minute job that no re-slicing of the _name_
+list can break up (splitting _within_ such a set was measured and backed out,
+below). Whichever shard carries it bounds the makespan once slots ≥
+total-work/max-shard (measured 1.39× over the perfect-packing bound at 15
+slots).
 
 > Recursive splitting of those subtrees was tried and **backed out** after
 > measurement: selecting attrs inside a giant package set forces that set's
@@ -511,6 +517,128 @@ perfect-packing bound at 15 slots).
 > cross-eval balance was still fixed at spawn. Both dissolved into the queue:
 > the ladder _is_ the slot count backing off, the rung _is_ the queue draining
 > to one slot, and rebalancing is what a shared queue does natively.
+
+**One scheduler, three work shapes.** Four fan-outs go through `run_shards` —
+`enumerate`, the full-set `evaluate`, `--tests`, and `instantiate` — and sharing
+it is deliberate: one concurrency implementation, exercised and kept correct by
+every memory-heavy `nix-eval-jobs` fan-out rather than re-implemented per phase
+(below, under `--tests`). But they do not share a **work shape**, and
+the shared scheduler's feedback loop was designed around exactly one of them.
+The distinction that matters: AIMD over the slot count has authority only when
+the _failure atom_ and the _memory-bearing unit_ are the same object.
+
+- In `evaluate` they are. The atom is a shard, peak memory scales as shard-size ×
+  slots, npb chooses **both** factors, there are hundreds of atoms so the slot
+  count has a wide dynamic range, and losing one atom re-pays seconds.
+- In `--tests` and `instantiate` they come apart. The atom is a whole
+  `(tree, system)` key — never sub-sliced, because the per-key nixpkgs import
+  dominates and, for `--tests`, sub-slicing multiplied the concurrent heavy
+  workers (below) — while the memory-bearing unit is **one job**: a `nixosTest`
+  is a whole NixOS system. So npb controls only the slot count, and with ~2 keys
+  per system that count is usually pinned by the **atom count**, not by the RAM
+  budget it was computed from (a 3-system review gives `instantiate` 4–6 shards,
+  hence 4–6 slots, whichever per-slot figure it counts at). Halving it bottoms
+  out after ~2 steps and there is nothing left to give.
+
+So `evaluate` is a _throughput_ problem — pack many cheap uniform atoms into RAM
+— while `--tests` and `instantiate` are _peak-footprint_ problems, where a single
+job may not fit and no amount of concurrency control changes that. A slot's
+ceiling is `nixpkgs spine + garbage accumulated since the last worker recycle +
+the current job's own demand`. Note what `--max-memory-size` is in that formula:
+`nix-eval-jobs` compares it against `getrusage`'s `ru_maxrss` — a **high-water
+mark** — after each job, and retires the worker (fresh fork, fresh spine import)
+when it is exceeded. It is a **recycle threshold, not a quota**: it bounds the
+middle term and never the demand of one job. Measured: a lone instantiate worker
+over 37 changed `nixosTests.installer.*` peaked at **5.3 GB against a 4 GiB cap**
+— so a heavy phase's honest per-slot figure is ~1.3× the cap, and both heavy
+phases count slots at the heavy-worker figure (`TESTS_SLOT_MEM_MB`) rather than
+the full-set eval's _typical_ 2 GiB.
+
+**What an abort may back off.** A shard that aborts (a worker died — commonly an
+OOM kill, but see below) walks a **finite** ladder, in order:
+
+1. **Halve the slot count** (the AIMD above), while it is > 1.
+2. **Halve the atom** instead, once slots are at 1. The anti-sub-slicing argument
+   is about the _happy path_ — re-paid imports, multiplied heavy workers — and
+   neither applies to one serial worker responding to a failure, where splitting
+   can only _lower_ the peak. This is the rung with real range: keep halving and
+   the work either fits or narrows to one item.
+3. **Fail, naming the item**, when a single item still aborts, with
+   `nix-eval-jobs`' own diagnostic — its exit status and stderr tail, which
+   `stream_jobs` already builds. "This one attr does not fit on this machine" is
+   a real answer; a machine that cannot evaluate it will not evaluate it on the
+   fourth attempt either.
+
+The rung list being finite is the point: the loop **terminates by construction**,
+with no retry counter, and every rung makes the retry _different work_ — the bar
+a retry has to clear to be worth attempting. Deliberately **not** a rung:
+lowering the worker's recycle cap. It shrinks only the accumulation term, its
+floor is the largest single job, and it buys that with one extra spine import per
+recycle — while halving the atom shrinks the same term _and_ isolates the
+culprit.
+
+**And a retry re-derives its work list from the phase's durable record.** A
+requeue that re-runs the whole atom re-does work already finished, which is how
+one aborted pass became two full passes over the same 36 items (below). What is
+salvageable differs per phase, because what a partial pass _leaves behind_ does:
+
+| phase         | durable product of a partial pass                           | a retry therefore                                                                 |
+| ------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `instantiate` | the `.drv` files, in the store                             | re-queries validity and runs only what is still absent (the ladder above when that set stops shrinking) |
+| `--tests`     | `test_drv`/`test_pkg` rows — poisonable (below)             | discards the key and re-runs it, with the split bounding the loss                 |
+| `evaluate`    | none — rows live in memory until the file is written whole  | discards the shard and requeues it (as today)                                     |
+
+`instantiate` is the phase that can salvage, and it needs no new bookkeeping to
+do it: its streamed rows are _discarded_ already (the `.drv` write is the whole
+point), and a `.drv` path is content-addressed — a valid `.drv` at `H` **is** the
+recipe hashing to `H`, the same fact that lets the phase skip recipes surviving
+from an earlier run (below). So a non-zero exit elsewhere in the pass cannot make
+a written recipe wrong, and "what is left to do" is a `nix-store
+--check-validity` away rather than an inference about a truncated stream. When the
+remaining set is empty the phase is simply **done**, abort or no abort; when it
+shrank but is non-empty the retry is strictly smaller; and when it did not shrink
+at all, re-running it unchanged is pointless — which is exactly when the ladder
+above takes over, down to the single item it can name. Progress, not a counter, is
+the stopping rule.
+
+`--tests` deliberately does _not_ salvage, though it looks like it could. Its
+rows are individually true, but `test_pkg` marks a package **fully** evaluated,
+so inserting that marker for a package whose test list was only half streamed
+would cache a permanently truncated test set at that `(tree, system, pkg)` — the
+one hazard the integrity gate exists to prevent. Knowing which packages are
+complete means leaning on `nix-eval-jobs`' single-worker dispatch order (all of a
+package's jobs preceding the next package's), an upstream implementation detail;
+the salvage is worth less than the coupling, so the key is re-run whole. The same
+holds for `evaluate`, where one top-level name fans out into an unknown number of
+rows, so a truncated stream cannot be attributed per item at all — and where a
+cached partial would poison every future diff with phantom "removed" packages.
+
+Two display consequences fall out. A count that outruns its total is _the_
+symptom of a retry redoing finished work (`instantiate` shows `count / total`, so
+`72 / 36` is visible; `--tests` streams a bare count and could hide the same
+thing), and with the work list re-derived each item is streamed once. And the
+note printed above the tree names its phase and reports what actually died,
+rather than asserting an OOM on every non-zero exit — `nix-eval-jobs` also exits
+non-zero on a fatal eval error (a `StackOverflowError` job is emitted _and_ then
+kills the run), so the guess is sometimes simply wrong.
+
+> **The failure this rule was written for (2026-07).** A three-system `--pr`
+> review of nixpkgs#523494 sat for 25 minutes showing `probe 0 / 84` — a
+> _waiting_ node, since the ` / total` column shows for a node's whole life (§11)
+> — behind an `instantiate` phase that could not finish. The x86_64-linux changed
+> set was 5 ordinary attrs plus 37 changed `nixos-install-tools`
+> `passthru.tests`, every one an `installer.*` `nixosTest`: 36 of them on the base
+> side, in one indivisible shard, one `nix-eval-jobs` worker, ~7.5 minutes and
+> ~5.3 GB per pass. Its 4 sides started at 4 slots, two aborts took that to 1
+> (the only phase whose slot count starts at 4, which is how the notes were
+> traced to it), and **each aborted pass had already streamed all 36 items and
+> written their `.drv` files** — so the phase re-derived 36 NixOS-system
+> evaluations for recipes that were already valid in the store, and would have
+> kept doing so unboundedly. The `^C` lost nothing: the next run found
+> every recipe present, skipped the phase entirely, and went straight to `probe`.
+> No OOM kill appears in the journal for that run, so the two "likely out of
+> memory" notes — the only output the phase produced, the real diagnostic having
+> been discarded on requeue — were also unfounded.
 
 **Eval purity vs `builtins.getEnv`.** A handful of nixpkgs packages leak the
 _environment_ into their derivations (drbd bakes `$SHELL` into a Makefile
@@ -547,7 +675,12 @@ _do_ need the `.drv` present in the store — the narinfo probe (§7, which read
 drv's output paths) and the local build (`nix build <drv>^*`, §5) — get it from
 a just-in-time `eval::instantiate` step: one `nix-eval-jobs` run per
 `(commit, system)`, instantiation on, over exactly the changed attr paths
-(nested paths included, via `lib.attrByPath`), run right before building. These
+(nested paths included, via `lib.attrByPath`), run right before building —
+_minus_ the changed set's `passthru.tests` rows, whose recipes the `--tests` eval
+already wrote while it was evaluating them (below). Those are the heaviest
+evaluations in the whole run, and evaluating a `nixosTest` **twice** — once to
+learn its `drvPath`, again to write the `.drv` that path already names — was the
+single largest piece of duplicated work npb did. These
 per-pair runs go through the **same shard scheduler** as the two eval paths
 (`run_shards`), so a fresh multi-system run instantiates all pairs concurrently
 (up to the same slot count) behind the identical live display, instead of
@@ -593,6 +726,22 @@ it is simply re-materialized, no worse than before. The import is per
 `(commit, system)` (one shard, above), so a side is skipped whole only when _all_
 its recipes are present — one absent drv still pays that side's import, with
 instantiation trimmed to the absent attrs.
+
+**Which makes an aborted pass cheap: the same filter _is_ the retry.** This phase
+is the one that salvages partial work (above), and it needs nothing new to do it —
+`drvs_needing_instantiation` already answers "what is still absent" from store
+validity, so a side that aborted re-runs through exactly the filter that decides
+whether it needs to run at all. An abort that had already written every recipe
+leaves an empty set and the side is **done** (a written recipe cannot be wrong:
+content-addressing again); a partial one leaves a strictly smaller set; a set that
+does not shrink means retrying is pointless and the ladder's last rung fires,
+naming the attr that would not evaluate. Since the phase's streamed rows are
+discarded anyway, there is no partial _result_ to distrust here — which is why
+`--tests` and `evaluate`, whose rows are the product, must still discard and
+re-run whole. Slots are counted at the heavy-worker budget, since a residual pass
+(a package whose tests were cached at that tree by an earlier review, its `.drv`
+since collected) still faces `nixosTest` attrs; in practice the atom count (≤2
+shards per system) binds first either way.
 
 **Choosing `base` and `head`.** Every input mode resolves to one shape: a
 _base-branch tip_ and a _head_ to review against it (`resolve_local`/`resolve_pr`
@@ -754,11 +903,31 @@ workers — the earlier `total/(2·slots)` split started `2·slots` of them and
 cascaded into OOM, then requeued one fat shard forever once the slot count
 bottomed out at 1, because the shard (not the concurrency) was the
 memory-bearing unit AIMD could never shrink. With the key as the atom, backing
-off the slot count backs off concurrent heavy workers directly — real memory
-control — the starting count is budgeted at the heavy-worker footprint
-(`TESTS_SLOT_MEM_MB`, the worker restart cap, not the full-set eval's lighter
-per-slot figure), and each key's single worker recycles
-its heap per package at that cap. It gets the same live scheduler display as
+off the slot count backs off concurrent heavy workers directly, and the starting
+count is budgeted at the heavy-worker footprint (`TESTS_SLOT_MEM_MB`, the worker
+restart cap, not the full-set eval's lighter per-slot figure), with each key's
+single worker recycling its heap once it crosses that cap (a recycle threshold,
+not a quota — above). That is real memory control, but only as far as it goes:
+with ~2 keys per system the slot count is usually pinned by the atom count
+itself, so the lever with actual range is splitting the atom on abort (above) —
+which the earlier sub-slicing got wrong not by splitting, but by splitting _up
+front_, where it multiplies heavy workers instead of following a failure.
+
+**This eval instantiates as it goes, and salvages nothing on abort.** Unlike the
+full-set walk, the tests eval runs _with_ instantiation: the drvs it evaluates are
+exactly the ones the changed test rows will need materialized, and writing the
+`.drv` costs the store I/O on a `nixosTest` evaluation that has just been
+performed anyway, where deferring it to the `instantiate` phase costs the whole
+evaluation a second time (above). It writes recipes for tests that turn out
+unchanged or already-decided — a superset of what will be built — which is cheap
+next to a re-evaluation, and unlike the full-set eval's ~114k attrs it is a
+superset of a few dozen. Nothing cached changes: `--no-instantiate` never altered
+a `drvPath` (the same derivation, computed either way), so the `test_drv` rows and
+the observation log are byte-identical and no format version moves (§1). What this
+phase does _not_ do is salvage a partial pass: its product is the cached rows, and
+`test_pkg` marking a package fully evaluated when only some of its tests streamed
+would poison that key permanently (above), so an aborted key is re-run whole. It
+gets the same live scheduler display as
 every other phase, minus the shard `NN%`: `tests` is one shard per key (above),
 so a shard-progress percentage could only ever read 0/50/100 — exactly what the
 blue → yellow → green label color already says — so a `tests` leaf shows just its
