@@ -676,7 +676,7 @@ fn ensure_distinct_trees(base: &Rev, head: &Rev) -> Result<()> {
         bail!(
             "base and head are the same tree ({}) — nothing to review.\n\
              (A clean checkout, an unmoved --pr, or a --base/--head typo?)",
-            &base.tree,
+            base.tree,
         );
     }
     Ok(())
@@ -716,8 +716,8 @@ fn merge_source(repo: &std::path::Path, base: &Rev, head: &Rev) -> Result<Rev> {
         bail!(
             "cannot merge {} onto {}: they conflict.\n\
              Re-run with --no-merge to diff from their merge-base instead.",
-            &head.label,
-            &base.label,
+            head.label,
+            base.label,
         );
     }
     let tree = String::from_utf8(out.stdout)?.trim().to_string();
