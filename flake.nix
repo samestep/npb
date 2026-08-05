@@ -85,8 +85,22 @@
               NPB_REV = npbRev;
               # makeBinaryWrapper, not makeWrapper: the bash wrapper costs ~4 ms
               # of PATH munging per invocation, the compiled one ~0.1 ms.
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeBinaryWrapper ];
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+                pkgs.installShellFiles
+                pkgs.makeBinaryWrapper
+              ];
+              # Completions come from the binary itself (`--completions <shell>`),
+              # so they can never drift from the parser. Generated before the wrap
+              # — `--completions` shells out to nothing and touches no cache, so it
+              # runs fine unwrapped in the sandbox — and skipped when the build
+              # machine can't execute what we just built (a cross build).
               postInstall = ''
+                ${pkgs.lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+                  installShellCompletion --cmd npb \
+                    --bash <($out/bin/npb --completions bash) \
+                    --fish <($out/bin/npb --completions fish) \
+                    --zsh <($out/bin/npb --completions zsh)
+                ''}
                 wrapProgram $out/bin/npb --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
               '';
             }
