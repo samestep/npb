@@ -63,7 +63,6 @@
             nix-eval-jobs
             pkgs.nix-output-monitor # `nom`, the build front-end
             pkgs.git
-            pkgs.nettools # `hostname`
           ];
           # crane's default source filter keeps only Cargo/`.rs` files, which
           # would drop `src/schema.sql` (embedded via `include_str!`) and break
