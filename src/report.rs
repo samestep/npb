@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::model::{Coverage, Observation, Outcome};
+use crate::model::{Observation, Outcome};
 
 /// One side's build state, reduced from a drv's observations (or its absence).
 /// `Ord` (declaration order) only tie-breaks section order among pairs sharing
@@ -202,41 +202,6 @@ fn longest_backtick_run(s: &str) -> usize {
     max
 }
 
-/// The report's disclosure that this review didn't cover the whole changed set
-/// (DESIGN §8) — a selection (`-p`) or a filtered delta (`-P`).
-///
-/// It renders *unfolded*, above the per-system sections, because it changes how
-/// every section below reads and a reader who didn't type the flags has no other
-/// way to tell: an attr missing from a section may have been left out rather than
-/// unaffected. The attr list comes from the flags; only the framing is prose.
-///
-/// TODO(samestep): write the prose. `ONLY` needs to say that the report covers
-/// only the attrs listed — `-p` named them, so anything else the change touches
-/// is outside this report, and an attr listed but absent below didn't resolve on
-/// either side. `SKIP` needs to say the listed attrs were dropped from the
-/// changed set by `-P`, that their absence below is therefore not evidence they
-/// were unaffected, and that a dropped package can still show up as the cause of
-/// a 🚫 on one side. (README, `--help`, and report text are yours, not
-/// AI-generated.)
-fn coverage_note(coverage: &Coverage) -> String {
-    const ONLY: &str = "TODO(samestep): report text disclosing that `-p` chose these attrs";
-    const SKIP: &str = "TODO(samestep): report text disclosing that `-P` dropped these attrs";
-    let list = |attrs: &[String]| {
-        attrs
-            .iter()
-            .map(|a| format!("`{a}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    // One tight list per flag: a blank line before the bullets, none between
-    // them, so each side renders as one block rather than loose paragraphs.
-    match coverage {
-        Coverage::All => String::new(),
-        Coverage::Only(attrs) => format!("\n{ONLY}\n\n- `-p`: {}\n", list(attrs)),
-        Coverage::Except(attrs) => format!("\n{SKIP}\n\n- `-P`: {}\n", list(attrs)),
-    }
-}
-
 /// Render the per-system entries to Markdown, grouped into `before → after`
 /// sections ordered worst-delta-first. `command` is the shell reproduction of
 /// this exact changeset (see `repro_command`), tucked under the heading inside a
@@ -245,7 +210,6 @@ pub fn render(
     base: &str,
     head: &str,
     command: &str,
-    coverage: &Coverage,
     per_system: &[(String, Vec<Entry>)],
 ) -> String {
     // Fence with more backticks than any run inside the command, so a working-
@@ -266,7 +230,6 @@ pub fn render(
         out.push_str(&format!("- {} = {}\n", state.glyph(), state.label()));
     }
     out.push_str("</details>\n");
-    out.push_str(&coverage_note(coverage));
     for (system, entries) in per_system {
         out.push_str(&format!("\n### `{system}`\n"));
         if entries.is_empty() {
@@ -337,47 +300,13 @@ mod tests {
         // run (editing a Markdown file). The fence must be longer so the report
         // block doesn't close early.
         let cmd = "git apply --cached <<'PATCH'\n+```sh hi\nPATCH";
-        let out = render("b", "h", cmd, &Coverage::All, &[]);
+        let out = render("b", "h", cmd, &[]);
         assert!(out.contains("\n````sh\n"), "{out}");
         // The block closes on its own oversized fence, then the <details> wrapping it.
         assert!(out.contains("\n````\n</details>\n"), "{out}");
         // The common (no-backtick) command still gets a plain triple fence.
-        let out = render("b", "h", "npb --base a --head b", &Coverage::All, &[]);
+        let out = render("b", "h", "npb --base a --head b", &[]);
         assert!(out.contains("\n```sh\n"), "{out}");
-    }
-
-    #[test]
-    fn coverage_note_renders_only_for_a_narrowed_review() {
-        // A whole-set delta review covers everything: nothing to disclose.
-        let out = render("b", "h", "cmd", &Coverage::All, &[]);
-        assert!(!out.contains("`-p`"), "{out}");
-        assert!(!out.contains("`-P`"), "{out}");
-
-        // A selection lists what it covered, unfolded, above the sections.
-        let out = render(
-            "b",
-            "h",
-            "cmd",
-            &Coverage::Only(vec!["git".into(), "hello".into()]),
-            &[("sys".into(), Vec::new())],
-        );
-        assert!(out.contains("- `-p`: `git`, `hello`\n"), "{out}");
-        assert!(!out.contains("`-P`"), "{out}");
-        assert!(out.find("`-p`") < out.find("### `sys`"), "{out}");
-
-        // A filtered delta lists what it dropped.
-        let out = render(
-            "b",
-            "h",
-            "cmd",
-            &Coverage::Except(vec!["python313Packages.requests".into()]),
-            &[],
-        );
-        assert!(!out.contains("`-p`"), "{out}");
-        assert!(
-            out.contains("- `-P`: `python313Packages.requests`\n"),
-            "{out}"
-        );
     }
 
     #[test]
@@ -492,7 +421,6 @@ mod tests {
             "base",
             "head",
             "npb --base base --head head",
-            &Coverage::All,
             &[("aarch64-linux".into(), entries)],
         );
 

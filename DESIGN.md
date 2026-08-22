@@ -713,7 +713,7 @@ two of the python sets ([`all-packages.nix`](https://github.com/NixOS/nixpkgs/bl
 `recurseIntoAttrs` on only `python313Packages`/`python314Packages`). Measured on
 one cached eval: 11305 rows under `python313Packages`, 11304 under
 `python314Packages`, **zero** under `python3Packages`, `python311Packages`,
-`python312Packages`, `python315Packages`, or any `pypy*Packages` — while
+`python312Packages`, `python315Packages`, or any of the pypy sets — while
 `python311Packages.dirty-equals` evaluates perfectly well and is a real rebuild
 of that PR. A name-matching filter can never reach those attrs, and neither can
 any tool keyed on a recursing walk (ofborg and Hydra included).
@@ -742,7 +742,10 @@ consequences:
   drvs on both sides (the change doesn't affect it — a real answer to the question
   asked, where a diff would silently drop it), and nothing on either side, which
   is how a typo'd `-p` reports itself (➖→➖, §8). So an unmatched `-p` needs no
-  separate diagnostic: it _is_ a row.
+  separate diagnostic: it _is_ a row. And a narrowed review needs no separate
+  disclosure either — the reproduction command every report carries (§8) names
+  the flags that produced it, which is how `--no-tests` and the `--allow-*`
+  profile have always disclosed themselves.
 - **A named attr must be a derivation, not a subtree.** `nix-eval-jobs` recurses
   into a `recurseForDerivations` attrset, so `-p python313Packages` would quietly
   become ~11k rows. Such a row arrives with a multi-element `attrPath` whose first
@@ -1169,17 +1172,6 @@ The heading links `npb` to the exact source tree the binary was built from —
 `main` for a dirty tree). `--version` prints the same URL, so a report and the
 binary that produced it point at one commit. This is npc's `--version` scheme.
 
-**A narrowed report says so, unfolded.** When a review didn't cover the whole
-changed set (§6), the report states which way and names the attrs, between the
-heading's folded blocks and the per-system sections (`report::coverage_note`).
-It is the one thing in a report that can't be folded away: it changes how every
-section below reads, and a reader who didn't type the flags has no other way to
-tell an attr that was filtered out from one the change didn't touch. A report
-whose sections show no regressions while silently covering 1% of the changed set
-would be worse than no report, and reports get pasted into PRs where the reader
-never saw the invocation. The reproduction command (below) echoes the flags for
-the same reason: without them it would reproduce a _different_ report.
-
 **Every report carries a copy-pasteable reproduction command** (a `sh`
 block folded in a `<details>` under the heading, `repro_command` in
 `src/main.rs`), followed by a second `<details>` glossing every glyph, so anyone
@@ -1191,8 +1183,8 @@ tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
 review byte-for-byte, and npb re-mints the merge itself — the command never names
 a synthetic (local-only) commit. Only report-shaping flags are echoed
 (`--no-merge`, the profile's `--allow-broken`/`--allow-unsupported`/`--allow-insecure`,
-`--no-tests`, each `-p`/`-P` of the package filter, and an explicit `-s` per
-system, since the default system is host-specific); `--retry` and the eval-sizing
+`--no-tests`, whichever of `-p`/`-P` narrowed the review (§6), and an explicit
+`-s` per system, since the default system is host-specific); `--retry` and the eval-sizing
 knobs don't change the changeset, so they're omitted. What varies is only how the
 _head_'s tree is recovered on another machine:
 

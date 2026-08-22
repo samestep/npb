@@ -1346,7 +1346,8 @@ fn run(cli: Cli) -> Result<()> {
     // What this review covers (DESIGN §6): the whole changed set, or exactly the
     // attrs `-p` named. `-P` drops attrs from a delta, and clap makes the two
     // flags exclusive — `-p` with `-P` would subtract from a set npb was told not
-    // to compute. Either way the report says what it covered (DESIGN §8).
+    // to compute. Either way the report's reproduction command echoes the flag
+    // that narrowed it (DESIGN §8), like every other report-shaping flag.
     let coverage = if !cli.package.is_empty() {
         Coverage::Only(cli.package)
     } else if !cli.skip_package.is_empty() {
@@ -1597,7 +1598,7 @@ fn run(cli: Cli) -> Result<()> {
     );
     print!(
         "{}",
-        report::render(&base.label, &head_display, &command, &coverage, &per_system)
+        report::render(&base.label, &head_display, &command, &per_system)
     );
     Ok(())
 }
