@@ -34,16 +34,16 @@ CREATE TABLE IF NOT EXISTS observation (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 
--- The `--tests` passthru.tests eval cache (DESIGN.md §4, §6). A test's drv is a
--- pure function of (tree, system, package-attr) — the source *tree*, not the
--- commit (see `model::Rev`) — so we cache per package and reuse across reviews at
--- a tree (a rebase/amend, or committing an as-is working tree, all hit).
+-- The `tests` phase's `passthru.tests` eval cache (DESIGN.md §4, §6). A test's
+-- drv is a pure function of (tree, system, package-attr) — the source *tree*, not
+-- the commit (see `model::Rev`) — so we cache per package and reuse across
+-- reviews at a tree (a rebase/amend, or committing an as-is working tree, all hit).
 --
 -- The `(tree, system)` an eval belongs to is *interned* into `eval_key` and
 -- referenced by its small integer `id`, rather than repeated as a 40-char tree
 -- hash + system string on every row of the tables below. A handful
 -- of distinct keys back thousands of test rows, so this is ~25% off the whole
--- `--tests` cache on real data (the biggest lever; DESIGN.md §4). It's also the
+-- `tests` cache on real data (the biggest lever; DESIGN.md §4). It's also the
 -- eviction unit: dropping an eval file (`--clean`) purges its key here, cascading
 -- to the rows below. The `system` value is the **profile-qualified** key
 -- `<token>/<system>` (`model::Profile::qualify`), so the same tree/system under
