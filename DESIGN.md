@@ -213,10 +213,24 @@ it uses a prefix-only `strip_out` rather than `strip_drv`) — and stores its
 matters more there than anywhere else: it's the one append-only, never-evicted
 table, so its per-row bytes are what compound over time (~15% off it, measured).
 
+**Selector resolutions → SQLite too** (`sel_drv`, §6). A `-p` review evaluates
+only the attrs it was named, so it writes no eval file — a partial eval cached
+under a `(tree, system, profile)` key is the one thing that poisons every later
+diff. But its _re-run_ has to stay instant like any other report's, so the
+resolutions land in the same engine the `tests` cache uses, and for the same
+reason: a keyed, incremental, partial fact, looked up by exact attr rather than
+diffed as a whole. Unlike `test_pkg` it needs no completeness marker — nothing
+ever asks for "all attrs at this key" — so a partial table is a partial cache
+rather than a truncated fact. One consequence for `--clean` (below): a selector
+key has no eval file, so it is not part of the corpus `--clean` measures or
+evicts. That is the honest reading of `--clean`'s contract rather than an
+oversight; the rows are tiny, keyed, and re-derivable in seconds, and a dated
+eviction can be added additively if that ever stops being true.
+
 ```
 ~/.cache/nix-npb/
   format-version                # eval-cache format version (§1); a bump wipes the eval cache, keeps the log
-  npb.sqlite                    # observation log (tiny) + test cache (the bulk) + patch-tree cache (§8)
+  npb.sqlite                    # observation log (tiny) + test cache (the bulk) + selector resolutions + patch-tree cache (§8)
   <token>/<sys>/<tree>.tsv.zst  # attr→drv maps (zstd), one file per (profile, system, eval) — evicted by --clean
 ```
 
@@ -654,7 +668,7 @@ as a bare `attr` line, distinct from a missing attr (no line at all). The diff
 is a set-diff on `(attr, drv_path)`, where a `None` drv means "threw": a package
 that starts or stops evaluating under the profile shows as a changed row
 (⏩↔build), while one that throws on _both_ sides is `None == None` — no change,
-not shown, so ⏩→⏩ never appears (§8). A row present on only _one_ side is a
+not shown, so ⏩→⏩ never appears in a delta report (§8). A row present on only _one_ side is a
 change whether or not it has a drv there, so a package that threw and then
 vanished (or appeared already throwing) still reports — ⏩→➖ and ➖→⏩ (§8). An
 earlier version dropped those two, reasoning that an attr nixpkgs-review could
@@ -666,71 +680,111 @@ changed-by-this-side / by-the-other / by-both; it turned out not to matter in
 practice and was dropped. The merge base survives only as the `--no-merge` base
 of a report.)
 
-**Reviewing part of the changed set: `-p` / `-P`.** A change deep in the
+**Reviewing less than the whole changed set: `-p` / `-P`.** A change deep in the
 dependency chain — a `gitMinimal` or `python3Packages.setuptools` bump — can put
 tens of thousands of attrs in the changed set, which is more than a review
-machine can build and more than a report can usefully say. So the changed set is
-_filterable_, like `nixpkgs-review`'s `-p`/`-P`: `-p`/`--package` restricts the
-review to given attrs, `-P`/`--skip-package` drops given ones
-(`model::PackageFilter`, prompted by
-[#2](https://github.com/samestep/npb/issues/2)). Three decisions make it fit.
+machine can build and more than a report can usefully say. So a review need not
+cover the whole set (`model::Coverage`, prompted by
+[#2](https://github.com/samestep/npb/issues/2)). There are two ways to want
+that, they are _different questions_, and conflating them is what the first cut
+of this got wrong:
 
-- **Attrs are matched exactly, because npb doesn't read attr-path structure.**
-  No subtrees, no globs, no prefixes — `-p git` is `git` and not `gitMinimal`,
-  and `-p python3Packages` selects nothing. That is not a shortcut, it is the
-  house style: nowhere in npb's Rust is an attr path anything but an opaque key
-  (sorted, diffed, compared, stored), and where structure is genuinely needed it
-  comes from the evaluator — `nix-eval-jobs`' pre-split `attrPath` array
-  (`eval::raw_to_test_job`) or a `lib.attrByPath (lib.splitString ".")` inside a
-  generated expression (`build_tests_expr`, the instantiate selector). A filter
-  is a poor place to break that, because the string it would have to parse is
-  ambiguous: the full-set eval stores `nix-eval-jobs`' *quoted* attr, so a dotted
-  *name* (`rubyPackages."http_parser.rb"` — 34 such attrs in one aarch64-linux
-  eval) and a dotted *path* look alike from the string alone. Subtree matching is
-  additive if someone asks for it (`-P python3Packages` to skip a whole set is
-  the plausible request); it isn't the default guess.
+- `-P`/`--skip-package` **narrows a delta.** The question is still "what did this
+  change break?", so the changed set is still computed from two whole-set evals;
+  these attrs are dropped from it.
+- `-p`/`--package` **is a selection.** The question is "what does this change do
+  to _these_ attrs?", which needs no changed set at all: npb evaluates exactly
+  the named attrs on both trees and reports each one.
 
-- **One pass, before the `tests` expansion — which is what makes tests come
-  along for free.** The filter applies once, to the diff (`run_phases`), and the
-  `tests` phase then expands only what survived, since it is driven off
-  `changed_names` of the filtered set. So `-p git` reviews `git` and every one of
-  its `git.tests.*` rows without the filter knowing what a test row is called;
-  `-P git` reviews neither; and no package's tests are enumerated except the
-  selected ones — which is the expensive part of that phase, and most of what
-  `-P` buys on a big changed set. Nothing downstream needs a second pass, so
-  there is exactly one predicate (`selects`) and one place it runs. The cost of
-  that simplicity is that `-P` cannot drop an individual `tests` row: a test's
-  membership follows its package's, because the row doesn't exist yet when the
-  filter runs.
+`-p` and `-P` are therefore exclusive (the CLI refuses both, and `Coverage`
+can't represent it): asking for both is asking npb to subtract from a set it was
+told not to compute.
 
-- **It filters the changed set, never the eval.** An eval file is the whole attr
-  set at a `(tree, system, profile)`, shared by every review of that tree, and a
-  _partial_ one cached under that key would poison every later diff with phantom
-  "removed" packages (§4, and the same hazard the `tests` cache's completeness
-  marker exists for). Narrowing the eval to the named attrs would be much faster
-  and is exactly what we don't do: on a cold cache a filtered review still pays
-  both full evals. What it skips is everything keyed on the changed _set_ — the
-  `tests` eval, instantiation, the probe, the builds, the report — which is where
-  a 20k-attr rebuild is actually unaffordable. Second and later runs are warm, so
-  the eval is paid once per tree either way. The corpus keeps its value; the
-  filter costs it nothing.
+**Why a selection is not a filter — the feedback that forced this.** The first
+implementation made `-p` a filter over the changed set, matched by attr name.
+[The first person to try
+it](https://github.com/samestep/npb/pull/3#issuecomment-5381463255) ran 18 `-p`
+attrs against [nixpkgs#545428](https://github.com/NixOS/nixpkgs/pull/545428) and
+got rows for two of them. Nothing was broken; the changed set genuinely
+contained no `python3Packages.dirty-equals`, because a whole-set walk only
+descends into attrsets marked `recurseForDerivations` and nixpkgs marks exactly
+two of the python sets ([`all-packages.nix`](https://github.com/NixOS/nixpkgs/blob/4905842092e96ae11254a905ef9d46f1b0e29437/pkgs/top-level/all-packages.nix#L4485):
+`python3Packages = dontRecurseIntoAttrs python314Packages`, with
+`recurseIntoAttrs` on only `python313Packages`/`python314Packages`). Measured on
+one cached eval: 11305 rows under `python313Packages`, 11304 under
+`python314Packages`, **zero** under `python3Packages`, `python311Packages`,
+`python312Packages`, `python315Packages`, or any `pypy*Packages` — while
+`python311Packages.dirty-equals` evaluates perfectly well and is a real rebuild
+of that PR. A name-matching filter can never reach those attrs, and neither can
+any tool keyed on a recursing walk (ofborg and Hydra included).
 
-And **exclusion removes a target, not a dependency.** A `-P`'d package that a
+nixpkgs-review had already solved the near half of this: with `-p` it
+**evaluates** the named attrs and intersects the changed set on **`drv_path`**
+(`_join_packages_for_system`, whose own comment says so), dying when a named attr
+resolves outside it — and on its local path it skips computing rebuilds
+altogether and just builds what you named. Since drvpath keying is npb's founding
+decision (§2), matching a filter on attr _names_ was keying on the wrong thing.
+Evaluating the named attrs directly goes one better than intersecting: it reviews
+attrs no changed set contains.
+
+**What a selection does.** For each named attr, npb resolves it on both trees —
+one targeted `nix-eval-jobs` run per `(tree, system)` over a `lib.attrByPath`
+selector (`eval::resolve_attrs`, the same `select_expr` the `instantiate` phase
+uses, so the attr-path splitting stays on the Nix side and npb's Rust keeps
+treating attrs as opaque keys) — and pairs the two sides into a row. Three
+consequences:
+
+- **No whole-set eval at all.** A cold selector run costs seconds (a lazy
+  top-level lookup per side) where a delta review costs minutes for two
+  ~114k-attr walks. This is the difference between npb being usable on a
+  setuptools-class rebuild and not.
+- **Every named attr gets a row**, including the two a diff can never show: equal
+  drvs on both sides (the change doesn't affect it — a real answer to the question
+  asked, where a diff would silently drop it), and nothing on either side, which
+  is how a typo'd `-p` reports itself (➖→➖, §8). So an unmatched `-p` needs no
+  separate diagnostic: it _is_ a row.
+- **A named attr must be a derivation, not a subtree.** `nix-eval-jobs` recurses
+  into a `recurseForDerivations` attrset, so `-p python313Packages` would quietly
+  become ~11k rows. Such a row arrives with a multi-element `attrPath` whose first
+  element is the attr that was asked for, so it is detected without parsing
+  anything and refused. Naming a whole set is a plausible want, but it is a
+  different feature with different costs, and it stays additive.
+
+**And the resolutions are cached, which is the whole reason this is affordable.**
+A selection writes no eval file — it evaluated a handful of attrs, and caching
+that under a `(tree, system, profile)` key would be a _partial_ eval, the one
+thing that poisons every later diff with phantom "removed" packages (§4). But
+npb's other stated guarantee is that a report's reproduction command re-runs
+near-instantly, and a targeted eval with nowhere to live would re-import nixpkgs
+on every run — exactly the cost `drvs_needing_instantiation` exists to avoid
+elsewhere in this section. So a resolution is cached where a keyed, incremental,
+partial fact belongs: SQLite (`sel_drv`, §4), holding the same trichotomy the
+eval-file format carries — a drv, no drv but it threw (⏩), or absent (➖). A warm
+selector re-run resolves nothing, imports nothing, and answers from the log.
+
+**Attrs are matched exactly, and `-P` runs before the `tests` expansion.** No
+subtrees, no globs, no prefixes: nowhere in npb's Rust is an attr path anything
+but an opaque key, and the string a matcher would have to parse is ambiguous
+anyway — the eval file keeps `nix-eval-jobs`' quoting, so a dotted _name_
+(`rubyPackages."http_parser.rb"` — 34 such attrs in one aarch64-linux eval) and a
+dotted _path_ look alike. `-P` then applies once, to the diff, _before_ the
+`tests` phase expands it, and that is what makes tests follow their package for
+free: the expansion is driven off whatever survives (`changed_names`), so a
+dropped package's tests are never enumerated — the expensive part — and a kept
+package's come along without the filter knowing what a test row is called. The
+cost of that simplicity is that `-P` cannot drop an individual `tests` row, which
+doesn't exist yet when it runs. A selection expands tests the same way, off the
+attrs it named.
+
+**Dropping an attr removes a target, not a dependency.** A `-P`'d package that a
 surviving target needs is still built by nix inside that target's closure —
 matching nixpkgs-review — and the observation it produces is keyed on its
 drvpath (§2) like any other, so it lands in the log all the same. A later run
 without the flag finds it already decided, for free. The visible consequence is a
 one-sided `🚫` whose culprit isn't in the report; that is unavoidable and mild,
-since `🚫` already means "something in the closure broke" (§8). Filtering narrows
-a report; it never discards knowledge — which is the difference between doing
-this over a durable fact store and doing it one-shot.
-
-A `-p` that names an attr the diff doesn't contain — a typo, an unaffected
-package, or a `tests` row (which isn't a changed-set attr when the filter runs) —
-is not an error, and deliberately not detected: distinguishing those cases would
-mean a whole-eval membership lookup for a wrong answer either way. The report
-discloses the filter instead (§8), so a narrow report is never mistaken for a
-clean one.
+since `🚫` already means "something in the closure broke" (§8). Narrowing a
+review narrows a report; it never discards knowledge — which is the difference
+between doing this over a durable fact store and doing it one-shot.
 
 **Eval does not instantiate; the changed set is materialized before building.**
 `nix-eval-jobs` runs with `--no-instantiate`: npb needs only the `drvPath` and
@@ -1081,10 +1135,14 @@ accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
-Of the 6 × 6 = 36 pairs, **34** can appear in a report: every combination except
-the two the diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no
+Of the 6 × 6 = 36 pairs, **34** can appear in a _delta_ report: every combination
+except the two the diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no
 change, §6) and ➖→➖ (an attr in neither eval is never a row). Every other pair,
-including ⏩→➖ and ➖→⏩, is reachable.
+including ⏩→➖ and ➖→⏩, is reachable. A **selection** (`-p`, §6) reaches all
+**36**, because it reports every attr it was named rather than every attr that
+changed: an attr that throws on both sides is still an answer, and ➖→➖ is how a
+`-p` that resolved to nothing — a typo, or a path that isn't there on either
+tree — reports itself.
 Sections are ordered **worst-delta-first**: each state has a goodness on the
 build-outcome axis (`✅` > `⏩` > `🚫` > `❌`, with `➖` absent slotted just under
 `✅` as _new_/_gone_), and a section sorts by the signed delta
@@ -1111,9 +1169,9 @@ The heading links `npb` to the exact source tree the binary was built from —
 `main` for a dirty tree). `--version` prints the same URL, so a report and the
 binary that produced it point at one commit. This is npc's `--version` scheme.
 
-**A filtered report says so, unfolded.** When `-p`/`-P` narrowed the changed set
-(§6), the report states it — and the attrs on each side of the filter — between
-the heading's folded blocks and the per-system sections (`report::filter_note`).
+**A narrowed report says so, unfolded.** When a review didn't cover the whole
+changed set (§6), the report states which way and names the attrs, between the
+heading's folded blocks and the per-system sections (`report::coverage_note`).
 It is the one thing in a report that can't be folded away: it changes how every
 section below reads, and a reader who didn't type the flags has no other way to
 tell an attr that was filtered out from one the change didn't touch. A report

@@ -253,15 +253,15 @@ npb --no-tests
 
 ### `-p`, `--package`
 
-TODO(samestep): write this section. It documents `-p`/`--package`, which restricts the review to the attributes named — matched exactly, so `-p git` covers `git` but not `gitMinimal` and not `python3Packages.git`. Pass it more than once for more than one attribute. Worth mentioning: the `passthru.tests` of a named package are still included (unless `--no-tests`), since those are found from the packages under review; the two Nixpkgs evaluations still happen in full, because that is how the changed set is computed, so what this saves is the test evaluation, the builds, and the report; and the report says which attributes it was restricted to.
+TODO(samestep): write this section. It documents `-p`/`--package`, which reviews exactly the attributes named instead of everything the change affects: `npb` evaluates just those attributes on both sides and reports each one. Worth mentioning: attribute names are matched exactly, and must name a package rather than a package set, so `-p python3Packages.dirty-equals` works but `-p python313Packages` is refused; the `passthru.tests` of a named package are included (unless `--no-tests`); an attribute the change turns out not to affect is still reported, and one that doesn't exist on either side is reported as `➖ → ➖`, which is how a typo shows up. Also worth mentioning, because it is the reason to reach for this on a big rebuild: naming attributes means `npb` does not have to evaluate all of Nixpkgs on both sides, so a first run takes seconds rather than minutes — including for attributes that a whole-Nixpkgs evaluation never reaches, like `python311Packages.dirty-equals`, whose set Nixpkgs doesn't mark for recursion. Cannot be combined with `-P`.
 
 ```sh
-npb -p git -p hello
+npb -p python3Packages.dirty-equals -p python313Packages.dirty-equals
 ```
 
 ### `-P`, `--skip-package`
 
-TODO(samestep): write this section. It documents `-P`/`--skip-package`, which drops the attributes named from the review, matched exactly like `-p`. Worth mentioning: a skipped package's tests are skipped with it; a skipped package is still built if something else in the review depends on it, and `npb` remembers that outcome, so a later run without the flag gets it for free.
+TODO(samestep): write this section. It documents `-P`/`--skip-package`, which reviews everything the change affects *except* the attributes named, matched exactly like `-p`. Worth mentioning: a skipped package's tests are skipped with it; a skipped package is still built if something else under review depends on it, and `npb` remembers that outcome, so a later run without the flag gets it for free. Unlike `-p` this still evaluates all of Nixpkgs on both sides, because that is how the affected set is found. Cannot be combined with `-p`.
 
 ```sh
 npb -P emscripten

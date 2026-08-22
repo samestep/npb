@@ -100,65 +100,104 @@ impl Profile {
     }
 }
 
-/// Which attrs of the changed set a review covers: `-p`/`--package` to restrict
-/// it to a set of attrs, `-P`/`--skip-package` to drop some (DESIGN §6).
+/// What a review covers: the whole changed set, that set minus some attrs
+/// (`-P`/`--skip-package`), or exactly the attrs `-p`/`--package` named
+/// (DESIGN §6).
 ///
-/// Both match an attr **exactly** — no subtrees, no globs, no interpretation of
-/// the `.`s inside an attr path. That is deliberate: nothing in npb's Rust has
-/// ever read structure out of an attr path. Attrs are opaque keys here — sorted,
-/// diffed, compared, stored — and where structure is genuinely needed it comes
-/// from the evaluator, either as `nix-eval-jobs`' pre-split `attrPath` array
-/// ([`TestJob`]) or from a `lib.attrByPath (lib.splitString ".")` inside a
-/// generated expression. A filter is a poor place to break that: the stored attr
-/// keeps `nix-eval-jobs`' quoting, so a dotted *name* (`rubyPackages."http_parser.rb"`)
-/// and a dotted *path* are not distinguishable from the string alone.
+/// One type with three states, because `-p` and `-P` answer different questions
+/// and can't be combined. A *delta* review asks "what did this change break?",
+/// derives its attrs from the diff of two whole-set evals, and can be narrowed by
+/// dropping attrs from it. A *selection* asks "what does this change do to these
+/// attrs?", so npb evaluates just those attrs on both trees and reports each one
+/// — including the ones the change turns out not to affect, which is a real
+/// answer to the question asked, and the two a whole-set diff can never show: an
+/// attr that exists on neither side (➖→➖, how a typo shows itself) and one that
+/// throws on both (⏩→⏩). Asking for both at once would be asking npb to subtract
+/// from a set it was told not to compute, so the CLI refuses it and this type
+/// can't represent it.
 ///
-/// So the filter runs **once**, over the changed set, before the `tests` phase
-/// expands it — and `passthru.tests` rows come along for free, because that
-/// expansion is driven off whatever survives here (`changed_names`). `-p git`
-/// reviews `git` and every `git.tests.*` row; `-P git` reviews neither; and no
-/// package's tests are enumerated except the selected ones, which is the
-/// expensive part of that phase. Nothing downstream needs a second pass.
+/// A selection needs no whole-set eval at all, which is the point: on a cold
+/// cache it turns minutes of enumerating ~114k attrs into seconds of evaluating
+/// the handful you named. What it does *not* give up is the warm re-run — those
+/// resolutions are cached like any other pure eval fact (`store::sel_drv`), so
+/// re-running a report's reproduction command stays near-instant, with no nixpkgs
+/// import at all.
 ///
-/// The filter never touches the eval, only what the diff hands downstream — an
-/// eval file is the whole attr set at a `(tree, system, profile)`, shared across
-/// every review of that tree, and a *partial* one cached under that key would
-/// poison every later diff with phantom "removed" packages (DESIGN §6). So a
-/// filtered review still pays both full evals on a cold cache; what it skips is
-/// everything keyed on the *changed set* — the `tests` eval, instantiation, the
-/// cache probe, the builds, and the report.
+/// **Attrs are matched exactly**, with no subtrees or globs, because nothing in
+/// npb's Rust reads structure out of an attr path — attrs are opaque keys here,
+/// and where structure is needed it comes from the evaluator, as `nix-eval-jobs`'
+/// pre-split `attrPath` ([`TestJob`]) or a `lib.attrByPath (lib.splitString ".")`
+/// inside a generated expression. The string a matcher would have to parse is
+/// ambiguous anyway: the eval file keeps `nix-eval-jobs`' quoting, so a dotted
+/// *name* (`rubyPackages."http_parser.rb"`) and a dotted *path* look alike.
 ///
-/// Exclusion removes a *target*, never a dependency: a `-P`'d package that some
-/// surviving target needs is still built by nix as part of that target's
-/// closure, and the observation it produces is keyed on its drvpath like any
-/// other (DESIGN §2), so it lands in the log all the same. A later run without
-/// the flag finds it already decided. Filtering narrows a report; it doesn't
-/// discard knowledge.
+/// [`Except`] runs once, over the diff, *before* the `tests` phase expands it —
+/// and that is what makes tests follow their package for free: the expansion is
+/// driven off whatever survives (`changed_names`), so a dropped package's tests
+/// are never enumerated (the expensive part) and a kept package's come along
+/// without the filter knowing what a test row is called. The cost of that
+/// simplicity is that `-P` can't drop an individual `tests` row, which doesn't
+/// exist yet when it runs.
+///
+/// Dropping an attr removes a *target*, never a dependency: a dropped package
+/// that some surviving target needs is still built by nix as part of that
+/// target's closure, and the observation it produces is keyed on its drvpath like
+/// any other (DESIGN §2), so it lands in the log all the same. A later run
+/// without the flag finds it already decided. Narrowing a review narrows a
+/// report; it doesn't discard knowledge.
+///
+/// [`Except`]: Coverage::Except
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PackageFilter {
-    /// `-p`: restrict the changed set to exactly these attrs. Empty means
-    /// "everything", not "nothing".
-    pub include: Vec<String>,
-    /// `-P`: drop exactly these attrs from the changed set. Applied after
-    /// `include`, so an exclusion always wins.
-    pub exclude: Vec<String>,
+pub enum Coverage {
+    /// The whole changed set: diff two whole-set evals.
+    #[default]
+    All,
+    /// The changed set minus these attrs (`-P`). Never empty.
+    Except(Vec<String>),
+    /// Exactly these attrs, resolved on both trees (`-p`). Never empty.
+    Only(Vec<String>),
 }
 
-impl PackageFilter {
-    /// Whether either flag was passed. A default filter selects everything, so
-    /// the report's disclosure (DESIGN §8) and the reproduction command's echo
-    /// both key off this.
-    pub fn is_set(&self) -> bool {
-        !self.include.is_empty() || !self.exclude.is_empty()
+impl Coverage {
+    /// The attrs a selection named, or `None` for a delta review. This is the
+    /// one question that changes which phases run at all (DESIGN §6).
+    pub fn only(&self) -> Option<&[String]> {
+        match self {
+            Coverage::Only(attrs) => Some(attrs),
+            _ => None,
+        }
     }
 
-    /// Whether this attr is in the review: named by some `-p` (or `-p` wasn't
-    /// passed at all) and by no `-P`. The whole filter, applied to a changed-set
-    /// attr; a `tests` row's membership follows from its package's, since the
-    /// expansion never runs for an attr this rejected.
-    pub fn selects(&self, attr: &str) -> bool {
-        !self.exclude.iter().any(|e| e == attr)
-            && (self.include.is_empty() || self.include.iter().any(|i| i == attr))
+    /// Whether this changed-set attr survives — always true unless `-P` named it.
+    /// A selection filters nothing, because it never computes a delta to filter.
+    pub fn keeps(&self, attr: &str) -> bool {
+        match self {
+            Coverage::Except(attrs) => !attrs.iter().any(|a| a == attr),
+            _ => true,
+        }
+    }
+}
+
+/// What one attr named with `-p` evaluates to at one `(tree, system, profile)`.
+///
+/// A pure fact, cached in `store::sel_drv` — which is what keeps a selector
+/// review's re-run instant without an eval file (DESIGN §4). It carries the same
+/// trichotomy the eval-file format does: a drv; no drv but `threw`, meaning it is
+/// broken/unsupported/insecure under the profile or forces something that is
+/// (⏩); or no drv and not `threw`, meaning the attr path isn't there at all (➖).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub drv_path: Option<String>,
+    pub threw: bool,
+}
+
+impl Resolved {
+    /// The `➖` case: nothing at that attr path on this tree.
+    pub fn absent() -> Self {
+        Self {
+            drv_path: None,
+            threw: false,
+        }
     }
 }
 
@@ -386,42 +425,50 @@ mod tests {
     }
 
     #[test]
-    fn package_filter_matches_attrs_exactly() {
-        let f = |inc: &[&str], exc: &[&str]| PackageFilter {
-            include: inc.iter().map(|s| s.to_string()).collect(),
-            exclude: exc.iter().map(|s| s.to_string()).collect(),
-        };
-        // A default filter selects everything, and isn't "set" (no disclosure,
-        // no echo in the reproduction command).
-        let none = f(&[], &[]);
-        assert!(!none.is_set());
-        assert!(none.selects("git"));
+    fn coverage_matches_attrs_exactly() {
+        // The default covers everything and drops nothing.
+        assert_eq!(Coverage::default(), Coverage::All);
+        assert!(Coverage::All.keeps("git"));
+        assert!(Coverage::All.only().is_none());
 
-        // `-p` restricts to exactly the attrs named: no prefix, no subtree, no
-        // interpretation of the `.`s in an attr path.
-        let p = f(&["git", "python3Packages.requests"], &[]);
-        assert!(p.is_set());
-        assert!(p.selects("git"));
-        assert!(p.selects("python3Packages.requests"));
-        assert!(!p.selects("gitMinimal"));
-        assert!(!p.selects("python3Packages.urllib3"));
-        // Naming a package set does not sweep it up — that would need attr-path
-        // structure the filter deliberately doesn't read.
-        assert!(!f(&["python3Packages"], &[]).selects("python3Packages.requests"));
-        // A `tests` row is likewise not selected by naming its package: it never
-        // reaches the filter, because the expansion that would create it runs
-        // only for attrs already selected (see `run_phases`).
-        assert!(!p.selects("git.tests.withInstallCheck"));
-
-        // `-P` drops exactly the attr named, and wins over an `-p`.
-        assert!(!f(&[], &["git"]).selects("git"));
-        assert!(f(&[], &["git"]).selects("gitMinimal"));
-        assert!(!f(&["git"], &["git"]).selects("git"));
-
-        // The stored attr keeps nix-eval-jobs' quoting, so a dotted *name* is
+        // `-P` drops exactly the attrs named: no prefix, no subtree, no reading
+        // of the `.`s in an attr path.
+        let skip = Coverage::Except(vec!["git".into(), "python313Packages.requests".into()]);
+        assert!(!skip.keeps("git"));
+        assert!(!skip.keeps("python313Packages.requests"));
+        assert!(skip.keeps("gitMinimal"));
+        assert!(skip.keeps("python313Packages.urllib3"));
+        // Naming a package set doesn't sweep it up — that would need attr-path
+        // structure the matcher deliberately doesn't read.
+        assert!(
+            Coverage::Except(vec!["python313Packages".into()]).keeps("python313Packages.requests")
+        );
+        // A `tests` row is dropped with its package, not by naming it: the row
+        // doesn't exist when the filter runs (see `run_phases`).
+        assert!(skip.keeps("git.tests.withInstallCheck"));
+        // The eval file keeps nix-eval-jobs' quoting, so a dotted *name* is
         // matched as it is stored — quotes and all.
-        let quoted = f(&["rubyPackages.\"http_parser.rb\""], &[]);
-        assert!(quoted.selects("rubyPackages.\"http_parser.rb\""));
-        assert!(!quoted.selects("rubyPackages.http_parser"));
+        let quoted = Coverage::Except(vec!["rubyPackages.\"http_parser.rb\"".into()]);
+        assert!(!quoted.keeps("rubyPackages.\"http_parser.rb\""));
+        assert!(quoted.keeps("rubyPackages.http_parser"));
+
+        // A selection names attrs to review; it filters no delta, since there
+        // isn't one.
+        let only = Coverage::Only(vec!["git".into()]);
+        assert_eq!(only.only(), Some(&["git".to_string()][..]));
+        assert!(only.keeps("anything"));
+    }
+
+    #[test]
+    fn resolved_distinguishes_absent_from_threw() {
+        // The trichotomy the report needs: a drv, ⏩ threw, ➖ absent.
+        let absent = Resolved::absent();
+        assert_eq!(absent.drv_path, None);
+        assert!(!absent.threw);
+        let threw = Resolved {
+            drv_path: None,
+            threw: true,
+        };
+        assert_ne!(absent, threw);
     }
 }
