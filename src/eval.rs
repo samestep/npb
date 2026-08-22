@@ -78,7 +78,7 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     }
 }
 
-/// Map a `--tests` job to a [`TestJob`]. Label from `attrPath` (unquoted
+/// Map a `tests` job to a [`TestJob`]. Label from `attrPath` (unquoted
 /// elements) rather than `attr` (which nix-eval-jobs quotes for the dotted
 /// package component, e.g. `"python3Packages.requests".tests.foo`): element 0
 /// is the package we asked for, and the whole path joined is the clean
@@ -164,7 +164,7 @@ fn stream_jobs<T>(
     // undrained pipe) also can't deadlock while we stream stdout.
 
     // nix-eval-jobs takes the expression inline (`--expr E`) or as a file-path
-    // positional. The `--tests` expression lists every changed package, so on a
+    // positional. The `tests` expression lists every changed package, so on a
     // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn);
     // writing it to a temp file and passing the path works for any size (and the
     // small shard/full-set exprs don't care). The evaluated expression is
@@ -255,7 +255,7 @@ fn stream_jobs<T>(
 
 // --- targeted test eval (passthru.tests of the changed set) ------------------
 //
-// The `--tests` feature (ported from nixpkgs-review#397): for the packages in a
+// The `tests` feature (ported from nixpkgs-review#397): for the packages in a
 // change's *changed set*, also build their `passthru.tests`. This is a small,
 // targeted eval over the (few) changed attrs, distinct from the full-set eval —
 // and it *is* cached, per package, in SQLite (see `store::Store` and `main`): a
@@ -484,8 +484,8 @@ const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 /// [`TESTS_SLOT_MEM_MB`].
 const SLOT_MEM_MB: u64 = 2048;
 
-/// Per-slot RAM budget for the two targeted evals — `--tests` and
-/// [`instantiate_execute`], which instantiates what `--tests` did not — distinct
+/// Per-slot RAM budget for the two targeted evals — `tests` and
+/// [`instantiate_execute`], which instantiates what `tests` did not — distinct
 /// from [`SLOT_MEM_MB`] because their workers are far heavier: each `nixosTest`
 /// pulls in a whole NixOS system, so a worker genuinely reaches the
 /// [`DEFAULT_WORKER_MEM_MB`] restart cap instead of sitting well under it like a
@@ -813,7 +813,7 @@ pub fn instantiate_execute(
     absent: &(dyn Fn(&[String]) -> Result<HashSet<String>> + Sync),
 ) -> Result<()> {
     let Instantiate { requests, nodes } = inst;
-    // Budgeted at the heavy-worker figure like `--tests`, not the light full-set
+    // Budgeted at the heavy-worker figure like `tests`, not the light full-set
     // one: a residual pass (a package whose tests another review cached at this
     // tree, its `.drv` since collected) still evaluates `nixosTest`s. In practice
     // the atom count — one shard per side, so ≤2 per system — binds first.
@@ -896,11 +896,11 @@ pub fn instantiate_execute(
     )
 }
 
-// --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
+// --- the shard scheduler (shared by the full-set eval and the tests eval) ---
 
 /// One group of shards run together: one leaf node in the progress tree, one
 /// assembled result. Its items (top-level names for the full eval, changed
-/// packages for `--tests`) are sliced into shards, which own them from then on;
+/// packages for `tests`) are sliced into shards, which own them from then on;
 /// the shard counters drive the AIMD scheduler, while progress is reflected onto
 /// `node` for the display.
 struct ShardGroup<T> {
@@ -976,7 +976,7 @@ type Remaining<'a> = dyn Fn(usize, &[String]) -> Result<Vec<String>> + Sync + 'a
 /// `items.len()` — true when one streamed row == one item (evaluate,
 /// instantiate), false for enumerate (which discovers its count) and tests
 /// (whose count is streamed jobs, not packages). Persistence is the caller's job
-/// via the closures (the full eval assembles a flat file, `--tests` returns
+/// via the closures (the full eval assembles a flat file, `tests` returns
 /// rows; DESIGN §4); this owns only the scheduling and the node updates. The
 /// outer `with_live` in `run` owns the refresher that redraws the tree.
 ///
@@ -993,7 +993,7 @@ type Remaining<'a> = dyn Fn(usize, &[String]) -> Result<Vec<String>> + Sync + 'a
 /// rather than a re-roll of the same dice:
 ///
 /// 0. **Re-derive what is still outstanding** through `remaining`, the phase's
-///    durable-record hook. `None` (`evaluate`, `--tests`) means nothing a partial
+///    durable-record hook. `None` (`evaluate`, `tests`) means nothing a partial
 ///    pass leaves behind is salvageable, so every item is still owed.
 ///    `instantiate` re-queries store validity, where an aborted pass's `.drv`
 ///    writes survive: an empty answer completes the shard outright, and a smaller
@@ -1554,7 +1554,7 @@ mod tests {
         assert_eq!(eval_slots(18, 16 * G, SLOT_MEM_MB), 8); //  darwin
         assert_eq!(eval_slots(18, 256 * G, SLOT_MEM_MB), 18); // core-bound
         assert_eq!(eval_slots(4, 2 * G, SLOT_MEM_MB), 1); //    never zero
-        // The heavy `--tests` budget (4 GiB/slot) trims the same boxes further.
+        // The heavy `tests` budget (4 GiB/slot) trims the same boxes further.
         assert_eq!(eval_slots(18, 31 * G, TESTS_SLOT_MEM_MB), 7);
     }
 

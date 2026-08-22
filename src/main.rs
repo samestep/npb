@@ -869,11 +869,11 @@ fn repro_command(
     }
 }
 
-/// The changed set per system: `(system, changed attrs)`, with `--tests` rows
+/// The changed set per system: `(system, changed attrs)`, with `tests` rows
 /// folded in. Threaded from [`run_phases`] into the build and the report.
 type PerSystemChanged = Vec<(String, Vec<evalfile::ChangedAttr>)>;
 
-/// The changed-package names for the `--tests` eval, per side: only packages
+/// The changed-package names for the `tests` eval, per side: only packages
 /// that evaluated to a drv on that side. A package that threw under the profile
 /// has no drv, so there's nothing to test for it there. Sorted + deduped.
 fn changed_names(changed: &[evalfile::ChangedAttr]) -> (Vec<String>, Vec<String>) {
@@ -901,7 +901,7 @@ struct TestsAccum {
     store: store::Store,
     /// Systems whose eval is complete and diff computed (processed once).
     processed: HashSet<String>,
-    /// Each system's changed set (pre-`--tests`), assembled in system order later.
+    /// Each system's changed set (pre-`tests`), assembled in system order later.
     changed: HashMap<String, Vec<evalfile::ChangedAttr>>,
     /// The `tests` phase node, created lazily on the first system with misses.
     tests_phase: Option<Arc<live::Node>>,
@@ -984,7 +984,7 @@ fn reveal_system_tests(
 
 /// The pre-build phases — everything that runs behind the one live progress tree
 /// (DESIGN §6, §9): evaluate both sides, diff to the changed set, expand
-/// `--tests`, instantiate the `.drv`s the build will touch, and probe the cache.
+/// `tests`, instantiate the `.drv`s the build will touch, and probe the cache.
 /// The nom build and the report come after, outside the tree. Returns the
 /// per-system changed set (with test rows folded in) and the build targets.
 #[allow(clippy::too_many_arguments)]
@@ -1013,7 +1013,7 @@ fn run_phases(
         fatal: None,
     });
     // Process a system once BOTH its eval files exist (cached up front, or cold
-    // once evaluated): compute its diff, and — with `--tests` — reveal its test
+    // once evaluated): compute its diff, and — when tests are on — reveal its test
     // leaves. Called per eval completion (worker threads), for cached systems once
     // the eval nodes exist (main thread, from `eval_pairs`), and a final sweep
     // (main thread). Idempotent via `processed`; the coarse mutex serializes the
@@ -1068,7 +1068,7 @@ fn run_phases(
     let nodes = std::mem::take(&mut acc.nodes);
     drop(acc);
 
-    // --tests: run the already-revealed test-listing leaves as one grouped
+    // tests: run the already-revealed test-listing leaves as one grouped
     // scheduler pass, cache the results, then fold each system's test rows into
     // its changed set — classified (regression / fixed / new / …) like any attr.
     if tests {

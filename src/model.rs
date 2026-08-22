@@ -15,7 +15,7 @@
 /// content — not of the commit that carries it. A commit adds parents, an
 /// author, a message, and timestamps, none of which the evaluation can observe:
 /// `fetchGit`'s checkout has no `.git`, and npb forwards only the resulting
-/// *path* into `import`. So the eval (and `--tests`) cache keys on [`tree`]: two
+/// *path* into `import`. So the eval (and `tests`) cache keys on [`tree`]: two
 /// commits with the same tree share one eval — a rebase that doesn't touch the
 /// changed files, a message-only `--amend`, a cherry-pick landing identical
 /// content, and, crucially, committing an as-is working tree (so an
@@ -93,7 +93,7 @@ impl Profile {
     /// The storage key for an eval on `system` under this profile:
     /// `<token>/<system>` (DESIGN §4). It is both the on-disk eval-file directory
     /// (`evalfile::eval_path`) and the `eval_key.system` column value, so the
-    /// `--tests` cache keys on the profile for free — no schema change. The
+    /// `tests` cache keys on the profile for free — no schema change. The
     /// embedded `/` makes it two path segments when joined onto the cache root.
     pub fn qualify(&self, system: &str) -> String {
         format!("{}/{}", self.token(), system)
@@ -118,7 +118,8 @@ pub struct AttrEval {
     pub drv_path: Option<String>,
 }
 
-/// One resolved `passthru.tests` entry from a targeted test eval (`--tests`).
+/// One resolved `passthru.tests` entry from a targeted test eval (the `tests`
+/// phase).
 ///
 /// Pure fact like [`AttrEval`], but decomposed for the per-package test cache:
 /// `pkg_attr` is the package the test hangs off (the attr-path's first element),

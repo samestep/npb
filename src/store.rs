@@ -1,5 +1,5 @@
 //! The SQLite fact store, in `~/.cache/nix-npb/npb.sqlite` (DESIGN.md §3–§4): the
-//! append-only observation log and the `--tests` eval cache. Full-set evals do
+//! append-only observation log and the `tests` eval cache. Full-set evals do
 //! *not* live here — they're standalone files (see `eval.rs`) — so what remains
 //! is only the small, index-worthy data an engine actually earns.
 
@@ -99,7 +99,7 @@ impl Store {
     /// Append one observation to the log (never overwrites; DESIGN.md §3).
     pub fn add_observation(&mut self, o: &Observation) -> Result<()> {
         // Drv path and blocker outputs are stored with their `/nix/store/…`
-        // affixes stripped (like the eval files and the `--tests` cache),
+        // affixes stripped (like the eval files and the `tests` cache),
         // restored on read. Store paths never contain a newline, so the blocker's
         // newline join round-trips losslessly; an empty blocker is NULL (a
         // success carries none).
@@ -227,7 +227,7 @@ impl Store {
         Ok(out)
     }
 
-    // --- the `--tests` passthru.tests cache (DESIGN.md §4, §6) ---------------
+    // --- the `tests` phase's `passthru.tests` cache (DESIGN.md §4, §6) -----
 
     /// The interned id for `(tree, system)`, or `None` if it has never been
     /// recorded. One indexed point-lookup on the `eval_key` UNIQUE index; a

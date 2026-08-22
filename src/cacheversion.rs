@@ -75,7 +75,7 @@ pub fn ensure_current() -> Result<()> {
     let from = found.map(|v| v.to_string()).unwrap_or_else(|| "0".into());
     eprintln!(
         "npb's eval-cache format has changed (version {from} -> {CURRENT}). The cached\n\
-         evaluations and --tests cache must be regenerated; your build history (the\n\
+         evaluations and test cache must be regenerated; your build history (the\n\
          observation log) is kept."
     );
     if !confirm(

@@ -7,7 +7,7 @@
 //! The last-*used* time is the file's mtime, which `eval::eval_pairs` re-stamps
 //! on every cache hit (`evalfile::touch_eval`) so a reused base eval stays warm.
 //!
-//! Evicting an eval file also purges that `(tree, system)`'s `--tests` rows
+//! Evicting an eval file also purges that `(tree, system)`'s `tests` rows
 //! (`store::Store::purge_tests`): the tests cache is keyed on the same tree, so
 //! the two travel together and the DB stays proportional to the eval corpus.
 //! The append-only observation log is left untouched — it's keyed on drvpath (no
@@ -243,7 +243,7 @@ fn gather(root: &std::path::Path) -> Result<Vec<Eval>> {
     Ok(out)
 }
 
-/// Evict eval files per `spec`, purge each evicted `(tree, system)`'s `--tests`
+/// Evict eval files per `spec`, purge each evicted `(tree, system)`'s `tests`
 /// rows, and vacuum the DB once. This is the whole `--clean` action — it reviews
 /// nothing. It first prints exactly what it *would* remove and asks for
 /// confirmation on stdin, deleting only on a yes. Nothing is touched until confirmed.
@@ -267,7 +267,7 @@ pub fn clean(spec: &CleanSpec) -> Result<()> {
     let freed: u64 = victims.iter().map(|&i| files[i].size).sum();
     println!(
         "Would evict {} of {} eval file(s), freeing {} ({} would remain), \
-         plus their --tests cache rows.",
+         plus their test cache rows.",
         victims.len(),
         files.len(),
         human_bytes(freed),

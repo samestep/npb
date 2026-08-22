@@ -174,7 +174,7 @@ eval, so a file beats SQLite on every axis that matters here:
   file's mtime, which a cache **hit** re-stamps (`evalfile::touch_eval`, called
   from `eval::eval_pairs`) — a read alone wouldn't, so a shared base eval reused
   across many reviews would otherwise look as old as its first write. Evicting an
-  eval also purges that key's `--tests` rows (below, §6), keyed on the same
+  eval also purges that key's `tests` rows (below, §6), keyed on the same
   profile-qualified `(tree, system)`, so they stay in lockstep. (The "millions of
   tiny files" failure mode is about a file _per attr_; one file per _eval_ is
   ~two files per review.)
@@ -187,12 +187,12 @@ the same eval can't collide.
 **Observations → SQLite** (`npb.sqlite`), where the append-only log actually
 wants an engine: indexed lookup by `drvpath`, transactional appends, no torn
 writes. The log itself stays tiny (KBs — a few hundred rows); the database
-file's bulk is the `--tests` cache below, which scales with the number of
+file's bulk is the `tests` cache below, which scales with the number of
 distinct trees reviewed (like the eval files, but ~two orders of magnitude
 smaller per review). Build logs are stored nowhere: Nix keeps them under
 `/nix/var/log/nix/drvs` (`nix log <drv>`, success or failure).
 
-**The `--tests` cache → SQLite too** (`test_pkg` / `test_drv` tables, §6). Same
+**The `tests` cache → SQLite too** (`test_pkg` / `test_drv` tables, §6). Same
 reasoning inverted from evals: it's a _keyed, incremental, partial_ fact (look up
 a package, append new ones), not a bulk write-once map to diff — so it wants the
 engine, not a file. Two space measures keep it lean, since it dominates the
@@ -216,7 +216,7 @@ table, so its per-row bytes are what compound over time (~15% off it, measured).
 ```
 ~/.cache/nix-npb/
   format-version                # eval-cache format version (§1); a bump wipes the eval cache, keeps the log
-  npb.sqlite                    # observation log (tiny) + --tests cache (the bulk) + patch-tree cache (§8)
+  npb.sqlite                    # observation log (tiny) + test cache (the bulk) + patch-tree cache (§8)
   <token>/<sys>/<tree>.tsv.zst  # attr→drv maps (zstd), one file per (profile, system, eval) — evicted by --clean
 ```
 
@@ -414,7 +414,7 @@ Keying on `tree` (`git rev-parse <commit>^{tree}`) collapses them into one cache
 entry: a rebase that leaves the changed files alone, a message-only `--amend`, a
 cherry-pick landing identical content, and — the payoff — committing an as-is
 working tree all become cache _hits_. npb resolves each requested revision to a
-`Rev { tree, commit, label }` (`src/model.rs`): `tree` is the eval/`--tests`
+`Rev { tree, commit, label }` (`src/model.rs`): `tree` is the eval/`tests`
 cache key, `commit` is what `fetchGit` fetches (a commit is still needed — there
 is no fetch-a-bare-tree), and `label` identifies the side (a sha, or `worktree`
 for a synthetic working-tree/patch head — the report heading shows the latter as
@@ -519,10 +519,10 @@ slots).
 > to one slot, and rebalancing is what a shared queue does natively.
 
 **One scheduler, three work shapes.** Four fan-outs go through `run_shards` —
-`enumerate`, the full-set `evaluate`, `--tests`, and `instantiate` — and sharing
+`enumerate`, the full-set `evaluate`, `tests`, and `instantiate` — and sharing
 it is deliberate: one concurrency implementation, exercised and kept correct by
 every memory-heavy `nix-eval-jobs` fan-out rather than re-implemented per phase
-(below, under `--tests`). But they do not share a **work shape**, and
+(below, under `tests`). But they do not share a **work shape**, and
 the shared scheduler's feedback loop was designed around exactly one of them.
 The distinction that matters: AIMD over the slot count has authority only when
 the _failure atom_ and the _memory-bearing unit_ are the same object.
@@ -530,9 +530,9 @@ the _failure atom_ and the _memory-bearing unit_ are the same object.
 - In `evaluate` they are. The atom is a shard, peak memory scales as shard-size ×
   slots, npb chooses **both** factors, there are hundreds of atoms so the slot
   count has a wide dynamic range, and losing one atom re-pays seconds.
-- In `--tests` and `instantiate` they come apart. The atom is a whole
+- In `tests` and `instantiate` they come apart. The atom is a whole
   `(tree, system)` key — never sub-sliced, because the per-key nixpkgs import
-  dominates and, for `--tests`, sub-slicing multiplied the concurrent heavy
+  dominates and, for `tests`, sub-slicing multiplied the concurrent heavy
   workers (below) — while the memory-bearing unit is **one job**: a `nixosTest`
   is a whole NixOS system. So npb controls only the slot count, and with ~2 keys
   per system that count is usually pinned by the **atom count**, not by the RAM
@@ -541,7 +541,7 @@ the _failure atom_ and the _memory-bearing unit_ are the same object.
   out after ~2 steps and there is nothing left to give.
 
 So `evaluate` is a _throughput_ problem — pack many cheap uniform atoms into RAM
-— while `--tests` and `instantiate` are _peak-footprint_ problems, where a single
+— while `tests` and `instantiate` are _peak-footprint_ problems, where a single
 job may not fit and no amount of concurrency control changes that. A slot's
 ceiling is `nixpkgs spine + garbage accumulated since the last worker recycle +
 the current job's own demand`. Note what `--max-memory-size` is in that formula:
@@ -585,7 +585,7 @@ salvageable differs per phase, because what a partial pass _leaves behind_ does:
 | phase         | durable product of a partial pass                           | a retry therefore                                                                 |
 | ------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | `instantiate` | the `.drv` files, in the store                             | re-queries validity and runs only what is still absent (the ladder above when that set stops shrinking) |
-| `--tests`     | `test_drv`/`test_pkg` rows — poisonable (below)             | discards the key and re-runs it, with the split bounding the loss                 |
+| `tests`     | `test_drv`/`test_pkg` rows — poisonable (below)             | discards the key and re-runs it, with the split bounding the loss                 |
 | `evaluate`    | none — rows live in memory until the file is written whole  | discards the shard and requeues it (as today)                                     |
 
 `instantiate` is the phase that can salvage, and it needs no new bookkeeping to
@@ -601,7 +601,7 @@ at all, re-running it unchanged is pointless — which is exactly when the ladde
 above takes over, down to the single item it can name. Progress, not a counter, is
 the stopping rule.
 
-`--tests` deliberately does _not_ salvage, though it looks like it could. Its
+`tests` deliberately does _not_ salvage, though it looks like it could. Its
 rows are individually true, but `test_pkg` marks a package **fully** evaluated,
 so inserting that marker for a package whose test list was only half streamed
 would cache a permanently truncated test set at that `(tree, system, pkg)` — the
@@ -615,7 +615,7 @@ cached partial would poison every future diff with phantom "removed" packages.
 
 Two display consequences fall out. A count that outruns its total is _the_
 symptom of a retry redoing finished work (`instantiate` shows `count / total`, so
-`72 / 36` is visible; `--tests` streams a bare count and could hide the same
+`72 / 36` is visible; `tests` streams a bare count and could hide the same
 thing), and with the work list re-derived each item is streamed once. And the
 note printed above the tree names its phase and reports what actually died,
 rather than asserting an OOM on every non-zero exit — `nix-eval-jobs` also exits
@@ -676,7 +676,7 @@ drv's output paths) and the local build (`nix build <drv>^*`, §5) — get it fr
 a just-in-time `eval::instantiate` step: one `nix-eval-jobs` run per
 `(commit, system)`, instantiation on, over exactly the changed attr paths
 (nested paths included, via `lib.attrByPath`), run right before building —
-_minus_ the changed set's `passthru.tests` rows, whose recipes the `--tests` eval
+_minus_ the changed set's `passthru.tests` rows, whose recipes the `tests` eval
 already wrote while it was evaluating them (below). Those are the heaviest
 evaluations in the whole run, and evaluating a `nixosTest` **twice** — once to
 learn its `drvPath`, again to write the `.drv` that path already names — was the
@@ -737,7 +737,7 @@ content-addressing again); a partial one leaves a strictly smaller set; a set th
 does not shrink means retrying is pointless and the ladder's last rung fires,
 naming the attr that would not evaluate. Since the phase's streamed rows are
 discarded anyway, there is no partial _result_ to distrust here — which is why
-`--tests` and `evaluate`, whose rows are the product, must still discard and
+`tests` and `evaluate`, whose rows are the product, must still discard and
 re-run whole. Slots are counted at the heavy-worker budget, since a residual pass
 (a package whose tests were cached at that tree by an earlier review, its `.drv`
 since collected) still faces `nixosTest` attrs; in practice the atom count (≤2
@@ -896,7 +896,7 @@ key at a time. But — like the instantiate phase and _unlike_ the full-set eval
 never sub-sliced.** Both phases share the full eval's _machinery_ but not its
 work shape: their dominant cost is the per-key nixpkgs-spine re-import over a
 changed set of a handful of packages, so slicing a key's packages across shards
-would only re-pay that import per shard for no gain. For `--tests` there is a
+would only re-pay that import per shard for no gain. For `tests` there is a
 second, sharper reason: a `nixosTest` worker ≈ a whole NixOS system, so it is the
 _heaviest_ fan-out npb runs, and sub-slicing multiplied the concurrent heavy
 workers — the earlier `total/(2·slots)` split started `2·slots` of them and
@@ -934,7 +934,7 @@ blue → yellow → green label color already says — so a `tests` leaf shows j
 bare streamed test-job count (a package yields one or more tests, so no total is
 known ahead of time). Sharing the scheduler means its
 concurrency logic is exercised — and kept correct — by **every** memory-heavy
-`nix-eval-jobs` fan-out (enumeration, the full-set eval, `--tests`, and
+`nix-eval-jobs` fan-out (enumeration, the full-set eval, `tests`, and
 instantiation, §6) rather than each re-implementing it. And every live readout in
 npb shares **one persistent progress tree** (`live::Tree`/`live::with_live` in
 `src/live.rs`) spanning the whole pre-build run — a refresher thread redraws it at
@@ -958,7 +958,7 @@ is plain scrollback and not windowed. When the tree finishes it freezes
 into scrollback, a dim separator fences it from what follows (nom's build display,
 then the report — the same separator between each), and the build proceeds
 (§5, nom's own display, not this tree). Persistence stays path-specific (§4): the full eval assembles a flat
-file, `--tests` returns rows for the per-package SQLite cache. A fully-cached
+file, `tests` returns rows for the per-package SQLite cache. A fully-cached
 re-run touches no `nix-eval-jobs` at all. Caching matters here because evaluating a test's drv
 means evaluating its whole derivation graph, and a `nixosTest` in `passthru.tests`
 pulls in an entire NixOS system — seconds and hundreds of MB _per test_ — so a
@@ -1189,7 +1189,7 @@ Open refinements: remote-builder fan-out; a `Local`-vs-`Cache` fidelity probe
 
 **Considered direction — a per-system pipeline over the whole pre-build graph.**
 Today the phases up to the build run as global barriers: _all_ pairs enumerate →
-_all_ eval → _all_ diffs → _all_ `--tests` → _all_ instantiate → probe → build. But
+_all_ eval → _all_ diffs → _all_ `tests` → _all_ instantiate → probe → build. But
 the real dependency graph is a fixed pipeline replicated per system and side —
 `enumerate(c,s) → eval(c,s)`, then `diff(s) → tests(s) → instantiate(s) →
 probe(s)` — with systems independent until the report. So a straggler (one slow

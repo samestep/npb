@@ -99,7 +99,7 @@ fn read_eval(path: &Path) -> Result<String> {
 /// The on-disk form of a drv path: strip the constant `/nix/store/` prefix and
 /// `.drv` suffix; [`restore_drv`] re-adds them. Every drv `nix-eval-jobs` emits
 /// has this exact shape (a threw attr carries no drv and is written as a bare
-/// `attr`, so this is only ever called on a real path). Shared with the `--tests`
+/// `attr`, so this is only ever called on a real path). Shared with the `tests`
 /// SQLite cache (`store.rs`), which stores its drvs stripped for the same reason.
 pub(crate) fn strip_drv(drv: &str) -> &str {
     let stripped = drv
@@ -431,7 +431,7 @@ fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
         .expect("slice cursors are infallible")
 }
 
-/// Diff two `test_attr → drv` maps (the `--tests` cache's shape, full drv paths)
+/// Diff two `test_attr → drv` maps (the `tests` cache's shape, full drv paths)
 /// with exactly [`diff`]'s semantics, so test rows classify (regression / fixed
 /// / new …) like any full-set attr. Only tests that resolved to a drv are cached,
 /// so every row here has a drv; a test unavailable under the profile was dropped

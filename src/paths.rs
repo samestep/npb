@@ -13,7 +13,7 @@ pub fn cache_root() -> Result<PathBuf> {
         .join("nix-npb"))
 }
 
-/// The SQLite fact store: the observation log and the `--tests` cache.
+/// The SQLite fact store: the observation log and the `tests` cache.
 pub fn db_path() -> Result<PathBuf> {
     Ok(cache_root()?.join("npb.sqlite"))
 }
