@@ -792,6 +792,18 @@ change to a package's `passthru.tests` that leaves the package itself untouched 
 invisible either way, since tests are only ever enumerated from a changed
 package.
 
+One wrinkle *is* a selection's own. `-p` can name a `tests` attr directly, which
+puts a test derivation in the changed set, and the phase then enumerates *that*
+derivation's `passthru.tests` — which, for the `overrideAttrs`-with-`doCheck`
+idiom, resolve straight back to itself (`x.tests.pytest.tests.pytest`). A
+whole-set walk can never produce such a row, since it doesn't descend into
+`passthru.tests`. npb drops it (`main::drop_self_tests`): a test whose derivation
+*is* its package's, on both sides, is that package under a second name — no new
+fact, facts being keyed on drvpath (§2) — and the report would only print the
+pair as an alias. The redundant enumeration still happens; recognising the named
+attr as a test up front would mean reading structure out of an attr path, which
+npb doesn't do.
+
 **Dropping an attr removes a target, not a dependency.** A `-P`'d package that a
 surviving target needs is still built by nix inside that target's closure —
 matching nixpkgs-review — and the observation it produces is keyed on its

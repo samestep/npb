@@ -920,6 +920,48 @@ fn changed_names(changed: &[evalfile::ChangedAttr]) -> (Vec<String>, Vec<String>
     )
 }
 
+/// Flatten both sides' `test_attr → (pkg_attr, drv)` maps to `test_attr → drv`,
+/// dropping any test whose derivation *is* the derivation of the package it
+/// hangs off — on both sides (DESIGN §6).
+///
+/// Such a test is that package under a second name: no new fact, since npb keys
+/// on drvpath (§2) and the package's own row already carries it, and the report
+/// would only print the pair as an alias (`pkg = pkg.tests.x`). It became
+/// reachable with `-p`: naming a `tests` attr directly puts a test derivation in
+/// the changed set, and the `tests` phase then enumerates *its* `passthru.tests`,
+/// which for the `overrideAttrs`-with-`doCheck` idiom resolve straight back to
+/// itself (`x.tests.pytest.tests.pytest`). A whole-set walk can't produce that,
+/// since it never descends into `passthru.tests`.
+///
+/// Both sides must match, so a test that shares one side's derivation with its
+/// package but not the other's is a real difference and stays — as does a test
+/// present on only one side.
+fn drop_self_tests(
+    bmap: &HashMap<String, (String, String)>,
+    hmap: &HashMap<String, (String, String)>,
+    changed: &[evalfile::ChangedAttr],
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let parents: HashMap<&str, &evalfile::ChangedAttr> =
+        changed.iter().map(|c| (c.attr.as_str(), c)).collect();
+    let is_alias = |test: &str| -> bool {
+        let Some((pkg, _)) = bmap.get(test).or_else(|| hmap.get(test)) else {
+            return false;
+        };
+        let Some(parent) = parents.get(pkg.as_str()) else {
+            return false;
+        };
+        let drv = |m: &HashMap<String, (String, String)>| m.get(test).map(|(_, d)| d.clone());
+        drv(bmap) == parent.base_drv && drv(hmap) == parent.head_drv
+    };
+    let flat = |m: &HashMap<String, (String, String)>| -> HashMap<String, String> {
+        m.iter()
+            .filter(|(test, _)| !is_alias(test))
+            .map(|(test, (_, drv))| (test.clone(), drv.clone()))
+            .collect()
+    };
+    (flat(bmap), flat(hmap))
+}
+
 /// Per-system state accumulated as each platform's eval lands (DESIGN §9). Its
 /// `Store` lives here rather than being shared by `&` because `rusqlite`'s
 /// connection is `!Sync` and this is touched from eval worker threads (behind the
@@ -1252,6 +1294,7 @@ fn run_phases(
             let key = profile.qualify(sys);
             let bmap = acc.store.tests_drvs_for(&base.tree, &key, &base_names)?;
             let hmap = acc.store.tests_drvs_for(&head.tree, &key, &head_names)?;
+            let (bmap, hmap) = drop_self_tests(&bmap, &hmap, changed);
             changed.extend(evalfile::changed_tests(&bmap, &hmap));
         }
     }
@@ -2189,6 +2232,53 @@ mod tests {
             &["sys".into()],
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -P emscripten -s sys");
+    }
+
+    #[test]
+    fn drop_self_tests_removes_a_test_that_is_its_own_package() {
+        let m = |rows: &[(&str, &str, &str)]| {
+            rows.iter()
+                .map(|(t, p, d)| (t.to_string(), (p.to_string(), d.to_string())))
+                .collect::<HashMap<String, (String, String)>>()
+        };
+        // The `-p <a test attr>` case: the named row is a test derivation, and
+        // the `tests` phase enumerates its own `passthru.tests` right back to it.
+        let changed = vec![ca(
+            "p.tests.pytest",
+            Some("/d/b"),
+            Some("/d/h"),
+            false,
+            false,
+        )];
+        let bmap = m(&[
+            ("p.tests.pytest.tests.pytest", "p.tests.pytest", "/d/b"),
+            ("p.tests.pytest.tests.other", "p.tests.pytest", "/d/other-b"),
+        ]);
+        let hmap = m(&[
+            ("p.tests.pytest.tests.pytest", "p.tests.pytest", "/d/h"),
+            ("p.tests.pytest.tests.other", "p.tests.pytest", "/d/other-h"),
+        ]);
+        let (b, h) = drop_self_tests(&bmap, &hmap, &changed);
+        // The self-alias goes; a genuinely different test of the same attr stays.
+        let keys = |m: &HashMap<String, String>| m.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&b), ["p.tests.pytest.tests.other"]);
+        assert_eq!(keys(&h), ["p.tests.pytest.tests.other"]);
+
+        // Matching on only one side is a real difference, so it stays.
+        let one_sided = m(&[("p.tests.pytest.tests.pytest", "p.tests.pytest", "/d/b")]);
+        let (b, _) = drop_self_tests(&one_sided, &HashMap::new(), &changed);
+        assert!(b.contains_key("p.tests.pytest.tests.pytest"));
+
+        // An ordinary package's tests are untouched, even when another changed
+        // attr happens to share the derivation (that's an alias worth printing).
+        let changed = vec![
+            ca("pkg", Some("/d/p0"), Some("/d/p1"), false, false),
+            ca("other", Some("/d/t0"), Some("/d/t1"), false, false),
+        ];
+        let bmap = m(&[("pkg.tests.x", "pkg", "/d/t0")]);
+        let hmap = m(&[("pkg.tests.x", "pkg", "/d/t1")]);
+        let (b, h) = drop_self_tests(&bmap, &hmap, &changed);
+        assert!(b.contains_key("pkg.tests.x") && h.contains_key("pkg.tests.x"));
     }
 
     #[test]

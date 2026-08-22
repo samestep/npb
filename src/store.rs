@@ -329,15 +329,17 @@ impl Store {
         Ok(())
     }
 
-    /// All cached test drvs for `pkgs` at this key, as `test_attr → drv_path`
-    /// (only tests that resolved to a derivation), with drv paths restored to
-    /// their full `/nix/store/…​.drv` form. One query for the whole set.
+    /// All cached test drvs for `pkgs` at this key, as
+    /// `test_attr → (pkg_attr, drv_path)` (only tests that resolved to a
+    /// derivation), with drv paths restored to their full `/nix/store/…​.drv`
+    /// form. One query for the whole set. The package a test hangs off rides
+    /// along so the caller can spot a test that *is* its package (`run_phases`).
     pub fn tests_drvs_for(
         &self,
         tree: &str,
         system: &str,
         pkgs: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, (String, String)>> {
         let mut out = std::collections::HashMap::new();
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(out);
@@ -347,7 +349,7 @@ impl Store {
         for chunk in pkgs.chunks(IN_CHUNK) {
             let placeholders = placeholders(chunk.len());
             let sql = format!(
-                "SELECT test_attr, drv_path FROM test_drv \
+                "SELECT test_attr, pkg_attr, drv_path FROM test_drv \
                  WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -355,12 +357,16 @@ impl Store {
                 std::iter::once(key_id.to_string()).chain(chunk.iter().cloned()),
             );
             let rows = stmt.query_map(params, |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                let (test_attr, stored) = row?;
+                let (test_attr, pkg_attr, stored) = row?;
                 let drv = restore_drv(Some(&stored)).expect("Some maps to Some");
-                out.insert(test_attr, drv);
+                out.insert(test_attr, (pkg_attr, drv));
             }
         }
         Ok(out)
@@ -669,16 +675,17 @@ mod tests {
             .unwrap();
         assert!(done.contains("hello") && done.contains("ripgrep") && !done.contains("curl"));
 
-        // hello resolves to its two drv'd tests (the errored one is not stored).
+        // hello resolves to its two drv'd tests (the errored one is not stored),
+        // each paired with the package it hangs off.
         let hd = s.tests_drvs_for(c, sys, &pkgs(&["hello"])).unwrap();
         assert_eq!(hd.len(), 2);
         assert_eq!(
             hd.get("hello.tests.run"),
-            Some(&"/nix/store/a.drv".to_string())
+            Some(&("hello".to_string(), "/nix/store/a.drv".to_string()))
         );
         assert_eq!(
             hd.get("hello.tests.version"),
-            Some(&"/nix/store/b.drv".to_string())
+            Some(&("hello".to_string(), "/nix/store/b.drv".to_string()))
         );
         // ripgrep is cached-done but has no test drvs.
         assert!(
