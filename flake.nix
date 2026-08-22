@@ -17,16 +17,11 @@
       rust-overlay,
     }:
     let
-      # The commit npb is built on, baked in so `--version` and the report
-      # heading can link to the exact source tree on GitHub (like npc's
-      # `NPC_REV`). `self.rev` is absent for a dirty tree, so fall back to the
-      # branch. Set only on the crate's own build (not the shared
-      # `cargoArtifacts`), so bumping the commit never rebuilds the deps.
-      npbRev = self.rev or "main";
       # Everything needed to build npb from a given `pkgs`, derived so the
       # overlay and the per-system checks share one definition. The overlay
       # exposes only `npb`; the checks additionally reach for `craneLib` /
-      # `commonArgs` / `cargoArtifacts` and the dev shell for the pinned tools.
+      # `commonArgs` / `cargoArtifacts` / `binEnv`, and the dev shell for the
+      # last of those.
       npbFor =
         pkgs:
         let
@@ -48,14 +43,22 @@
           # instead of two Nix builds (`nixVersions.nix_2_35` and these
           # components) that only happen to agree.
           nix = nix-eval-jobs.nix;
-          # npb shells out to these at runtime; wrap them onto its PATH so the
-          # packaged binary works outside the dev shell (`nix shell .`).
-          runtimeDeps = [
-            nix
-            nix-eval-jobs
-            pkgs.nix-output-monitor # `nom`, the build front-end
-            pkgs.git
-          ];
+          # The tools npb shells out to at runtime, baked into the binary as
+          # absolute store paths at compile time (`env!("NIX_BIN")` &c. in
+          # `src/main.rs`) rather than wrapped onto its PATH — npc's scheme. npb
+          # then runs the exact tools it was packaged against whatever the
+          # caller's PATH holds (the 2.35 `nix` above, not the user's 2.34), the
+          # unwrapped binary works anywhere, and Nix keeps the closure alive off
+          # these very strings. Set only on the crate's own build (not the shared
+          # `cargoArtifacts`), so a tool bump never rebuilds the deps.
+          binEnv = {
+            GIT_BIN = "${pkgs.git}/bin/git";
+            NIX_BIN = "${nix}/bin/nix";
+            NIX_STORE_BIN = "${nix}/bin/nix-store";
+            NIX_INSTANTIATE_BIN = "${nix}/bin/nix-instantiate";
+            NIX_EVAL_JOBS_BIN = "${nix-eval-jobs}/bin/nix-eval-jobs";
+            NOM_BIN = "${pkgs.nix-output-monitor}/bin/nom"; # the build front-end
+          };
           # crane's default source filter keeps only Cargo/`.rs` files, which
           # would drop `src/schema.sql` (embedded via `include_str!`) and break
           # the build. Widen it to also keep `.sql` — crane's documented idiom
@@ -70,38 +73,28 @@
             };
             strictDeps = true;
             # ring (via ureq's TLS) needs perl at build; rusqlite bundles sqlite (cc).
-            # git: the `--pr` resolution tests shell out to it against a fixture repo.
-            nativeBuildInputs = [
-              pkgs.perl
-              pkgs.git
-            ];
+            # The `--pr` resolution tests shell out to git, but at `GIT_BIN` — no
+            # build input needed for a tool named by absolute path.
+            nativeBuildInputs = [ pkgs.perl ];
           };
           # Built once and shared by the package and every check.
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           npb = craneLib.buildPackage (
             commonArgs
+            // binEnv
             // {
               inherit cargoArtifacts;
-              NPB_REV = npbRev;
-              # makeBinaryWrapper, not makeWrapper: the bash wrapper costs ~4 ms
-              # of PATH munging per invocation, the compiled one ~0.1 ms.
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
-                pkgs.installShellFiles
-                pkgs.makeBinaryWrapper
-              ];
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.installShellFiles ];
               # Completions come from the binary itself (`--completions <shell>`),
-              # so they can never drift from the parser. Generated before the wrap
-              # — `--completions` shells out to nothing and touches no cache, so it
-              # runs fine unwrapped in the sandbox — and skipped when the build
-              # machine can't execute what we just built (a cross build).
-              postInstall = ''
-                ${pkgs.lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
-                  installShellCompletion --cmd npb \
-                    --bash <($out/bin/npb --completions bash) \
-                    --fish <($out/bin/npb --completions fish) \
-                    --zsh <($out/bin/npb --completions zsh)
-                ''}
-                wrapProgram $out/bin/npb --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
+              # so they can never drift from the parser. `--completions` shells out
+              # to nothing and touches no cache, so it runs fine in the sandbox —
+              # and it's skipped when the build machine can't execute what we just
+              # built (a cross build).
+              postInstall = pkgs.lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+                installShellCompletion --cmd npb \
+                  --bash <($out/bin/npb --completions bash) \
+                  --fish <($out/bin/npb --completions fish) \
+                  --zsh <($out/bin/npb --completions zsh)
               '';
             }
           );
@@ -111,8 +104,7 @@
             craneLib
             commonArgs
             cargoArtifacts
-            nix
-            nix-eval-jobs
+            binEnv
             npb
             ;
         };
@@ -136,7 +128,12 @@
           ];
         };
         build = npbFor pkgs;
-        inherit (build) craneLib commonArgs cargoArtifacts;
+        inherit (build)
+          craneLib
+          commonArgs
+          cargoArtifacts
+          binEnv
+          ;
       in
       {
         packages.default = pkgs.npb;
@@ -147,34 +144,35 @@
           npb = pkgs.npb;
           npb-test = craneLib.cargoTest (
             commonArgs
+            // binEnv
             // {
               inherit cargoArtifacts;
-              NPB_REV = npbRev;
             }
           );
           npb-clippy = craneLib.cargoClippy (
             commonArgs
+            // binEnv
             // {
               inherit cargoArtifacts;
-              NPB_REV = npbRev;
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             }
           );
           npb-fmt = craneLib.cargoFmt { inherit (commonArgs) src; };
         };
-        devShells.default = pkgs.mkShell {
-          # `env!("NPB_REV")` is resolved at compile time, so a bare `cargo
-          # build` in the dev shell needs it set too (nix builds set it above).
-          NPB_REV = npbRev;
-          buildInputs = [
-            pkgs.rust-bin.stable.latest.default
-            build.nix
-            build.nix-eval-jobs
-            pkgs.nix-output-monitor
-            pkgs.markdown-toc
-            pkgs.sqlite # for poking at the store during development
-          ];
-        };
+        devShells.default = pkgs.mkShell (
+          # `env!("NIX_BIN")` &c. are resolved at compile time, so a bare `cargo
+          # build` in the dev shell needs them set too (nix builds set them
+          # above). They're also why the dev shell puts none of those tools on
+          # PATH: a locally built npb reaches them by absolute path already.
+          binEnv
+          // {
+            buildInputs = [
+              pkgs.rust-bin.stable.latest.default
+              pkgs.markdown-toc
+              pkgs.sqlite # for poking at the store during development
+            ];
+          }
+        );
       }
     );
 }

@@ -20,7 +20,9 @@
 //! since-healed dependency un-blocks its dependents automatically, no `--retry`.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +69,28 @@ const ACT_BUILD: i64 = 105;
 /// one at a time and can't compute a width from the batch.
 const VERB_W: usize = 8;
 
+/// `PATH` for the `nom` child: the directory of `nix` ahead of the inherited PATH
+/// (see the call site). Left untouched when `nix` isn't an absolute path — a
+/// packaging may set [`crate::NIX`] to a bare name and provide it on PATH
+/// instead, and a bare name's "parent" is the empty path, which as a PATH entry
+/// would mean the cwd (the nixpkgs clone under review).
+fn nom_path(nix: &str) -> OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let Some(dir) = Path::new(nix).parent().filter(|d| d.is_absolute()) else {
+        return inherited;
+    };
+    if inherited.is_empty() {
+        // Not `<dir>:`, whose empty second entry would mean the cwd.
+        return dir.as_os_str().to_os_string();
+    }
+    // Split and rejoin: `join_paths` takes one *entry* per item and rejects any
+    // that contains the separator, so the inherited PATH goes in as its entries
+    // rather than as one string.
+    let entries = std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&inherited));
+    let joined = std::env::join_paths(entries);
+    joined.unwrap_or(inherited)
+}
+
 /// Build all of `drvs` (all outputs) in ONE nix invocation — nix schedules them
 /// together with its own parallelism — while acting as a middleman: nix emits
 /// `--log-format internal-json`, which we always parse for build (`type:105`)
@@ -94,7 +118,7 @@ const VERB_W: usize = 8;
 /// (DESIGN.md §5).
 fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
-    let mut nix = Command::new("nix");
+    let mut nix = Command::new(crate::NIX);
     nix.arg("build").args([
         // Installables come over stdin (`--stdin`, one per line, written below),
         // not argv: a mass-rebuild changed set is tens of thousands of `<drv>^*`
@@ -139,8 +163,14 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
     // keeps ^C-safety) and render a plain append-only log ourselves.
     let mut nom = if live::colors_enabled() {
         Some(
-            Command::new("nom")
+            Command::new(crate::NOM)
                 .arg("--json")
+                // nom runs `nix eval … builtins.currentSystem` to label the build
+                // platform and finds it on PATH — the one thing npb's tools need
+                // from the environment rather than an absolute path. Prefix ours,
+                // so the packaged binary doesn't make nom print `Command 'nix'
+                // not available from $PATH` on a machine without nix on PATH.
+                .env("PATH", nom_path(crate::NIX))
                 .stdin(Stdio::piped())
                 .spawn()
                 .context("spawning nom --json (nix-output-monitor)")?,
@@ -259,7 +289,7 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
                 loop {
                     let i = cursor.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = chunks.get(i) else { break };
-                    match Command::new("nix-store")
+                    match Command::new(crate::NIX_STORE)
                         .args(["--check-validity", "--print-invalid"])
                         .args(*chunk)
                         .output()
@@ -296,7 +326,7 @@ fn drv_closure(drvs: &[&str]) -> Result<HashSet<String>> {
     // union of each drv's requisites, so unioning the per-chunk output is exact.
     let mut reqs = HashSet::new();
     for chunk in drvs.chunks(NIX_STORE_ARG_CHUNK) {
-        let out = Command::new("nix-store")
+        let out = Command::new(crate::NIX_STORE)
             .args(["--query", "--requisites"])
             .args(chunk)
             .output()
@@ -985,6 +1015,37 @@ mod tests {
     use std::fs;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    /// The `nom` child must find npb's own `nix` first, whatever the caller's
+    /// PATH holds — that's the whole point of the prefix.
+    #[test]
+    fn nom_path_leads_with_our_nix_dir() {
+        let path = nom_path(crate::NIX);
+        let mut entries = std::env::split_paths(&path);
+        assert_eq!(
+            entries.next().expect("a first entry"),
+            Path::new(crate::NIX).parent().unwrap()
+        );
+        // …and the caller's own PATH stays behind it, entry for entry: the
+        // inherited PATH is one string of many entries, so a naive `join_paths`
+        // of `[dir, PATH]` errors out and silently drops the prefix.
+        let inherited = std::env::var_os("PATH").expect("cargo runs tests with a PATH");
+        assert_eq!(
+            entries.collect::<Vec<_>>(),
+            std::env::split_paths(&inherited).collect::<Vec<_>>()
+        );
+    }
+
+    /// A packaging that points `NIX_BIN` at a bare name, leaving the lookup to a
+    /// PATH wrapper (nixpkgs has a reason to: `env!` is compile-time, so absolute
+    /// paths mean one npb build per lix variant), must not get the empty "parent"
+    /// of that name prefixed — as a PATH entry it means the cwd.
+    #[test]
+    fn nom_path_leaves_a_relative_nix_alone() {
+        let inherited = std::env::var_os("PATH").expect("cargo runs tests with a PATH");
+        assert_eq!(nom_path("nix"), inherited);
+        assert_eq!(nom_path("bin/nix"), inherited);
+    }
+
     fn target(drv: &str) -> Target {
         Target {
             drv_path: drv.into(),
@@ -1153,7 +1214,7 @@ mod tests {
 
     /// Instantiate a nix expression, returning its .drv path.
     fn instantiate(expr: &str, attr: &str) -> String {
-        let out = Command::new("nix-instantiate")
+        let out = Command::new(crate::NIX_INSTANTIATE)
             .args(["--expr", expr, "-A", attr])
             .output()
             .expect("running nix-instantiate");
@@ -1373,7 +1434,7 @@ mod tests {
     #[ignore = "queries the real store via nix-store; needs nix"]
     fn direct_failure_self_heals_when_own_outputs_are_valid() {
         let valid = String::from_utf8(
-            Command::new("nix-store")
+            Command::new(crate::NIX_STORE)
                 .args(["--add", "/etc/hostname"])
                 .output()
                 .unwrap()
@@ -1471,7 +1532,7 @@ mod tests {
 
         // Realize `dep` so its outputs are valid in the store — the culprit has
         // healed. (Build it directly; it isn't a requested target of this run.)
-        let ok = Command::new("nix")
+        let ok = Command::new(crate::NIX)
             .args(["build", "--no-link", &format!("{dep}^*")])
             .args(["--extra-experimental-features", "nix-command"])
             .status()

@@ -217,7 +217,7 @@ pub fn render(
     // ``` fences and all) can't close the block early.
     let fence = "`".repeat(longest_backtick_run(command).max(2) + 1);
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
-    // `npb` links to the exact source tree this binary was built from (§8).
+    // `npb` links to the tagged source tree this binary was built from (§8).
     let url = crate::URL;
     let mut out = format!("## [`npb`]({url}) · {base} → {head}\n\n");
     // The reproduction command and the glyph legend each fold away behind a

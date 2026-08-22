@@ -1041,11 +1041,15 @@ merge-base under `--no-merge` — §6) it **builds both sides of the changed
 set** (skipping anything already known or substitutable), so a fresh report has
 a real state for every row rather than a wall of `❔`.
 
-The heading links `npb` to the exact source tree the binary was built from —
-`https://github.com/samestep/npb/tree/<rev>`, from the `URL` const in
-`src/main.rs`, whose `<rev>` the Nix build bakes in as `NPB_REV` (`self.rev`, or
-`main` for a dirty tree). `--version` prints the same URL, so a report and the
-binary that produced it point at one commit. This is npc's `--version` scheme.
+The heading links `npb` to the source tree the binary was built from —
+`https://github.com/samestep/npb/tree/v<version>`, from the `URL` const in
+`src/main.rs`, whose `<version>` is the crate's own (`CARGO_PKG_VERSION`), i.e.
+the release tag. `--version` prints that version and nothing else (plain clap
+`version`), so a report and the binary that produced it name one release. This is
+npc's `--version` scheme: released versions are the granularity npb is
+identified at, and no build-time revision is baked in — the packaging stays a
+pure function of the source tree, and a report's provenance is a tag anyone can
+fetch rather than a commit that may only exist in one clone.
 
 **Every report carries a copy-pasteable reproduction command** (a `sh`
 block folded in a `<details>` under the heading, `repro_command` in
@@ -1320,3 +1324,37 @@ mistake rather than a combination, and one attribute per flag can't be forgotten
 by a knob added later. It returns before `cacheversion::ensure_current`, so a shell
 sourcing it at every startup does no I/O, and generating it inside a build
 sandbox (no writable `HOME`, no `nix` on `PATH`) works.
+
+**The tools npb shells out to are absolute paths baked in at compile time**, not
+names resolved on `PATH`: `GIT_BIN`, `NIX_BIN`, `NIX_STORE_BIN`,
+`NIX_INSTANTIATE_BIN`, `NIX_EVAL_JOBS_BIN`, and `NOM_BIN` come from `flake.nix`
+(`binEnv`) into the consts at the top of `src/main.rs`, and every `Command::new`
+names one of those — npc's scheme, and the reason npb needs no wrapper script
+around its binary. Three things follow. A run uses the Nix it was *packaged*
+against, so the ≥2.35 requirement §4's disk story rests on is a property of the
+build rather than a hope about the caller's `PATH` (a user's 2.34 `nix` in front
+can't quietly reintroduce the ~400 MB source copy). npb adds nothing to the
+user's environment: `nix shell github:samestep/npb` puts `npb` there and not a
+second `nix`, `git`, or `nom`. And the store paths in the binary's own strings
+are what keeps the closure alive, so packaging is one `buildPackage` with no
+`wrapProgram` and nothing to keep in sync.
+
+A packaging is free to set those variables to **bare names** instead and provide
+them on `PATH` with a wrapper — npb calls whatever string it was given, so this
+works and is sometimes the better trade: `env!` resolves at compile time, so an
+absolute path means one whole npb build per variant of a tool (nixpkgs builds npb
+against C++ Nix and each `lixPackageSets` lix, where a wrapper would otherwise
+rebuild nothing). The only code that inspects the strings is `nom_path` below,
+which leaves a non-absolute one alone.
+
+Two deliberate exceptions. `nom` is handed a `PATH` with npb's `nix` directory
+prefixed (`nom_path` in `src/build.rs`) because nom itself runs `nix eval …
+builtins.currentSystem` to label the build platform and looks *that* up on
+`PATH` — without it a packaged npb makes nom print `Command 'nix' not available
+from $PATH` over the build tree. nom is the only tool in the set that resolves
+another program by name at runtime; the rest reach their helpers through paths
+fixed at their own build time (nix's own closure, git's `GIT_EXEC_PATH` libexec,
+nix-eval-jobs re-execing itself for workers), which is why they need nothing from
+the environment at all. And macOS' `sysctl` (the memory probe in
+`src/eval.rs`, §6) stays a bare name: it's an OS tool no package provides, and
+the probe already falls back when it fails.

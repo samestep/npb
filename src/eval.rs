@@ -181,7 +181,7 @@ fn stream_jobs<T>(
         .context("writing nix-eval-jobs expr file")?;
     let workers_s = workers.to_string();
     let max_s = per_worker_mb.to_string();
-    let mut cmd = Command::new("nix-eval-jobs");
+    let mut cmd = Command::new(crate::NIX_EVAL_JOBS);
     cmd.args(["--workers", &workers_s, "--max-memory-size", &max_s]);
     // `--no-instantiate` evaluates without writing the `.drv` files. The full-set
     // walk only needs the drvPath + outputs (both emitted regardless), so skipping
@@ -198,7 +198,7 @@ fn stream_jobs<T>(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
+        .context("spawning nix-eval-jobs")?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let stderr_tail = thread::spawn(move || {
@@ -697,7 +697,7 @@ fn enumerate_names(repo: &Path, rev: &str, system: &str, config: &str) -> Result
         build_expr(repo, rev, system, config)
     );
     let out = scrub_env(
-        Command::new("nix-instantiate").args(["--eval", "--strict", "--json", "-E", &expr]),
+        Command::new(crate::NIX_INSTANTIATE).args(["--eval", "--strict", "--json", "-E", &expr]),
     )
     .output()
     .context("running nix-instantiate (attr names)")?;
