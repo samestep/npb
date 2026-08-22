@@ -31,31 +31,23 @@
         pkgs:
         let
           craneLib = crane.mkLib pkgs;
-          # npb needs Nix ≥2.35, whose lazy source-copying is load-bearing for
-          # its disk story: `build_expr`'s `fetchGit` tree is only ever *read*,
-          # so 2.35 hashes it without materializing a ~400 MB
-          # `/nix/store/…-source` object per reviewed tree (DESIGN §4). nixpkgs'
-          # default `nix` is still the 2.34 series, so pin 2.35 explicitly.
-          nix = pkgs.nixVersions.nix_2_35;
-          # `nix-eval-jobs` links Nix's internals, so it must be the same series
-          # — otherwise the shard eval would still copy the tree. nixpkgs only
-          # packages the 2.34 release yet, so build the 2.35.0 release candidate
-          # (nix-eval-jobs#428) against the matching components. That commit also
-          # carries the macOS `ru_maxrss` fix (#426), letting `stream_jobs` drop
-          # its ×1024 workaround (DESIGN §9).
-          nix-eval-jobs =
-            (pkgs.nix-eval-jobs.override {
-              nixComponents = pkgs.nixVersions.nixComponents_2_35;
-            }).overrideAttrs
-              (_: {
-                version = "2.35.0-unstable-2026-07-16";
-                src = pkgs.fetchFromGitHub {
-                  owner = "nix-community";
-                  repo = "nix-eval-jobs";
-                  rev = "97997acae32aece824bc4c07bcd97f0823783919"; # pr #428 "release 2.35.0"
-                  hash = "sha256-/C5wyGYe4uMKKH26vy3knpwP/hvjOHO/58cySL8ADC4=";
-                };
-              });
+          nix-eval-jobs = pkgs.nix-eval-jobs;
+          # npb needs Nix ≥2.35, whose lazy source-copying is load-bearing for its
+          # disk story: `build_expr`'s `fetchGit` tree is only ever *read*, so 2.35
+          # hashes it without materializing a ~400 MB `/nix/store/…-source` object
+          # per reviewed tree (DESIGN §4). It has to be the *same series* as
+          # `nix-eval-jobs`, which links Nix's internals — a mismatched pair and
+          # the shard eval would still copy the tree — so take Nix from
+          # `nix-eval-jobs` itself rather than naming a version here. That
+          # `passthru` exists for exactly this ("we propagate the Nix used for
+          # building it to make it easier for users downstream to reference it"),
+          # and it makes the invariant structural: nixpkgs' default `nix` is still
+          # the 2.34 series, so npb can't use it, but a hand-written 2.35 pin
+          # beside a `nix-eval-jobs` that nixpkgs later builds against 2.36
+          # components would silently drift apart. It's also one runtime closure
+          # instead of two Nix builds (`nixVersions.nix_2_35` and these
+          # components) that only happen to agree.
+          nix = nix-eval-jobs.nix;
           # npb shells out to these at runtime; wrap them onto its PATH so the
           # packaged binary works outside the dev shell (`nix shell .`).
           runtimeDeps = [

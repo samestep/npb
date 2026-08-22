@@ -143,9 +143,11 @@ it in place instead of materializing a ~400 MB `/nix/store/…-source` object pe
 reviewed tree, which older Nix wrote eagerly (and which npb, keeping no gcroots,
 left for `nix-collect-garbage` to reclaim). Both eval binaries must be 2.35 for
 this to hold — `nix-instantiate` enumerates the attr names and `nix-eval-jobs`
-evaluates the shards, and either one forcing the tree would copy it — so the
-flake pins both to the 2.35 series (`nix-eval-jobs` built from its 2.35.0 release
-candidate, since nixpkgs packages only 2.34 so far; §9).
+evaluates the shards, and either one forcing the tree would copy it. nixpkgs'
+default `nix` is still the 2.34 series, so the flake can't use it; instead it
+takes Nix _from_ `nix-eval-jobs` (`nix-eval-jobs.nix`, the `passthru` nixpkgs
+provides for exactly this), which makes "same series" structural rather than two
+version pins that have to be kept in step by hand.
 
 The two fact kinds have opposite access patterns, so they get different backends.
 
@@ -1250,7 +1252,7 @@ eval-engine problem: with the cap compensated ×1024, the same darwin VM
 evaluated _faster_ than the Linux VM (7671 vs 5134 attrs/30 s, one worker).
 Reported as [nix-eval-jobs#425](https://github.com/NixOS/nix-eval-jobs/issues/425)
 and fixed by [nix-eval-jobs#426](https://github.com/NixOS/nix-eval-jobs/pull/426).
-The flake pins a `nix-eval-jobs` that includes the fix (§4), so `stream_jobs`
+nixpkgs' `nix-eval-jobs` has included the fix since 2.35.0 (§4), so `stream_jobs`
 (`src/eval.rs`) now passes `--max-memory-size` unscaled on every platform — the
 former ×1024 macOS workaround is gone.
 
