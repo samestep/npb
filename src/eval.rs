@@ -747,6 +747,25 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &
     )
 }
 
+/// Which of [`resolve_attrs`]' requests get a node in the progress tree: the ones
+/// with something left to resolve.
+///
+/// A side whose attrs are all cached has no items, hence no shard — and a group
+/// with no shards is never marked running or done, so it would sit blue at
+/// `0 / 0` for the whole run while its phase line showed yellow, since the parent
+/// rollup reads a waiting child as "still running" (`live::eff_state`). Both
+/// sibling phases already avoid this: `instantiate_prepare` drops its empty
+/// requests, and `reveal_system_tests` never creates the leaf at all. The
+/// returned indices map a group back to its request.
+fn live_requests(requests: &[(Rev, String, Vec<String>)]) -> Vec<usize> {
+    requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, attrs))| !attrs.is_empty())
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Resolve the attrs a selector review named (`-p`) to their drvs at each
 /// `(tree, system)`, through the same shard scheduler as every other targeted
 /// eval (DESIGN §6). `requests` is `(rev, system, attrs)` — callers pass only the
@@ -779,27 +798,30 @@ pub fn resolve_attrs(
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<(String, Resolved)>>> {
-    if requests.iter().all(|(_, _, a)| a.is_empty()) {
+    let live = live_requests(requests);
+    if live.is_empty() {
         return Ok(requests.iter().map(|_| Vec::new()).collect());
     }
     // Light workers (no `.drv` writes, a handful of attrs), so the full-set eval's
     // per-slot budget fits — unlike `tests`, this never forces a `nixosTest`.
     let slots = default_slots(SLOT_MEM_MB);
-    let groups: Vec<(String, String)> = requests
+    let groups: Vec<(String, String)> = live
         .iter()
-        .map(|(rev, system, _)| (system.clone(), rev.display.clone()))
+        .map(|&i| (requests[i].1.clone(), requests[i].0.display.clone()))
         .collect();
     let nodes = add_phase(tree, "resolve", &groups, Leaf::Count);
-    let labels: Vec<String> = requests
+    let labels: Vec<String> = live
         .iter()
-        .map(|(rev, system, _)| format!("{} {system}", rev.display))
+        .map(|&i| format!("{} {}", requests[i].0.display, requests[i].1))
         .collect();
-    let items: Vec<Vec<String>> = requests.iter().map(|(_, _, a)| a.clone()).collect();
-    let meta: Vec<(&Rev, &str)> = requests.iter().map(|(r, s, _)| (r, s.as_str())).collect();
+    let items: Vec<Vec<String>> = live.iter().map(|&i| requests[i].2.clone()).collect();
+    let meta: Vec<(&Rev, &str)> = live
+        .iter()
+        .map(|&i| (&requests[i].0, requests[i].1.as_str()))
+        .collect();
     let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    let results: Vec<Mutex<Vec<(String, Resolved)>>> = (0..requests.len())
-        .map(|_| Mutex::new(Vec::new()))
-        .collect();
+    let results: Vec<Mutex<Vec<(String, Resolved)>>> =
+        live.iter().map(|_| Mutex::new(Vec::new())).collect();
 
     run_shards(
         "resolve",
@@ -860,13 +882,18 @@ pub fn resolve_attrs(
         None,
     )?;
 
+    // Back to one entry per request, in the caller's order: a side that had
+    // nothing to resolve contributes nothing (its attrs were already cached).
+    let mut resolved: Vec<HashMap<String, Resolved>> =
+        requests.iter().map(|_| HashMap::new()).collect();
+    for (&i, rows) in live.iter().zip(results) {
+        resolved[i] = rows.into_inner().unwrap().into_iter().collect();
+    }
     // Fill in the attrs that streamed nothing: silence means absent.
     Ok(requests
         .iter()
-        .zip(results)
-        .map(|((_, _, asked), got)| {
-            let got = got.into_inner().unwrap();
-            let by_attr: HashMap<String, Resolved> = got.into_iter().collect();
+        .zip(resolved)
+        .map(|((_, _, asked), by_attr)| {
             asked
                 .iter()
                 .map(|a| {
@@ -1725,5 +1752,42 @@ mod tests {
         assert!(e.contains("builtins.listToAttrs"));
         assert!(e.contains(r#""hello" "#));
         assert!(e.contains(r#""with\"quote" "#));
+    }
+
+    #[test]
+    fn only_sides_with_work_get_a_resolve_node() {
+        let rev = |label: &str| Rev {
+            tree: format!("tree-{label}"),
+            commit: format!("commit-{label}"),
+            label: label.into(),
+            display: label.into(),
+        };
+        let req = |label: &str, system: &str, attrs: &[&str]| {
+            (
+                rev(label),
+                system.to_string(),
+                attrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        // A system whose attrs were all cached (both sides empty) contributes no
+        // group at all — otherwise its leaves would sit blue at `0 / 0` forever
+        // and drag the phase line to yellow after everything finished.
+        let requests = vec![
+            req("base", "x86_64-linux", &["git"]),
+            req("head", "x86_64-linux", &["git"]),
+            req("base", "aarch64-linux", &[]),
+            req("head", "aarch64-linux", &[]),
+            // ...and a system cached on one side only keeps the other side.
+            req("base", "aarch64-darwin", &[]),
+            req("head", "aarch64-darwin", &["git"]),
+        ];
+        assert_eq!(live_requests(&requests), vec![0, 1, 5]);
+
+        // Nothing to do anywhere: no phase, which `resolve_attrs` short-circuits on.
+        let cached = vec![
+            req("base", "x86_64-linux", &[]),
+            req("head", "x86_64-linux", &[]),
+        ];
+        assert!(live_requests(&cached).is_empty());
     }
 }
