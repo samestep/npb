@@ -116,6 +116,8 @@ That command may not give you the same result if you run it yourself, but `npb`'
   - [`--patch`](#--patch)
   - [`--no-merge`](#--no-merge)
   - [`--no-tests`](#--no-tests)
+  - [`-p`, `--package`](#-p---package)
+  - [`-P`, `--skip-package`](#-p---skip-package)
   - [`--allow-unsupported`](#--allow-unsupported)
   - [`--allow-broken`](#--allow-broken)
   - [`--allow-insecure`](#--allow-insecure)
@@ -247,6 +249,22 @@ By default, `npb` includes all `passthru.tests` for packages that changed betwee
 
 ```sh
 npb --no-tests
+```
+
+### `-p`, `--package`
+
+TODO(samestep): write this section. It documents `-p`/`--package`, which restricts the review to the attributes named — matched exactly, so `-p git` covers `git` but not `gitMinimal` and not `python3Packages.git`. Pass it more than once for more than one attribute. Worth mentioning: the `passthru.tests` of a named package are still included (unless `--no-tests`), since those are found from the packages under review; the two Nixpkgs evaluations still happen in full, because that is how the changed set is computed, so what this saves is the test evaluation, the builds, and the report; and the report says which attributes it was restricted to.
+
+```sh
+npb -p git -p hello
+```
+
+### `-P`, `--skip-package`
+
+TODO(samestep): write this section. It documents `-P`/`--skip-package`, which drops the attributes named from the review, matched exactly like `-p`. Worth mentioning: a skipped package's tests are skipped with it; a skipped package is still built if something else in the review depends on it, and `npb` remembers that outcome, so a later run without the flag gets it for free.
+
+```sh
+npb -P emscripten
 ```
 
 ### `--allow-unsupported`

@@ -666,6 +666,72 @@ changed-by-this-side / by-the-other / by-both; it turned out not to matter in
 practice and was dropped. The merge base survives only as the `--no-merge` base
 of a report.)
 
+**Reviewing part of the changed set: `-p` / `-P`.** A change deep in the
+dependency chain — a `gitMinimal` or `python3Packages.setuptools` bump — can put
+tens of thousands of attrs in the changed set, which is more than a review
+machine can build and more than a report can usefully say. So the changed set is
+_filterable_, like `nixpkgs-review`'s `-p`/`-P`: `-p`/`--package` restricts the
+review to given attrs, `-P`/`--skip-package` drops given ones
+(`model::PackageFilter`, prompted by
+[#2](https://github.com/samestep/npb/issues/2)). Three decisions make it fit.
+
+- **Attrs are matched exactly, because npb doesn't read attr-path structure.**
+  No subtrees, no globs, no prefixes — `-p git` is `git` and not `gitMinimal`,
+  and `-p python3Packages` selects nothing. That is not a shortcut, it is the
+  house style: nowhere in npb's Rust is an attr path anything but an opaque key
+  (sorted, diffed, compared, stored), and where structure is genuinely needed it
+  comes from the evaluator — `nix-eval-jobs`' pre-split `attrPath` array
+  (`eval::raw_to_test_job`) or a `lib.attrByPath (lib.splitString ".")` inside a
+  generated expression (`build_tests_expr`, the instantiate selector). A filter
+  is a poor place to break that, because the string it would have to parse is
+  ambiguous: the full-set eval stores `nix-eval-jobs`' *quoted* attr, so a dotted
+  *name* (`rubyPackages."http_parser.rb"` — 34 such attrs in one aarch64-linux
+  eval) and a dotted *path* look alike from the string alone. Subtree matching is
+  additive if someone asks for it (`-P python3Packages` to skip a whole set is
+  the plausible request); it isn't the default guess.
+
+- **One pass, before the `tests` expansion — which is what makes tests come
+  along for free.** The filter applies once, to the diff (`run_phases`), and the
+  `tests` phase then expands only what survived, since it is driven off
+  `changed_names` of the filtered set. So `-p git` reviews `git` and every one of
+  its `git.tests.*` rows without the filter knowing what a test row is called;
+  `-P git` reviews neither; and no package's tests are enumerated except the
+  selected ones — which is the expensive part of that phase, and most of what
+  `-P` buys on a big changed set. Nothing downstream needs a second pass, so
+  there is exactly one predicate (`selects`) and one place it runs. The cost of
+  that simplicity is that `-P` cannot drop an individual `tests` row: a test's
+  membership follows its package's, because the row doesn't exist yet when the
+  filter runs.
+
+- **It filters the changed set, never the eval.** An eval file is the whole attr
+  set at a `(tree, system, profile)`, shared by every review of that tree, and a
+  _partial_ one cached under that key would poison every later diff with phantom
+  "removed" packages (§4, and the same hazard the `tests` cache's completeness
+  marker exists for). Narrowing the eval to the named attrs would be much faster
+  and is exactly what we don't do: on a cold cache a filtered review still pays
+  both full evals. What it skips is everything keyed on the changed _set_ — the
+  `tests` eval, instantiation, the probe, the builds, the report — which is where
+  a 20k-attr rebuild is actually unaffordable. Second and later runs are warm, so
+  the eval is paid once per tree either way. The corpus keeps its value; the
+  filter costs it nothing.
+
+And **exclusion removes a target, not a dependency.** A `-P`'d package that a
+surviving target needs is still built by nix inside that target's closure —
+matching nixpkgs-review — and the observation it produces is keyed on its
+drvpath (§2) like any other, so it lands in the log all the same. A later run
+without the flag finds it already decided, for free. The visible consequence is a
+one-sided `🚫` whose culprit isn't in the report; that is unavoidable and mild,
+since `🚫` already means "something in the closure broke" (§8). Filtering narrows
+a report; it never discards knowledge — which is the difference between doing
+this over a durable fact store and doing it one-shot.
+
+A `-p` that names an attr the diff doesn't contain — a typo, an unaffected
+package, or a `tests` row (which isn't a changed-set attr when the filter runs) —
+is not an error, and deliberately not detected: distinguishing those cases would
+mean a whole-eval membership lookup for a wrong answer either way. The report
+discloses the filter instead (§8), so a narrow report is never mistaken for a
+clean one.
+
 **Eval does not instantiate; the changed set is materialized before building.**
 `nix-eval-jobs` runs with `--no-instantiate`: npb needs only the `drvPath` and
 `outputs` (both emitted regardless), so it skips writing the `.drv` files — ~40%
@@ -1045,6 +1111,17 @@ The heading links `npb` to the exact source tree the binary was built from —
 `main` for a dirty tree). `--version` prints the same URL, so a report and the
 binary that produced it point at one commit. This is npc's `--version` scheme.
 
+**A filtered report says so, unfolded.** When `-p`/`-P` narrowed the changed set
+(§6), the report states it — and the attrs on each side of the filter — between
+the heading's folded blocks and the per-system sections (`report::filter_note`).
+It is the one thing in a report that can't be folded away: it changes how every
+section below reads, and a reader who didn't type the flags has no other way to
+tell an attr that was filtered out from one the change didn't touch. A report
+whose sections show no regressions while silently covering 1% of the changed set
+would be worse than no report, and reports get pasted into PRs where the reader
+never saw the invocation. The reproduction command (below) echoes the flags for
+the same reason: without them it would reproduce a _different_ report.
+
 **Every report carries a copy-pasteable reproduction command** (a `sh`
 block folded in a `<details>` under the heading, `repro_command` in
 `src/main.rs`), followed by a second `<details>` glossing every glyph, so anyone
@@ -1056,10 +1133,10 @@ tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
 review byte-for-byte, and npb re-mints the merge itself — the command never names
 a synthetic (local-only) commit. Only report-shaping flags are echoed
 (`--no-merge`, the profile's `--allow-broken`/`--allow-unsupported`/`--allow-insecure`,
-`--no-tests`, and an explicit `-s` per system, since the default system is
-host-specific); `--retry` and the eval-sizing knobs don't change the changeset,
-so they're omitted. What varies is only how the _head_'s tree is recovered on
-another machine:
+`--no-tests`, each `-p`/`-P` of the package filter, and an explicit `-s` per
+system, since the default system is host-specific); `--retry` and the eval-sizing
+knobs don't change the changeset, so they're omitted. What varies is only how the
+_head_'s tree is recovered on another machine:
 
 - a committed / explicit head is already a fetchable commit → `--head <sha>`;
 - otherwise (a `--pr` head or an uncommitted working tree) the head has no

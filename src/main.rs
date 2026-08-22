@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::model::{BuildPolicy, Profile, Rev};
+use crate::model::{BuildPolicy, PackageFilter, Profile, Rev};
 
 /// The npb source tree this binary was built from, as a GitHub URL. `NPB_REV`
 /// is baked in by the Nix build (`self.rev`, or `main` for a dirty tree); it is
@@ -71,6 +71,12 @@ struct Cli {
     /// Don't add passthru.tests
     #[arg(long, conflicts_with = "clean")]
     no_tests: bool,
+    /// TODO(samestep): write the `--help` text for this flag
+    #[arg(short = 'p', long, value_name = "ATTR", conflicts_with = "clean")]
+    package: Vec<String>,
+    /// TODO(samestep): write the `--help` text for this flag
+    #[arg(short = 'P', long, value_name = "ATTR", conflicts_with = "clean")]
+    skip_package: Vec<String>,
     /// Enable allowUnsupportedSystem in Nixpkgs config
     #[arg(long, conflicts_with = "clean")]
     allow_unsupported: bool,
@@ -819,14 +825,15 @@ enum HeadRepro {
 /// and the `--patch` flag), so npb does the git plumbing internally and the
 /// command calls no external binary. Only flags that change *what the report
 /// contains* are echoed (`--no-merge`, the profile's `--allow-*`, `--no-tests`,
-/// the systems); `--retry` and the eval-sizing knobs don't change the changeset,
-/// so they're omitted.
+/// the `-p`/`-P` package filter, the systems); `--retry` and the eval-sizing
+/// knobs don't change the changeset, so they're omitted.
 fn repro_command(
     base_sha: &str,
     head: &HeadRepro,
     no_merge: bool,
     profile: Profile,
     no_tests: bool,
+    filter: &PackageFilter,
     systems: &[String],
 ) -> String {
     let mut flags = String::new();
@@ -844,6 +851,14 @@ fn repro_command(
     }
     if no_tests {
         flags.push_str(" --no-tests");
+    }
+    // The filter narrows the changeset, so a repro that omitted it would
+    // reproduce a *different* report (DESIGN §8).
+    for a in &filter.include {
+        flags.push_str(&format!(" -p {a}"));
+    }
+    for a in &filter.exclude {
+        flags.push_str(&format!(" -P {a}"));
     }
     for s in systems {
         flags.push_str(&format!(" -s {s}"));
@@ -996,6 +1011,7 @@ fn run_phases(
     profile: Profile,
     policy: BuildPolicy,
     tests: bool,
+    filter: &PackageFilter,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<(PerSystemChanged, Vec<build::Target>)> {
@@ -1034,7 +1050,15 @@ fn run_phases(
                 return Ok(()); // not both sides yet
             }
             acc.processed.insert(sys.to_string());
-            let changed = evalfile::changed_set(&base.tree, &head.tree, &key)?;
+            let mut changed = evalfile::changed_set(&base.tree, &head.tree, &key)?;
+            // `-p`/`-P`, applied once, here: this is *before* the `tests` phase,
+            // which expands only what survives (`changed_names` below), so a
+            // filtered-out package's tests are never enumerated — the expensive
+            // part of that phase — and a surviving package's come along without
+            // the filter needing to know what a test row is called (DESIGN §6).
+            if filter.is_set() {
+                changed.retain(|c| filter.selects(&c.attr));
+            }
             if tests {
                 reveal_system_tests(&mut acc, tree, systems, base, head, profile, sys, &changed)?;
             }
@@ -1185,6 +1209,12 @@ fn run(cli: Cli) -> Result<()> {
         insecure: cli.allow_insecure,
     };
     let policy = BuildPolicy { retry: cli.retry };
+    // Which attrs of the changed set this review covers (DESIGN §6). Default is
+    // everything; `-p`/`-P` narrow it, and the report says so (DESIGN §8).
+    let filter = PackageFilter {
+        include: cli.package,
+        exclude: cli.skip_package,
+    };
     let repo = resolve_repo(cli.path)?;
 
     let systems = resolve_systems(cli.system);
@@ -1290,7 +1320,7 @@ fn run(cli: Cli) -> Result<()> {
             ensure_distinct_trees(&base, &head)?;
 
             let (per_system_changed, targets) = run_phases(
-                &repo, &base, &head, &systems, profile, policy, tests, &tree, handle,
+                &repo, &base, &head, &systems, profile, policy, tests, &filter, &tree, handle,
             )?;
             Ok((
                 base,
@@ -1423,11 +1453,12 @@ fn run(cli: Cli) -> Result<()> {
         cli.no_merge,
         profile,
         !tests,
+        &filter,
         &systems,
     );
     print!(
         "{}",
-        report::render(&base.label, &head_display, &command, &per_system)
+        report::render(&base.label, &head_display, &command, &filter, &per_system)
     );
     Ok(())
 }
@@ -1930,6 +1961,7 @@ mod tests {
             false,
             strict,
             false,
+            &PackageFilter::default(),
             &["x86_64-linux".into()],
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -s x86_64-linux");
@@ -1940,6 +1972,7 @@ mod tests {
             true,
             all,
             true,
+            &PackageFilter::default(),
             &["a".into(), "b".into()],
         );
         assert_eq!(
@@ -1958,6 +1991,7 @@ mod tests {
             false,
             strict,
             false,
+            &PackageFilter::default(),
             &["sys".into()],
         );
         assert_eq!(cmd, "npb --base m1 --head fork --patch fork...m2 -s sys");
@@ -1972,12 +2006,86 @@ mod tests {
             false,
             strict,
             false,
+            &PackageFilter::default(),
             &["sys".into()],
         );
         assert_eq!(
             cmd,
             "npb --base b --head h --patch /dev/stdin -s sys <<'PATCH'\n--- a\n+++ b\nPATCH"
         );
+
+        // The package filter narrows the changeset, so it's echoed too — one
+        // token per attr, includes before excludes.
+        let cmd = repro_command(
+            "aaa",
+            &HeadRepro::Commit("bbb".into()),
+            false,
+            strict,
+            false,
+            &PackageFilter {
+                include: vec!["git".into(), "hello".into()],
+                exclude: vec!["python3Packages.requests".into()],
+            },
+            &["sys".into()],
+        );
+        assert_eq!(
+            cmd,
+            "npb --base aaa --head bbb -p git -p hello -P python3Packages.requests -s sys"
+        );
+    }
+
+    #[test]
+    fn package_filter_leaves_only_selected_packages_to_expand() {
+        // `run_phases` filters the changed set once, before the `tests` phase,
+        // and that phase expands only what `changed_names` reports — so the
+        // filter decides which packages get their tests enumerated, without ever
+        // having to know what a test row is called.
+        let filter = PackageFilter {
+            include: vec!["git".into()],
+            exclude: Vec::new(),
+        };
+        let mut changed = vec![
+            ca("git", Some("/d/g0"), Some("/d/g1"), false, false),
+            ca("gitMinimal", Some("/d/m0"), Some("/d/m1"), false, false),
+            ca("hello", Some("/d/h0"), Some("/d/h1"), false, false),
+        ];
+        changed.retain(|c| filter.selects(&c.attr));
+        assert_eq!(
+            changed_names(&changed),
+            (vec!["git".to_string()], vec!["git".to_string()])
+        );
+
+        // The expansion's rows then ride along unfiltered, since they can only
+        // have come from a selected package...
+        changed.extend([
+            ca(
+                "git.tests.withInstallCheck",
+                None,
+                Some("/d/t1"),
+                false,
+                false,
+            ),
+            ca(
+                "git.tests.buildbot-integration",
+                Some("/d/t2"),
+                None,
+                false,
+                false,
+            ),
+        ]);
+        let attrs: Vec<&str> = changed.iter().map(|c| c.attr.as_str()).collect();
+        assert_eq!(
+            attrs,
+            [
+                "git",
+                "git.tests.withInstallCheck",
+                "git.tests.buildbot-integration"
+            ]
+        );
+        // ...and every one of their drvs is a build target.
+        let targets = assemble_targets(&[("sys".into(), changed)]);
+        let drvs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
+        assert_eq!(drvs, ["/d/g0", "/d/g1", "/d/t1", "/d/t2"]);
     }
 
     #[test]
