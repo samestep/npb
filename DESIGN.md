@@ -693,8 +693,10 @@ of this got wrong:
   change break?", so the changed set is still computed from two whole-set evals;
   these attrs are dropped from it.
 - `-p`/`--package` **is a selection.** The question is "what does this change do
-  to _these_ attrs?", which needs no changed set at all: npb evaluates exactly
-  the named attrs on both trees and reports each one.
+  to _these_ attrs?", which needs no whole-set eval at all: npb evaluates exactly
+  the named attrs on both trees and diffs those. Its real value is **reach** — it
+  can review attrs a whole-set walk never enumerates — not a different reporting
+  rule.
 
 `-p` and `-P` are therefore exclusive (the CLI refuses both, and `Coverage`
 can't represent it): asking for both is asking npb to subtract from a set it was
@@ -738,14 +740,22 @@ consequences:
   top-level lookup per side) where a delta review costs minutes for two
   ~114k-attr walks. This is the difference between npb being usable on a
   setuptools-class rebuild and not.
-- **Every named attr gets a row**, including the two a diff can never show: equal
-  drvs on both sides (the change doesn't affect it — a real answer to the question
-  asked, where a diff would silently drop it), and nothing on either side, which
-  is how a typo'd `-p` reports itself (➖→➖, §8). So an unmatched `-p` needs no
-  separate diagnostic: it _is_ a row. And a narrowed review needs no separate
-  disclosure either — the reproduction command every report carries (§8) names
-  the flags that produced it, which is how `--no-tests` and the `--allow-*`
-  profile have always disclosed themselves.
+- **A row is still a change.** The named attrs are resolved, then diffed, so an
+  attr that comes out identical on both sides is not a row — the same rule
+  `evalfile::changed_set` applies structurally to a delta, and the reason `⏩→⏩`
+  and `➖→➖` are unreachable in _either_ mode (§8). It also means an unchanged
+  named attr never reaches the `tests` phase, exactly as it wouldn't have in a
+  delta. A selection is a cheaper, wider way to _find_ the attrs a review covers;
+  what npb then says about them is unchanged.
+- **A `-p` that resolves to nothing is simply no rows**, like any other attr the
+  change doesn't affect. Making it an error was tried and backed out: the
+  condition can't be stated per system — a Linux-only package reviewed on Darwin
+  resolves to nothing there and is perfectly legitimate — so it needs a
+  quantifier over every side of every `--system`, and a rule that awkward to
+  state is a rule about the wrong thing. npb is a diff; asking it about an attr
+  that isn't there is answered by the absence of rows, and the reproduction
+  command in the report says what was asked for. (nixpkgs-review does `die`
+  here; it has no equivalent of npb's multi-system runs to complicate it.)
 - **A named attr must be a derivation, not a subtree.** `nix-eval-jobs` recurses
   into a `recurseForDerivations` attrset, so `-p python313Packages` would quietly
   become ~11k rows. Such a row arrives with a multi-element `attrPath` whose first
@@ -777,7 +787,10 @@ dropped package's tests are never enumerated — the expensive part — and a ke
 package's come along without the filter knowing what a test row is called. The
 cost of that simplicity is that `-P` cannot drop an individual `tests` row, which
 doesn't exist yet when it runs. A selection expands tests the same way, off the
-attrs it named.
+attrs it named that actually changed — the delta's rule, blind spot included: a
+change to a package's `passthru.tests` that leaves the package itself untouched is
+invisible either way, since tests are only ever enumerated from a changed
+package.
 
 **Dropping an attr removes a target, not a dependency.** A `-P`'d package that a
 surviving target needs is still built by nix inside that target's closure —
@@ -1138,14 +1151,13 @@ accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
-Of the 6 × 6 = 36 pairs, **34** can appear in a _delta_ report: every combination
-except the two the diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no
-change, §6) and ➖→➖ (an attr in neither eval is never a row). Every other pair,
-including ⏩→➖ and ➖→⏩, is reachable. A **selection** (`-p`, §6) reaches all
-**36**, because it reports every attr it was named rather than every attr that
-changed: an attr that throws on both sides is still an answer, and ➖→➖ is how a
-`-p` that resolved to nothing — a typo, or a path that isn't there on either
-tree — reports itself.
+Of the 6 × 6 = 36 pairs, **34** can appear in a report: every combination except
+the two a diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no change,
+§6) and ➖→➖ (an attr with no derivation on either side is never a row). Every
+other pair, including ⏩→➖ and ➖→⏩, is reachable. This holds in both coverage
+modes: a selection diffs the attrs it resolved just as a delta diffs the attrs it
+walked (§6), so naming an attr with `-p` gets it _considered_, never reported
+unconditionally.
 Sections are ordered **worst-delta-first**: each state has a goodness on the
 build-outcome axis (`✅` > `⏩` > `🚫` > `❌`, with `➖` absent slotted just under
 `✅` as _new_/_gone_), and a section sorts by the signed delta

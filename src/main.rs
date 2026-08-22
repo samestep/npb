@@ -1074,29 +1074,40 @@ fn selected_changed_sets(
 
     // Pair the sides back up per system, in `systems` order (two sides each, in
     // the order they were pushed above).
-    let mut out = HashMap::new();
-    for (i, sys) in systems.iter().enumerate() {
-        let side = |n: usize| -> HashMap<String, model::Resolved> {
+    let resolved: Vec<HashMap<String, model::Resolved>> = (0..sides.len())
+        .map(|n| {
             let mut m = cached[n].clone();
             m.extend(fresh[n].iter().cloned());
             m
-        };
-        let b = side(2 * i);
-        let h = side(2 * i + 1);
+        })
+        .collect();
+
+    let mut out = HashMap::new();
+    for (i, sys) in systems.iter().enumerate() {
+        let (b, h) = (&resolved[2 * i], &resolved[2 * i + 1]);
         let rows: Vec<evalfile::ChangedAttr> = wanted
             .iter()
-            .map(|attr| {
+            .filter_map(|attr| {
                 let get = |m: &HashMap<String, model::Resolved>| {
                     m.get(attr).cloned().unwrap_or_else(model::Resolved::absent)
                 };
-                let (b, h) = (get(&b), get(&h));
-                evalfile::ChangedAttr {
-                    attr: attr.clone(),
-                    base_drv: b.drv_path,
-                    head_drv: h.drv_path,
-                    base_threw: b.threw,
-                    head_threw: h.threw,
+                let (base, head) = (get(b), get(h));
+                // Identical on both sides is not a row — the same rule
+                // `evalfile::changed_set` applies structurally to a delta, which
+                // is why this is a changed set and not a listing. So `⏩→⏩` and
+                // `➖→➖` stay unreachable in either mode (DESIGN §6, §8), and an
+                // unchanged attr never reaches the `tests` phase, exactly as it
+                // wouldn't have in a delta.
+                if base == head {
+                    return None;
                 }
+                Some(evalfile::ChangedAttr {
+                    attr: attr.clone(),
+                    base_drv: base.drv_path,
+                    head_drv: head.drv_path,
+                    base_threw: base.threw,
+                    head_threw: head.threw,
+                })
             })
             .collect();
         out.insert(sys.clone(), rows);
