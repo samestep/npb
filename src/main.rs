@@ -24,52 +24,60 @@ use std::process::Command as Proc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 
 use crate::model::{BuildPolicy, Coverage, Profile, Rev};
 
-/// The npb source tree this binary was built from, as a GitHub URL. `NPB_REV`
-/// is baked in by the Nix build (`self.rev`, or `main` for a dirty tree); it is
-/// what `--version` prints and what the report heading links `npb` to.
+/// The npb source tree this binary was built from, as a GitHub URL: the tag of
+/// the release it was cut from, so a report and the binary that produced it name
+/// one version. `--version` prints that same version (clap, from
+/// `CARGO_PKG_VERSION`) — npc's scheme.
 pub const URL: &str = concat!(
     "https://github.com/samestep/",
     env!("CARGO_PKG_NAME"),
-    "/tree/",
-    env!("NPB_REV"),
+    "/tree/v",
+    env!("CARGO_PKG_VERSION"),
 );
 
+/// The tools npb shells out to, as absolute paths baked in at compile time by
+/// the packaging (`GIT_BIN`, `NIX_BIN`, … in `flake.nix`) — npc's scheme, and
+/// the reason nothing here is looked up on `PATH`: npb runs the exact tools it
+/// was built against, not whatever the caller happens to have installed (§4's
+/// disk story needs *that* `nix`, a 2.35, not the user's older one), and the
+/// unwrapped binary behaves the same inside a dev shell and out. (macOS'
+/// `sysctl`, in [`eval`], stays a bare PATH lookup: it's an OS tool no package
+/// provides, and the memory probe that calls it already falls back on failure.)
+pub const GIT: &str = env!("GIT_BIN");
+pub const NIX: &str = env!("NIX_BIN");
+pub const NIX_STORE: &str = env!("NIX_STORE_BIN");
+pub const NIX_INSTANTIATE: &str = env!("NIX_INSTANTIATE_BIN");
+pub const NIX_EVAL_JOBS: &str = env!("NIX_EVAL_JOBS_BIN");
+pub const NOM: &str = env!("NOM_BIN");
+
 #[derive(Parser)]
-#[command(
-    name = "npb",
-    version = URL,
-    about = "Nixpkgs build outcome diff CLI"
-)]
+#[command(name = "npb", version, about = "Nixpkgs build outcome diff CLI")]
 struct Cli {
     /// Nixpkgs clone
-    #[arg(short = 'C', default_value = ".", conflicts_with = "clean")]
+    #[arg(short = 'C', default_value = ".")]
     path: PathBuf,
     /// Revision before the change
-    #[arg(
-        long,
-        value_name = "REV",
-        default_value = "master",
-        conflicts_with = "clean"
-    )]
+    #[arg(long, value_name = "REV", default_value = "master")]
     base: String,
     /// Revision after the change [default: working tree]
-    #[arg(long, value_name = "REV", conflicts_with = "clean")]
+    #[arg(long, value_name = "REV")]
     head: Option<String>,
     /// Set --base and --head to a pull request
-    #[arg(long, value_name = "NUMBER", conflicts_with_all = ["base", "head", "patch", "clean"])]
+    #[arg(long, value_name = "NUMBER", conflicts_with_all = ["base", "head", "patch"])]
     pr: Option<u64>,
     /// Apply a diff on top of --head
-    #[arg(long, value_name = "PATH|REV...REV", conflicts_with = "clean")]
+    #[arg(long, value_name = "PATH|REV...REV")]
     patch: Option<String>,
     /// Compare merge-base to --head, instead of --base to merge
-    #[arg(long, conflicts_with = "clean")]
+    #[arg(long)]
     no_merge: bool,
     /// Don't add passthru.tests
-    #[arg(long, conflicts_with = "clean")]
+    #[arg(long)]
     no_tests: bool,
     /// TODO(samestep): write the `--help` text for this flag
     #[arg(
@@ -83,23 +91,26 @@ struct Cli {
     #[arg(short = 'P', long, value_name = "ATTR", conflicts_with = "clean")]
     skip_package: Vec<String>,
     /// Enable allowUnsupportedSystem in Nixpkgs config
-    #[arg(long, conflicts_with = "clean")]
+    #[arg(long)]
     allow_unsupported: bool,
     /// Enable allowBroken in Nixpkgs config
-    #[arg(long, conflicts_with = "clean")]
+    #[arg(long)]
     allow_broken: bool,
     /// Set allowInsecurePredicate to true in Nixpkgs config
-    #[arg(long, conflicts_with = "clean")]
+    #[arg(long)]
     allow_insecure: bool,
     /// Try to build derivations that have failed before
-    #[arg(long, conflicts_with = "clean")]
+    #[arg(long)]
     retry: bool,
     /// Every system to evaluate [default: just this system]
-    #[arg(short, long, conflicts_with = "clean")]
+    #[arg(short, long)]
     system: Vec<String>,
     /// Delete least recently used cache entries
-    #[arg(long, value_name = "SIZE|DATE|DURATION")]
+    #[arg(long, value_name = "SIZE|DATE|DURATION", exclusive = true)]
     clean: Option<String>,
+    /// Generate shell completions
+    #[arg(long, value_name = "SHELL", exclusive = true)]
+    completions: Option<Shell>,
 }
 
 /// The host Nix system double, e.g. `aarch64-linux`.
@@ -149,7 +160,7 @@ const UPSTREAM: &str = "https://github.com/NixOS/nixpkgs";
 /// (DESIGN §6): npb *owns* the merge, so the environment it runs git in must not
 /// perturb the result.
 fn git_command(repo: &std::path::Path) -> Proc {
-    let mut cmd = Proc::new("git");
+    let mut cmd = Proc::new(GIT);
     cmd.arg("-C")
         .arg(repo)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1376,6 +1387,17 @@ fn compare_head_display(anchor: &str, expr: &str) -> String {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // `--completions` writes a script to stdout and exits, ahead of everything
+    // else: a shell sourcing it on every startup must not touch the cache (the
+    // version check below can prompt), and the packaging that generates these
+    // scripts at build time runs npb in a sandbox with no writable HOME.
+    if let Some(shell) = cli.completions {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
+
     // Reconcile the on-disk cache with this npb's eval-cache format version before
     // touching it — a format bump prompts a one-time wipe of the eval cache while
     // keeping the observation log (DESIGN §1, §4). Runs ahead of `--clean` too, so
@@ -1383,7 +1405,7 @@ fn run(cli: Cli) -> Result<()> {
     cacheversion::ensure_current()?;
 
     // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
-    // files and exit, reviewing nothing. It conflicts with every review knob.
+    // files and exit, reviewing nothing — hence `exclusive` on the flag.
     if let Some(spec) = &cli.clean {
         return clean::clean(&clean::CleanSpec::parse(spec)?);
     }
@@ -1748,7 +1770,7 @@ mod tests {
 
     /// Run git in `dir`, returning trimmed stdout; panics on failure.
     fn g(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = Proc::new("git")
+        let out = Proc::new(GIT)
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -1799,7 +1821,7 @@ mod tests {
         let (up, s) = pr_fixture();
         let local = tempfile::tempdir().unwrap();
         assert!(
-            Proc::new("git")
+            Proc::new(GIT)
                 .args(["clone", "-q"])
                 .arg(up.path())
                 .arg(local.path())
@@ -1847,7 +1869,7 @@ mod tests {
     fn resolve_pr_missing_merge_ref_errors_and_suggests_no_merge() {
         let (up, s) = pr_fixture();
         let local = tempfile::tempdir().unwrap();
-        Proc::new("git")
+        Proc::new(GIT)
             .args(["clone", "-q"])
             .arg(up.path())
             .arg(local.path())
@@ -1915,7 +1937,7 @@ mod tests {
         g(d, &["update-ref", "refs/pull/9/merge", &m]);
 
         let local = tempfile::tempdir().unwrap();
-        Proc::new("git")
+        Proc::new(GIT)
             .args(["clone", "-q"])
             .arg(up.path())
             .arg(local.path())
@@ -2114,7 +2136,7 @@ mod tests {
     fn resolve_pr_missing_pr_errors() {
         let (up, _s) = pr_fixture();
         let local = tempfile::tempdir().unwrap();
-        Proc::new("git")
+        Proc::new(GIT)
             .args(["clone", "-q"])
             .arg(up.path())
             .arg(local.path())

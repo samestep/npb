@@ -35,7 +35,7 @@ fn store_hash(path: &str) -> Option<&str> {
 /// --outputs` (fails if the .drv isn't in the local store). The one such
 /// helper — the build driver's validity checks use it too.
 pub fn drv_outputs(drv: &str) -> Result<Vec<String>> {
-    let out = Command::new("nix-store")
+    let out = Command::new(crate::NIX_STORE)
         .args(["--query", "--outputs", drv])
         .output()
         .context("running nix-store --query --outputs")?;
@@ -112,7 +112,7 @@ fn drv_outputs_many(drvs: &[String]) -> HashMap<String, Vec<String>> {
 
     let mut map = HashMap::new();
     for chunk in existing.chunks(DERIVATION_SHOW_CHUNK) {
-        let out = Command::new("nix")
+        let out = Command::new(crate::NIX)
             .args([
                 "derivation",
                 "show",

@@ -124,6 +124,7 @@ That command may not give you the same result if you run it yourself, but `npb`'
   - [`--retry`](#--retry)
   - [`-s`, `--system`](#-s---system)
   - [`--clean`](#--clean)
+  - [`--completions`](#--completions)
   - [`-V`, `--version`](#-v---version)
 - [Acknowledgments](#acknowledgments)
 - [License](#license)
@@ -335,6 +336,14 @@ The value passed to this argument must be either a [`YYYY-MM-DD` date](https://e
   - `GiB` = gibibytes
   - `TB` = terabytes
   - `TiB` = tebibytes
+
+### `--completions`
+
+To generate shell completions:
+
+```sh
+npb --completions bash
+```
 
 ### `-V`, `--version`
 
