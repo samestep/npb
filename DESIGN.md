@@ -682,27 +682,26 @@ changed-by-this-side / by-the-other / by-both; it turned out not to matter in
 practice and was dropped. The merge base survives only as the `--no-merge` base
 of a report.)
 
-**Reviewing less than the whole changed set: `-p` / `-P`.** A change deep in the
+**Reviewing less than the whole changed set: `-p`.** A change deep in the
 dependency chain — a `gitMinimal` or `python3Packages.setuptools` bump — can put
 tens of thousands of attrs in the changed set, which is more than a review
 machine can build and more than a report can usefully say. So a review need not
-cover the whole set (`model::Coverage`, prompted by
-[#2](https://github.com/samestep/npb/issues/2)). There are two ways to want
-that, they are _different questions_, and conflating them is what the first cut
-of this got wrong:
+cover the whole set: `-p`/`--package` reviews exactly the attrs it names
+(`model::Coverage`, prompted by
+[#2](https://github.com/samestep/npb/issues/2)). The question shifts from "what
+did this change break?" — answered from the diff of two whole-set evals — to
+"what does this change do to _these_ attrs?", which needs no whole-set eval at
+all: npb evaluates the named attrs on both trees and diffs those. Its real value
+is **reach** — it can review attrs a whole-set walk never enumerates — not a
+different reporting rule.
 
-- `-P`/`--skip-package` **narrows a delta.** The question is still "what did this
-  change break?", so the changed set is still computed from two whole-set evals;
-  these attrs are dropped from it.
-- `-p`/`--package` **is a selection.** The question is "what does this change do
-  to _these_ attrs?", which needs no whole-set eval at all: npb evaluates exactly
-  the named attrs on both trees and diffs those. Its real value is **reach** — it
-  can review attrs a whole-set walk never enumerates — not a different reporting
-  rule.
-
-`-p` and `-P` are therefore exclusive (the CLI refuses both, and `Coverage`
-can't represent it): asking for both is asking npb to subtract from a set it was
-told not to compute.
+> **`-P`/`--skip-package` was implemented alongside it and then dropped**, before
+> either shipped. The issue asked for both, for parity with nixpkgs-review, on
+> the guess that one would come free with the other; it doesn't, and asked
+> [directly](https://github.com/samestep/npb/issues/2#issuecomment-5385779137)
+> the requester had never used `-P` there and couldn't construct a case for it
+> that `-p` wouldn't cover. A flag nobody wants is a flag npb is committed to
+> keeping working forever (§1), so it went.
 
 **Why a selection is not a filter — the feedback that forced this.** The first
 implementation made `-p` a filter over the changed set, matched by attr name.
@@ -777,22 +776,20 @@ partial fact belongs: SQLite (`sel_drv`, §4), holding the same trichotomy the
 eval-file format carries — a drv, no drv but it threw (⏩), or absent (➖). A warm
 selector re-run resolves nothing, imports nothing, and answers from the log.
 
-**Attrs are matched exactly, and `-P` runs before the `tests` expansion.** No
-subtrees, no globs, no prefixes: nowhere in npb's Rust is an attr path anything
-but an opaque key, and the string a matcher would have to parse is ambiguous
-anyway — the eval file keeps `nix-eval-jobs`' quoting, so a dotted _name_
-(`rubyPackages."http_parser.rb"` — 34 such attrs in one aarch64-linux eval) and a
-dotted _path_ look alike. `-P` then applies once, to the diff, _before_ the
-`tests` phase expands it, and that is what makes tests follow their package for
-free: the expansion is driven off whatever survives (`changed_names`), so a
-dropped package's tests are never enumerated — the expensive part — and a kept
-package's come along without the filter knowing what a test row is called. The
-cost of that simplicity is that `-P` cannot drop an individual `tests` row, which
-doesn't exist yet when it runs. A selection expands tests the same way, off the
-attrs it named that actually changed — the delta's rule, blind spot included: a
-change to a package's `passthru.tests` that leaves the package itself untouched is
-invisible either way, since tests are only ever enumerated from a changed
-package.
+**Attrs are matched exactly.** No subtrees, no globs, no prefixes: nowhere in
+npb's Rust is an attr path anything but an opaque key, and the string a matcher
+would have to parse is ambiguous anyway — the eval file keeps `nix-eval-jobs`'
+quoting, so a dotted _name_ (`rubyPackages."http_parser.rb"` — 34 such attrs in
+one aarch64-linux eval) and a dotted _path_ look alike.
+
+**Tests follow the attrs a review covers, for free.** The `tests` phase expands
+whatever the changed set holds (`changed_names`), so a selection expands the
+attrs it named that actually changed, and a delta expands the packages that
+changed — neither needs the flag, or the diff, to know what a test row is called.
+It carries the delta's blind spot with it: a change to a package's
+`passthru.tests` that leaves the package itself untouched is invisible either way,
+since tests are only ever enumerated from a changed package. A selection is the
+way out, since it can name the test.
 
 One wrinkle *is* a selection's own. `-p` can name a `tests` attr directly, which
 puts a test derivation in the changed set, and the phase then enumerates *that*
@@ -806,8 +803,8 @@ pair as an alias. The redundant enumeration still happens; recognising the named
 attr as a test up front would mean reading structure out of an attr path, which
 npb doesn't do.
 
-**Dropping an attr removes a target, not a dependency.** A `-P`'d package that a
-surviving target needs is still built by nix inside that target's closure —
+**Leaving an attr out removes a target, not a dependency.** An unnamed package
+that a named target needs is still built by nix inside that target's closure —
 matching nixpkgs-review — and the observation it produces is keyed on its
 drvpath (§2) like any other, so it lands in the log all the same. A later run
 without the flag finds it already decided, for free. The visible consequence is a
@@ -1213,8 +1210,8 @@ tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
 review byte-for-byte, and npb re-mints the merge itself — the command never names
 a synthetic (local-only) commit. Only report-shaping flags are echoed
 (`--no-merge`, the profile's `--allow-broken`/`--allow-unsupported`/`--allow-insecure`,
-`--no-tests`, whichever of `-p`/`-P` narrowed the review (§6), and an explicit
-`-s` per system, since the default system is host-specific); `--retry` and the eval-sizing
+`--no-tests`, each `-p` of a selection (§6), and an explicit `-s` per system,
+since the default system is host-specific); `--retry` and the eval-sizing
 knobs don't change the changeset, so they're omitted. What varies is only how the
 _head_'s tree is recovered on another machine:
 

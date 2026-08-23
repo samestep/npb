@@ -80,16 +80,8 @@ struct Cli {
     #[arg(long)]
     no_tests: bool,
     /// TODO(samestep): write the `--help` text for this flag
-    #[arg(
-        short = 'p',
-        long,
-        value_name = "ATTR",
-        conflicts_with_all = ["clean", "skip_package"]
-    )]
+    #[arg(short = 'p', long, value_name = "ATTR")]
     package: Vec<String>,
-    /// TODO(samestep): write the `--help` text for this flag
-    #[arg(short = 'P', long, value_name = "ATTR", conflicts_with = "clean")]
-    skip_package: Vec<String>,
     /// Enable allowUnsupportedSystem in Nixpkgs config
     #[arg(long)]
     allow_unsupported: bool,
@@ -841,7 +833,7 @@ enum HeadRepro {
 /// and the `--patch` flag), so npb does the git plumbing internally and the
 /// command calls no external binary. Only flags that change *what the report
 /// contains* are echoed (`--no-merge`, the profile's `--allow-*`, `--no-tests`,
-/// what `-p`/`-P` narrowed the review to, the systems); `--retry` and the eval-sizing
+/// each `-p` of a selection, the systems); `--retry` and the eval-sizing
 /// knobs don't change the changeset, so they're omitted.
 fn repro_command(
     base_sha: &str,
@@ -868,19 +860,11 @@ fn repro_command(
     if no_tests {
         flags.push_str(" --no-tests");
     }
-    // Both decide *what* the report covers, so a repro that omitted them would
-    // reproduce a different report (DESIGN §8).
-    match coverage {
-        Coverage::All => {}
-        Coverage::Only(attrs) => {
-            for a in attrs {
-                flags.push_str(&format!(" -p {a}"));
-            }
-        }
-        Coverage::Except(attrs) => {
-            for a in attrs {
-                flags.push_str(&format!(" -P {a}"));
-            }
+    // A selection decides *what* the report covers, so a repro that omitted it
+    // would reproduce a different report (DESIGN §8).
+    if let Some(attrs) = coverage.only() {
+        for a in attrs {
+            flags.push_str(&format!(" -p {a}"));
         }
     }
     for s in systems {
@@ -1221,13 +1205,7 @@ fn run_phases(
                 return Ok(()); // not both sides yet
             }
             acc.processed.insert(sys.to_string());
-            let mut changed = evalfile::changed_set(&base.tree, &head.tree, &key)?;
-            // `-P`, applied once, here: this is *before* the `tests` phase, which
-            // expands only what survives (`changed_names` below), so a dropped
-            // package's tests are never enumerated — the expensive part of that
-            // phase — and a surviving package's come along without the filter
-            // needing to know what a test row is called (DESIGN §6).
-            changed.retain(|c| coverage.keeps(&c.attr));
+            let changed = evalfile::changed_set(&base.tree, &head.tree, &key)?;
             if tests {
                 reveal_system_tests(&mut acc, tree, systems, base, head, profile, sys, &changed)?;
             }
@@ -1420,16 +1398,12 @@ fn run(cli: Cli) -> Result<()> {
     };
     let policy = BuildPolicy { retry: cli.retry };
     // What this review covers (DESIGN §6): the whole changed set, or exactly the
-    // attrs `-p` named. `-P` drops attrs from a delta, and clap makes the two
-    // flags exclusive — `-p` with `-P` would subtract from a set npb was told not
-    // to compute. Either way the report's reproduction command echoes the flag
-    // that narrowed it (DESIGN §8), like every other report-shaping flag.
-    let coverage = if !cli.package.is_empty() {
-        Coverage::Only(cli.package)
-    } else if !cli.skip_package.is_empty() {
-        Coverage::Except(cli.skip_package)
-    } else {
+    // attrs `-p` named. The report's reproduction command echoes the flag
+    // (DESIGN §8), like every other report-shaping flag.
+    let coverage = if cli.package.is_empty() {
         Coverage::All
+    } else {
+        Coverage::Only(cli.package)
     };
     let repo = resolve_repo(cli.path)?;
 
@@ -2242,18 +2216,6 @@ mod tests {
             &["sys".into()],
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -p git -p hello -s sys");
-
-        // ...and so does a `-P` filter on a delta.
-        let cmd = repro_command(
-            "aaa",
-            &HeadRepro::Commit("bbb".into()),
-            false,
-            strict,
-            false,
-            &Coverage::Except(vec!["emscripten".into()]),
-            &["sys".into()],
-        );
-        assert_eq!(cmd, "npb --base aaa --head bbb -P emscripten -s sys");
     }
 
     #[test]
@@ -2301,47 +2263,6 @@ mod tests {
         let hmap = m(&[("pkg.tests.x", "pkg", "/d/t1")]);
         let (b, h) = drop_self_tests(&bmap, &hmap, &changed);
         assert!(b.contains_key("pkg.tests.x") && h.contains_key("pkg.tests.x"));
-    }
-
-    #[test]
-    fn skip_filter_leaves_only_kept_packages_to_expand() {
-        // `run_phases` filters a delta's changed set once, before the `tests`
-        // phase, and that phase expands only what `changed_names` reports — so the
-        // filter decides which packages get their tests enumerated, without ever
-        // having to know what a test row is called.
-        let skip = Coverage::Except(vec!["hello".into()]);
-        let mut changed = vec![
-            ca("git", Some("/d/g0"), Some("/d/g1"), false, false),
-            ca("hello", Some("/d/h0"), Some("/d/h1"), false, false),
-        ];
-        changed.retain(|c| skip.keeps(&c.attr));
-        assert_eq!(
-            changed_names(&changed),
-            (vec!["git".to_string()], vec!["git".to_string()])
-        );
-
-        // The expansion's rows then ride along unfiltered, since they can only
-        // have come from a kept package...
-        changed.extend([
-            ca(
-                "git.tests.withInstallCheck",
-                None,
-                Some("/d/t1"),
-                false,
-                false,
-            ),
-            ca(
-                "git.tests.buildbot-integration",
-                Some("/d/t2"),
-                None,
-                false,
-                false,
-            ),
-        ]);
-        // ...and every one of their drvs is a build target.
-        let targets = assemble_targets(&[("sys".into(), changed)]);
-        let drvs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
-        assert_eq!(drvs, ["/d/g0", "/d/g1", "/d/t1", "/d/t2"]);
     }
 
     #[test]

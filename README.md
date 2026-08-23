@@ -117,7 +117,6 @@ That command may not give you the same result if you run it yourself, but `npb`'
   - [`--no-merge`](#--no-merge)
   - [`--no-tests`](#--no-tests)
   - [`-p`, `--package`](#-p---package)
-  - [`-P`, `--skip-package`](#-p---skip-package)
   - [`--allow-unsupported`](#--allow-unsupported)
   - [`--allow-broken`](#--allow-broken)
   - [`--allow-insecure`](#--allow-insecure)
@@ -254,18 +253,10 @@ npb --no-tests
 
 ### `-p`, `--package`
 
-TODO(samestep): write this section. It documents `-p`/`--package`, which reviews only the attributes named instead of everything the change affects: `npb` evaluates just those attributes on both sides and compares them. Worth mentioning: the report still lists only what the change actually affects, so naming an attribute the change doesn't touch produces no row for it; attribute names are matched exactly, and must name a package rather than a package set, so `-p python3Packages.dirty-equals` works but `-p python313Packages` is refused; and the `passthru.tests` of a named package are included (unless `--no-tests`). Also worth mentioning, because it is the reason to reach for this on a big rebuild: naming attributes means `npb` does not have to evaluate all of Nixpkgs on both sides, so a first run takes seconds rather than minutes — and it can reach attributes that evaluating all of Nixpkgs never reaches, like `python311Packages.dirty-equals`, whose set Nixpkgs doesn't mark for recursion. Cannot be combined with `-P`.
+TODO(samestep): write this section. It documents `-p`/`--package`, which reviews only the attributes named instead of everything the change affects: `npb` evaluates just those attributes on both sides and compares them. Worth mentioning: the report still lists only what the change actually affects, so naming an attribute the change doesn't touch produces no row for it; attribute names are matched exactly, and must name a package rather than a package set, so `-p python3Packages.dirty-equals` works but `-p python313Packages` is refused; and the `passthru.tests` of a named package are included (unless `--no-tests`). Also worth mentioning, because it is the reason to reach for this on a big rebuild: naming attributes means `npb` does not have to evaluate all of Nixpkgs on both sides, so a first run takes seconds rather than minutes — and it can reach attributes that evaluating all of Nixpkgs never reaches, like `python311Packages.dirty-equals`, whose set Nixpkgs doesn't mark for recursion.
 
 ```sh
 npb -p python3Packages.dirty-equals -p python313Packages.dirty-equals
-```
-
-### `-P`, `--skip-package`
-
-TODO(samestep): write this section. It documents `-P`/`--skip-package`, which reviews everything the change affects *except* the attributes named, matched exactly like `-p`. Worth mentioning: a skipped package's tests are skipped with it; a skipped package is still built if something else under review depends on it, and `npb` remembers that outcome, so a later run without the flag gets it for free. Unlike `-p` this still evaluates all of Nixpkgs on both sides, because that is how the affected set is found. Cannot be combined with `-p`.
-
-```sh
-npb -P emscripten
 ```
 
 ### `--allow-unsupported`

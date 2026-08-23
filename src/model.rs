@@ -100,28 +100,28 @@ impl Profile {
     }
 }
 
-/// What a review covers: the whole changed set, that set minus some attrs
-/// (`-P`/`--skip-package`), or exactly the attrs `-p`/`--package` named
-/// (DESIGN §6).
+/// What a review covers: the whole changed set, or exactly the attrs
+/// `-p`/`--package` named (DESIGN §6).
 ///
-/// One type with three states, because `-p` and `-P` answer different questions
-/// and can't be combined. A *delta* review asks "what did this change break?",
-/// derives its attrs from the diff of two whole-set evals, and can be narrowed by
-/// dropping attrs from it. A *selection* asks "what does this change do to these
-/// attrs?", so npb evaluates just those attrs on both trees and reports each one
-/// — including the ones the change turns out not to affect, which is a real
-/// answer to the question asked, and the two a whole-set diff can never show: an
-/// attr that exists on neither side (➖→➖, how a typo shows itself) and one that
-/// throws on both (⏩→⏩). Asking for both at once would be asking npb to subtract
-/// from a set it was told not to compute, so the CLI refuses it and this type
-/// can't represent it.
+/// A *delta* review asks "what did this change break?", and derives its attrs
+/// from the diff of two whole-set evals. A *selection* asks "what does this
+/// change do to _these_ attrs?", so npb evaluates just those on both trees and
+/// diffs them. Its value is **reach**: a whole-set walk only descends into
+/// attrsets marked `recurseForDerivations`, so plenty of real attrs — a
+/// `python311Packages.foo`, a `<pkg>.tests.<name>` — are in no changed set and
+/// can be reviewed no other way.
 ///
-/// A selection needs no whole-set eval at all, which is the point: on a cold
-/// cache it turns minutes of enumerating ~114k attrs into seconds of evaluating
-/// the handful you named. What it does *not* give up is the warm re-run — those
-/// resolutions are cached like any other pure eval fact (`store::sel_drv`), so
-/// re-running a report's reproduction command stays near-instant, with no nixpkgs
-/// import at all.
+/// A selection needs no whole-set eval at all, which is the other half of the
+/// point: on a cold cache it turns minutes of enumerating ~114k attrs into
+/// seconds of evaluating the handful you named. What it does *not* give up is
+/// the warm re-run — those resolutions are cached like any other pure eval fact
+/// (`store::sel_drv`), so re-running a report's reproduction command stays
+/// near-instant, with no nixpkgs import at all.
+///
+/// What it does *not* change is what a row means. The resolved attrs are diffed,
+/// so an attr identical on both sides is not a row, just as in a delta — a
+/// selection is a cheaper, wider way to _find_ the attrs a review covers, not a
+/// different reporting rule.
 ///
 /// **Attrs are matched exactly**, with no subtrees or globs, because nothing in
 /// npb's Rust reads structure out of an attr path — attrs are opaque keys here,
@@ -131,29 +131,17 @@ impl Profile {
 /// ambiguous anyway: the eval file keeps `nix-eval-jobs`' quoting, so a dotted
 /// *name* (`rubyPackages."http_parser.rb"`) and a dotted *path* look alike.
 ///
-/// [`Except`] runs once, over the diff, *before* the `tests` phase expands it —
-/// and that is what makes tests follow their package for free: the expansion is
-/// driven off whatever survives (`changed_names`), so a dropped package's tests
-/// are never enumerated (the expensive part) and a kept package's come along
-/// without the filter knowing what a test row is called. The cost of that
-/// simplicity is that `-P` can't drop an individual `tests` row, which doesn't
-/// exist yet when it runs.
-///
-/// Dropping an attr removes a *target*, never a dependency: a dropped package
-/// that some surviving target needs is still built by nix as part of that
-/// target's closure, and the observation it produces is keyed on its drvpath like
-/// any other (DESIGN §2), so it lands in the log all the same. A later run
-/// without the flag finds it already decided. Narrowing a review narrows a
-/// report; it doesn't discard knowledge.
-///
-/// [`Except`]: Coverage::Except
+/// Leaving an attr out removes a *target*, never a dependency: an unnamed package
+/// that some named target needs is still built by nix as part of that target's
+/// closure, and the observation it produces is keyed on its drvpath like any
+/// other (DESIGN §2), so it lands in the log all the same. A later run without
+/// the flag finds it already decided. Narrowing a review narrows a report; it
+/// doesn't discard knowledge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Coverage {
     /// The whole changed set: diff two whole-set evals.
     #[default]
     All,
-    /// The changed set minus these attrs (`-P`). Never empty.
-    Except(Vec<String>),
     /// Exactly these attrs, resolved on both trees (`-p`). Never empty.
     Only(Vec<String>),
 }
@@ -164,16 +152,7 @@ impl Coverage {
     pub fn only(&self) -> Option<&[String]> {
         match self {
             Coverage::Only(attrs) => Some(attrs),
-            _ => None,
-        }
-    }
-
-    /// Whether this changed-set attr survives — always true unless `-P` named it.
-    /// A selection filters nothing, because it never computes a delta to filter.
-    pub fn keeps(&self, attr: &str) -> bool {
-        match self {
-            Coverage::Except(attrs) => !attrs.iter().any(|a| a == attr),
-            _ => true,
+            Coverage::All => None,
         }
     }
 }
@@ -425,38 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn coverage_matches_attrs_exactly() {
-        // The default covers everything and drops nothing.
+    fn coverage_defaults_to_the_whole_delta() {
+        // The default covers the whole changed set and names nothing.
         assert_eq!(Coverage::default(), Coverage::All);
-        assert!(Coverage::All.keeps("git"));
         assert!(Coverage::All.only().is_none());
 
-        // `-P` drops exactly the attrs named: no prefix, no subtree, no reading
-        // of the `.`s in an attr path.
-        let skip = Coverage::Except(vec!["git".into(), "python313Packages.requests".into()]);
-        assert!(!skip.keeps("git"));
-        assert!(!skip.keeps("python313Packages.requests"));
-        assert!(skip.keeps("gitMinimal"));
-        assert!(skip.keeps("python313Packages.urllib3"));
-        // Naming a package set doesn't sweep it up — that would need attr-path
-        // structure the matcher deliberately doesn't read.
-        assert!(
-            Coverage::Except(vec!["python313Packages".into()]).keeps("python313Packages.requests")
+        // A selection carries exactly the attrs it was given, in order.
+        let only = Coverage::Only(vec!["git".into(), "python313Packages.requests".into()]);
+        assert_eq!(
+            only.only(),
+            Some(&["git".to_string(), "python313Packages.requests".to_string()][..])
         );
-        // A `tests` row is dropped with its package, not by naming it: the row
-        // doesn't exist when the filter runs (see `run_phases`).
-        assert!(skip.keeps("git.tests.withInstallCheck"));
-        // The eval file keeps nix-eval-jobs' quoting, so a dotted *name* is
-        // matched as it is stored — quotes and all.
-        let quoted = Coverage::Except(vec!["rubyPackages.\"http_parser.rb\"".into()]);
-        assert!(!quoted.keeps("rubyPackages.\"http_parser.rb\""));
-        assert!(quoted.keeps("rubyPackages.http_parser"));
-
-        // A selection names attrs to review; it filters no delta, since there
-        // isn't one.
-        let only = Coverage::Only(vec!["git".into()]);
-        assert_eq!(only.only(), Some(&["git".to_string()][..]));
-        assert!(only.keeps("anything"));
     }
 
     #[test]
