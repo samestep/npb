@@ -106,7 +106,6 @@ That command may not give you the same result if you run it yourself, but `npb`'
 - [Goals](#goals)
 - [Non-goals](#non-goals)
 - [Installation](#installation)
-  - [Temporary](#temporary)
 - [Usage](#usage)
   - [`-h`, `--help`](#-h---help)
   - [`-C`](#-c)
@@ -156,15 +155,11 @@ That command may not give you the same result if you run it yourself, but `npb`'
 
 ## Installation
 
-### Temporary
-
-This repository provides a [Nix flake](https://wiki.nixos.org/wiki/Flakes), so if you have flakes enabled, the quickest way to use it is via the [`nix shell`](https://nix.dev/manual/nix/2.34/command-ref/new-cli/nix3-env-shell.html) command:
+`npb` is in Nixpkgs, so you can run the following command to start a shell within your shell which has `npb` available on the `PATH`:
 
 ```sh
-nix shell github:samestep/npb
+nix-shell -p npb
 ```
-
-This starts a shell within your shell which has `npb` available on the `PATH`.
 
 ## Usage
 
