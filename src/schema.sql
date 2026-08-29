@@ -81,6 +81,32 @@ CREATE TABLE IF NOT EXISTS test_drv (
     PRIMARY KEY (key_id, pkg_attr, test_attr)
 ) STRICT, WITHOUT ROWID;
 
+-- The selector-resolution cache (DESIGN.md §4, §6): what an attr named with `-p`
+-- evaluates to at one `(tree, system)` key. A selector run evaluates only the
+-- attrs it was given, so it writes no eval file — and this is what keeps its
+-- *re-run* near-instant all the same, the property the eval files provide for a
+-- whole-set review. Sound for the same reason they are: a resolution is a pure
+-- function of `(tree, system, profile)`, and the profile rides in the
+-- `eval_key.system` value.
+--
+-- One row per attr *asked for*, holding the trichotomy the eval-file format
+-- carries too: a drv (stored stripped, `evalfile::strip_drv`); no drv with
+-- `threw` set, meaning it evaluated to an error under this profile (⏩); or no
+-- drv with `threw` clear, meaning the attr path isn't there at all (➖). So a
+-- *present row* means resolved, and an absent row means not yet asked — never
+-- "absent attr", which is a cached fact of its own.
+--
+-- Unlike `test_pkg`, this needs no completeness marker: every read is a lookup by
+-- exact attr, so nothing ever asks for "all attrs at this key" and a partial
+-- table is simply a partial cache rather than a truncated fact.
+CREATE TABLE IF NOT EXISTS sel_drv (
+    key_id   INTEGER NOT NULL REFERENCES eval_key (id),
+    attr     TEXT NOT NULL,
+    drv_path TEXT,
+    threw    INTEGER NOT NULL,
+    PRIMARY KEY (key_id, attr)
+) STRICT, WITHOUT ROWID;
+
 -- The patch-tree cache (DESIGN.md §8): maps a `--patch <A...B>` compare — its
 -- anchor commit and sha-pinned expression — to the head *tree* npb reconstructed
 -- by applying that compare's diff onto the anchor. It lets a *reproduction*

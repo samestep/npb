@@ -451,6 +451,35 @@ pub fn changed_tests(
     diff(&rows(base), &rows(head))
 }
 
+/// Pair two `test_attr → drv` maps into a row per test, *keeping* the ones whose
+/// drv is identical on both sides — [`changed_tests`] without the diff.
+///
+/// This is what a selection wants (DESIGN §6). `-p` replaces the step that finds
+/// the packages to review; the step that adds their `passthru.tests` still runs,
+/// so those tests are part of what was asked for, and "this test is unaffected"
+/// is an answer to that question rather than a non-event. A delta review keeps
+/// [`changed_tests`], where a row *is* a change and an unchanged test isn't one.
+pub fn paired_tests(
+    base: &std::collections::HashMap<String, String>,
+    head: &std::collections::HashMap<String, String>,
+) -> Vec<ChangedAttr> {
+    let mut attrs: Vec<&String> = base.keys().chain(head.keys()).collect();
+    attrs.sort_unstable();
+    attrs.dedup();
+    attrs
+        .into_iter()
+        .map(|attr| ChangedAttr {
+            attr: attr.clone(),
+            base_drv: base.get(attr).cloned(),
+            head_drv: head.get(attr).cloned(),
+            // Only tests that resolved to a drv are cached, so a side without a
+            // row is genuinely absent (➖) rather than a throw (⏩).
+            base_threw: false,
+            head_threw: false,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +723,38 @@ mod tests {
         // A missing file must error (through the in-band producer error).
         assert!(changed_set_files(&dir.join("nope.tsv.zst"), &hpath).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paired_tests_keeps_the_unchanged_rows() {
+        let m = |kv: &[(&str, &str)]| {
+            kv.iter()
+                .map(|(a, d)| (a.to_string(), format!("/nix/store/{d}.drv")))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let base = m(&[
+            ("pkg.tests.dropped", "d1"),
+            ("pkg.tests.same", "s1"),
+            ("pkg.tests.bumped", "b0"),
+        ]);
+        let head = m(&[
+            ("pkg.tests.added", "a1"),
+            ("pkg.tests.same", "s1"),
+            ("pkg.tests.bumped", "b1"),
+        ]);
+        // Every test in either side gets a row, sorted by attr — `same` included,
+        // which `changed_tests` drops. That row is the point: it says the test a
+        // selection asked about is unaffected.
+        let got = paired_tests(&base, &head);
+        let want = vec![
+            ca("pkg.tests.added", None, Some("a1"), false, false),
+            ca("pkg.tests.bumped", Some("b0"), Some("b1"), false, false),
+            ca("pkg.tests.dropped", Some("d1"), None, false, false),
+            ca("pkg.tests.same", Some("s1"), Some("s1"), false, false),
+        ];
+        assert_eq!(got, want);
+        // The diff over the same input keeps only the three that changed.
+        assert_eq!(changed_tests(&base, &head).len(), 3);
     }
 
     #[test]

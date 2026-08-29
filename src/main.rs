@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 
-use crate::model::{BuildPolicy, Profile, Rev};
+use crate::model::{BuildPolicy, Coverage, Profile, Rev};
 
 /// The npb source tree this binary was built from, as a GitHub URL: the tag of
 /// the release it was cut from, so a report and the binary that produced it name
@@ -79,6 +79,9 @@ struct Cli {
     /// Don't add passthru.tests
     #[arg(long)]
     no_tests: bool,
+    /// Every non-test package to build [default: all changes]
+    #[arg(short = 'p', long, value_name = "ATTR")]
+    package: Vec<String>,
     /// Enable allowUnsupportedSystem in Nixpkgs config
     #[arg(long)]
     allow_unsupported: bool,
@@ -830,14 +833,15 @@ enum HeadRepro {
 /// and the `--patch` flag), so npb does the git plumbing internally and the
 /// command calls no external binary. Only flags that change *what the report
 /// contains* are echoed (`--no-merge`, the profile's `--allow-*`, `--no-tests`,
-/// the systems); `--retry` and the eval-sizing knobs don't change the changeset,
-/// so they're omitted.
+/// each `-p` of a selection, the systems); `--retry` and the eval-sizing
+/// knobs don't change the changeset, so they're omitted.
 fn repro_command(
     base_sha: &str,
     head: &HeadRepro,
     no_merge: bool,
     profile: Profile,
     no_tests: bool,
+    coverage: &Coverage,
     systems: &[String],
 ) -> String {
     let mut flags = String::new();
@@ -855,6 +859,13 @@ fn repro_command(
     }
     if no_tests {
         flags.push_str(" --no-tests");
+    }
+    // A selection decides *what* the report covers, so a repro that omitted it
+    // would reproduce a different report (DESIGN §8).
+    if let Some(attrs) = coverage.only() {
+        for a in attrs {
+            flags.push_str(&format!(" -p {a}"));
+        }
     }
     for s in systems {
         flags.push_str(&format!(" -s {s}"));
@@ -902,6 +913,48 @@ fn changed_names(changed: &[evalfile::ChangedAttr]) -> (Vec<String>, Vec<String>
         names_on(|c| c.base_drv.is_some()),
         names_on(|c| c.head_drv.is_some()),
     )
+}
+
+/// Flatten both sides' `test_attr → (pkg_attr, drv)` maps to `test_attr → drv`,
+/// dropping any test whose derivation *is* the derivation of the package it
+/// hangs off — on both sides (DESIGN §6).
+///
+/// Such a test is that package under a second name: no new fact, since npb keys
+/// on drvpath (§2) and the package's own row already carries it, and the report
+/// would only print the pair as an alias (`pkg = pkg.tests.x`). It became
+/// reachable with `-p`: naming a `tests` attr directly puts a test derivation in
+/// the changed set, and the `tests` phase then enumerates *its* `passthru.tests`,
+/// which for the `overrideAttrs`-with-`doCheck` idiom resolve straight back to
+/// itself (`x.tests.pytest.tests.pytest`). A whole-set walk can't produce that,
+/// since it never descends into `passthru.tests`.
+///
+/// Both sides must match, so a test that shares one side's derivation with its
+/// package but not the other's is a real difference and stays — as does a test
+/// present on only one side.
+fn drop_self_tests(
+    bmap: &HashMap<String, (String, String)>,
+    hmap: &HashMap<String, (String, String)>,
+    changed: &[evalfile::ChangedAttr],
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let parents: HashMap<&str, &evalfile::ChangedAttr> =
+        changed.iter().map(|c| (c.attr.as_str(), c)).collect();
+    let is_alias = |test: &str| -> bool {
+        let Some((pkg, _)) = bmap.get(test).or_else(|| hmap.get(test)) else {
+            return false;
+        };
+        let Some(parent) = parents.get(pkg.as_str()) else {
+            return false;
+        };
+        let drv = |m: &HashMap<String, (String, String)>| m.get(test).map(|(_, d)| d.clone());
+        drv(bmap) == parent.base_drv && drv(hmap) == parent.head_drv
+    };
+    let flat = |m: &HashMap<String, (String, String)>| -> HashMap<String, String> {
+        m.iter()
+            .filter(|(test, _)| !is_alias(test))
+            .map(|(test, (_, drv))| (test.clone(), drv.clone()))
+            .collect()
+    };
+    (flat(bmap), flat(hmap))
 }
 
 /// Per-system state accumulated as each platform's eval lands (DESIGN §9). Its
@@ -993,6 +1046,103 @@ fn reveal_system_tests(
     Ok(())
 }
 
+/// A selector review's changed set: resolve every `-p` attr on both trees and
+/// pair the two sides into rows (DESIGN §6).
+///
+/// This is the whole difference between a selection and a delta. There is no
+/// whole-set eval and no diff — npb evaluates exactly the attrs it was told to
+/// review, so a cold selector run costs seconds rather than the minutes two
+/// ~114k-attr walks take. Resolutions are cached per `(tree, system, profile)`
+/// (`store::sel_drv`), so the re-run of a report's reproduction command resolves
+/// nothing and imports nothing, which is the property the eval files buy for a
+/// delta review.
+///
+/// Every named attr becomes a row, including the ones a diff would drop:
+/// identical drvs on both sides (the change doesn't affect it — a real answer to
+/// "what does this do to `git`?"), and nothing on either side (➖→➖, which is how
+/// a typo'd `-p` shows itself). Rows keep the order they were named in, deduped;
+/// the report sorts its own output anyway.
+#[allow(clippy::too_many_arguments)]
+fn selected_changed_sets(
+    repo: &std::path::Path,
+    base: &Rev,
+    head: &Rev,
+    systems: &[String],
+    profile: Profile,
+    attrs: &[String],
+    store: &mut store::Store,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<HashMap<String, Vec<evalfile::ChangedAttr>>> {
+    // Dedup, first-seen order: `-p git -p git` is one row, not two.
+    let mut wanted: Vec<String> = Vec::new();
+    for a in attrs {
+        if !wanted.contains(a) {
+            wanted.push(a.clone());
+        }
+    }
+
+    // Cache first, per side. A warm re-run finds everything here and asks the
+    // evaluator for nothing at all.
+    let sides: Vec<(&Rev, &String)> = systems
+        .iter()
+        .flat_map(|sys| [(base, sys), (head, sys)])
+        .collect();
+    let mut cached: Vec<HashMap<String, model::Resolved>> = Vec::new();
+    let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
+    for (rev, sys) in &sides {
+        let hits = store.resolved_attrs(&rev.tree, &profile.qualify(sys), &wanted)?;
+        let misses: Vec<String> = wanted
+            .iter()
+            .filter(|a| !hits.contains_key(*a))
+            .cloned()
+            .collect();
+        requests.push(((*rev).clone(), (*sys).clone(), misses));
+        cached.push(hits);
+    }
+
+    // Resolve the misses (nothing to do when every side was cached), then record
+    // them — including the ones that resolved to nothing, so a `-p` naming an attr
+    // that isn't there costs one evaluation ever, not one per run.
+    let fresh = eval::resolve_attrs(repo, &requests, profile, tree, handle)?;
+    for ((rev, sys, _), rows) in requests.iter().zip(&fresh) {
+        store.cache_resolutions(&rev.tree, &profile.qualify(sys), rows)?;
+    }
+
+    // Pair the sides back up per system, in `systems` order (two sides each, in
+    // the order they were pushed above).
+    let resolved: Vec<HashMap<String, model::Resolved>> = (0..sides.len())
+        .map(|n| {
+            let mut m = cached[n].clone();
+            m.extend(fresh[n].iter().cloned());
+            m
+        })
+        .collect();
+
+    let mut out = HashMap::new();
+    for (i, sys) in systems.iter().enumerate() {
+        let (b, h) = (&resolved[2 * i], &resolved[2 * i + 1]);
+        let rows: Vec<evalfile::ChangedAttr> = wanted
+            .iter()
+            .map(|attr| {
+                let get = |m: &HashMap<String, model::Resolved>| {
+                    m.get(attr).cloned().unwrap_or_else(model::Resolved::absent)
+                };
+                let (base, head) = (get(b), get(h));
+                evalfile::ChangedAttr {
+                    attr: attr.clone(),
+                    base_drv: base.drv_path,
+                    head_drv: head.drv_path,
+                    base_threw: base.threw,
+                    head_threw: head.threw,
+                }
+            })
+            .collect();
+        out.insert(sys.clone(), rows);
+    }
+    Ok(out)
+}
+
 /// The pre-build phases — everything that runs behind the one live progress tree
 /// (DESIGN §6, §9): evaluate both sides, diff to the changed set, expand
 /// `tests`, instantiate the `.drv`s the build will touch, and probe the cache.
@@ -1007,6 +1157,7 @@ fn run_phases(
     profile: Profile,
     policy: BuildPolicy,
     tests: bool,
+    coverage: &Coverage,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<(PerSystemChanged, Vec<build::Target>)> {
@@ -1057,13 +1208,42 @@ fn run_phases(
         }
     };
 
-    // Cold systems fire `process` as their eval lands; systems already cached
-    // when eval starts fire once `eval_two` has created the eval nodes (so `tests`
-    // still sorts below `evaluate`). The sweep then catches the fully-cached run,
-    // where `eval_two` creates no nodes and fires nothing at all.
-    eval::eval_two(repo, base, head, systems, profile, tree, handle, &process)?;
-    for sys in systems {
-        process(sys);
+    match coverage.only() {
+        // A delta review: evaluate both sides whole and diff them. Cold systems
+        // fire `process` as their eval lands; systems already cached when eval
+        // starts fire once `eval_two` has created the eval nodes (so `tests` still
+        // sorts below `evaluate`). The sweep then catches the fully-cached run,
+        // where `eval_two` creates no nodes and fires nothing at all.
+        None => {
+            eval::eval_two(repo, base, head, systems, profile, tree, handle, &process)?;
+            for sys in systems {
+                process(sys);
+            }
+        }
+        // A selection: resolve exactly the named attrs on both trees — no
+        // whole-set eval, no diff (DESIGN §6) — then reveal each system's `tests`
+        // the way the delta path does as its eval lands.
+        Some(attrs) => {
+            let mut acc = accum.lock().unwrap();
+            let changed = selected_changed_sets(
+                repo,
+                base,
+                head,
+                systems,
+                profile,
+                attrs,
+                &mut acc.store,
+                tree,
+                handle,
+            )?;
+            for sys in systems {
+                let rows = changed.get(sys).cloned().unwrap_or_default();
+                if tests {
+                    reveal_system_tests(&mut acc, tree, systems, base, head, profile, sys, &rows)?;
+                }
+                acc.changed.insert(sys.clone(), rows);
+            }
+        }
     }
 
     // Assemble the diffs in system order; surface any callback error.
@@ -1094,7 +1274,16 @@ fn run_phases(
             let key = profile.qualify(sys);
             let bmap = acc.store.tests_drvs_for(&base.tree, &key, &base_names)?;
             let hmap = acc.store.tests_drvs_for(&head.tree, &key, &head_names)?;
-            changed.extend(evalfile::changed_tests(&bmap, &hmap));
+            let (bmap, hmap) = drop_self_tests(&bmap, &hmap, changed);
+            // A delta reports changes, so an unchanged test isn't one. A
+            // selection reports the attrs it was given, and a named package's
+            // tests are given with it — "no regression here" is the answer it was
+            // asked for (DESIGN §6).
+            changed.extend(if coverage.only().is_some() {
+                evalfile::paired_tests(&bmap, &hmap)
+            } else {
+                evalfile::changed_tests(&bmap, &hmap)
+            });
         }
     }
 
@@ -1207,6 +1396,14 @@ fn run(cli: Cli) -> Result<()> {
         insecure: cli.allow_insecure,
     };
     let policy = BuildPolicy { retry: cli.retry };
+    // What this review covers (DESIGN §6): the whole changed set, or exactly the
+    // attrs `-p` named. The report's reproduction command echoes the flag
+    // (DESIGN §8), like every other report-shaping flag.
+    let coverage = if cli.package.is_empty() {
+        Coverage::All
+    } else {
+        Coverage::Only(cli.package)
+    };
     let repo = resolve_repo(cli.path)?;
 
     let systems = resolve_systems(cli.system);
@@ -1312,7 +1509,7 @@ fn run(cli: Cli) -> Result<()> {
             ensure_distinct_trees(&base, &head)?;
 
             let (per_system_changed, targets) = run_phases(
-                &repo, &base, &head, &systems, profile, policy, tests, &tree, handle,
+                &repo, &base, &head, &systems, profile, policy, tests, &coverage, &tree, handle,
             )?;
             Ok((
                 base,
@@ -1445,6 +1642,7 @@ fn run(cli: Cli) -> Result<()> {
         cli.no_merge,
         profile,
         !tests,
+        &coverage,
         &systems,
     );
     print!(
@@ -1952,6 +2150,7 @@ mod tests {
             false,
             strict,
             false,
+            &Coverage::All,
             &["x86_64-linux".into()],
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -s x86_64-linux");
@@ -1962,6 +2161,7 @@ mod tests {
             true,
             all,
             true,
+            &Coverage::All,
             &["a".into(), "b".into()],
         );
         assert_eq!(
@@ -1980,6 +2180,7 @@ mod tests {
             false,
             strict,
             false,
+            &Coverage::All,
             &["sys".into()],
         );
         assert_eq!(cmd, "npb --base m1 --head fork --patch fork...m2 -s sys");
@@ -1994,12 +2195,73 @@ mod tests {
             false,
             strict,
             false,
+            &Coverage::All,
             &["sys".into()],
         );
         assert_eq!(
             cmd,
             "npb --base b --head h --patch /dev/stdin -s sys <<'PATCH'\n--- a\n+++ b\nPATCH"
         );
+
+        // A selection decides what the report covers, so it's echoed — one token
+        // per attr, in the order they were named.
+        let cmd = repro_command(
+            "aaa",
+            &HeadRepro::Commit("bbb".into()),
+            false,
+            strict,
+            false,
+            &Coverage::Only(vec!["git".into(), "hello".into()]),
+            &["sys".into()],
+        );
+        assert_eq!(cmd, "npb --base aaa --head bbb -p git -p hello -s sys");
+    }
+
+    #[test]
+    fn drop_self_tests_removes_a_test_that_is_its_own_package() {
+        let m = |rows: &[(&str, &str, &str)]| {
+            rows.iter()
+                .map(|(t, p, d)| (t.to_string(), (p.to_string(), d.to_string())))
+                .collect::<HashMap<String, (String, String)>>()
+        };
+        // The `-p <a test attr>` case: the named row is a test derivation, and
+        // the `tests` phase enumerates its own `passthru.tests` right back to it.
+        let changed = vec![ca(
+            "p.tests.pytest",
+            Some("/d/b"),
+            Some("/d/h"),
+            false,
+            false,
+        )];
+        let bmap = m(&[
+            ("p.tests.pytest.tests.pytest", "p.tests.pytest", "/d/b"),
+            ("p.tests.pytest.tests.other", "p.tests.pytest", "/d/other-b"),
+        ]);
+        let hmap = m(&[
+            ("p.tests.pytest.tests.pytest", "p.tests.pytest", "/d/h"),
+            ("p.tests.pytest.tests.other", "p.tests.pytest", "/d/other-h"),
+        ]);
+        let (b, h) = drop_self_tests(&bmap, &hmap, &changed);
+        // The self-alias goes; a genuinely different test of the same attr stays.
+        let keys = |m: &HashMap<String, String>| m.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&b), ["p.tests.pytest.tests.other"]);
+        assert_eq!(keys(&h), ["p.tests.pytest.tests.other"]);
+
+        // Matching on only one side is a real difference, so it stays.
+        let one_sided = m(&[("p.tests.pytest.tests.pytest", "p.tests.pytest", "/d/b")]);
+        let (b, _) = drop_self_tests(&one_sided, &HashMap::new(), &changed);
+        assert!(b.contains_key("p.tests.pytest.tests.pytest"));
+
+        // An ordinary package's tests are untouched, even when another changed
+        // attr happens to share the derivation (that's an alias worth printing).
+        let changed = vec![
+            ca("pkg", Some("/d/p0"), Some("/d/p1"), false, false),
+            ca("other", Some("/d/t0"), Some("/d/t1"), false, false),
+        ];
+        let bmap = m(&[("pkg.tests.x", "pkg", "/d/t0")]);
+        let hmap = m(&[("pkg.tests.x", "pkg", "/d/t1")]);
+        let (b, h) = drop_self_tests(&bmap, &hmap, &changed);
+        assert!(b.contains_key("pkg.tests.x") && h.contains_key("pkg.tests.x"));
     }
 
     #[test]

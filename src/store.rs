@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::evalfile::{restore_drv, strip_drv};
-use crate::model::{Observation, Outcome, TestJob};
+use crate::model::{Observation, Outcome, Resolved, TestJob};
 
 // npb is public and writes no migration code (DESIGN.md §1, CLAUDE.md): this
 // schema evolves only *additively* — a new `CREATE TABLE IF NOT EXISTS`, or a
@@ -329,15 +329,17 @@ impl Store {
         Ok(())
     }
 
-    /// All cached test drvs for `pkgs` at this key, as `test_attr → drv_path`
-    /// (only tests that resolved to a derivation), with drv paths restored to
-    /// their full `/nix/store/…​.drv` form. One query for the whole set.
+    /// All cached test drvs for `pkgs` at this key, as
+    /// `test_attr → (pkg_attr, drv_path)` (only tests that resolved to a
+    /// derivation), with drv paths restored to their full `/nix/store/…​.drv`
+    /// form. One query for the whole set. The package a test hangs off rides
+    /// along so the caller can spot a test that *is* its package (`run_phases`).
     pub fn tests_drvs_for(
         &self,
         tree: &str,
         system: &str,
         pkgs: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, (String, String)>> {
         let mut out = std::collections::HashMap::new();
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(out);
@@ -347,7 +349,7 @@ impl Store {
         for chunk in pkgs.chunks(IN_CHUNK) {
             let placeholders = placeholders(chunk.len());
             let sql = format!(
-                "SELECT test_attr, drv_path FROM test_drv \
+                "SELECT test_attr, pkg_attr, drv_path FROM test_drv \
                  WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -355,35 +357,124 @@ impl Store {
                 std::iter::once(key_id.to_string()).chain(chunk.iter().cloned()),
             );
             let rows = stmt.query_map(params, |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                let (test_attr, stored) = row?;
+                let (test_attr, pkg_attr, stored) = row?;
                 let drv = restore_drv(Some(&stored)).expect("Some maps to Some");
-                out.insert(test_attr, drv);
+                out.insert(test_attr, (pkg_attr, drv));
             }
         }
         Ok(out)
     }
 
+    // --- the selector-resolution cache (DESIGN.md §4, §6) ------------------
+
+    /// The cached resolutions for `attrs` at this key, as `attr → resolution`.
+    /// A *missing* entry means the attr has never been resolved here; an entry
+    /// present with no drv is itself a cached fact — it threw (⏩) or the attr
+    /// path isn't there (➖). Drv paths come back in full `/nix/store/…​.drv` form.
+    pub fn resolved_attrs(
+        &self,
+        tree: &str,
+        system: &str,
+        attrs: &[String],
+    ) -> Result<std::collections::HashMap<String, Resolved>> {
+        let mut out = std::collections::HashMap::new();
+        let Some(key_id) = self.key_id(tree, system)? else {
+            return Ok(out); // key never recorded ⇒ nothing cached
+        };
+        // Chunked under SQLite's bound-parameter cap (see `IN_CHUNK`).
+        for chunk in attrs.chunks(IN_CHUNK) {
+            let placeholders = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT attr, drv_path, threw FROM sel_drv \
+                 WHERE key_id = ?1 AND attr IN ({placeholders})",
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(
+                std::iter::once(key_id.to_string()).chain(chunk.iter().cloned()),
+            );
+            let rows = stmt.query_map(params, |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (attr, stored, threw) = row?;
+                out.insert(
+                    attr,
+                    Resolved {
+                        drv_path: restore_drv(stored.as_deref()),
+                        threw: threw != 0,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record a completed resolution of `resolutions` at this key, in one
+    /// transaction — including the ones that resolved to nothing, which are facts
+    /// worth caching too (a typo'd attr shouldn't cost an eval every run).
+    /// Idempotent (`INSERT OR REPLACE`).
+    pub fn cache_resolutions(
+        &mut self,
+        tree: &str,
+        system: &str,
+        resolutions: &[(String, Resolved)],
+    ) -> Result<()> {
+        if resolutions.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let key_id = Self::key_id_get_or_create(&tx, tree, system)?;
+        for (attr, r) in resolutions {
+            tx.execute(
+                "INSERT OR REPLACE INTO sel_drv (key_id, attr, drv_path, threw) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    key_id,
+                    attr,
+                    r.drv_path.as_deref().map(strip_drv),
+                    i64::from(r.threw)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop the caches for one `(tree, system)` — its `eval_key` row and the
-    /// `test_pkg`/`test_drv` rows that reference it — when its eval file is
-    /// evicted (`--clean`, DESIGN.md §4). Returns the number of `test_drv` rows
+    /// `test_pkg`/`test_drv`/`sel_drv` rows that reference it — when its eval file
+    /// is evicted (`--clean`, DESIGN.md §4). Returns the number of `test_drv` rows
     /// removed (the bulk); a no-op if the key was never recorded. The caller
     /// [`Store::vacuum`]s once after a batch of these to return the pages.
-    pub fn purge_tests(&mut self, tree: &str, system: &str) -> Result<usize> {
+    ///
+    /// Note what this *doesn't* reach: a selector run (`-p`) writes no eval file,
+    /// so its key has nothing for `--clean` to evict and its rows live on. That's
+    /// deliberate — `--clean`'s budget is over the eval-file corpus, and a
+    /// selector key isn't part of it (DESIGN §4) — not an oversight.
+    pub fn purge_key(&mut self, tree: &str, system: &str) -> Result<usize> {
         let Some(key_id) = self.key_id(tree, system)? else {
             return Ok(0);
         };
         let tx = self.conn.transaction()?;
         let drvs = tx.execute("DELETE FROM test_drv WHERE key_id = ?1", [key_id])?;
         tx.execute("DELETE FROM test_pkg WHERE key_id = ?1", [key_id])?;
+        tx.execute("DELETE FROM sel_drv WHERE key_id = ?1", [key_id])?;
         tx.execute("DELETE FROM eval_key WHERE id = ?1", [key_id])?;
         tx.commit()?;
         Ok(drvs)
     }
 
-    /// Rebuild the database file to reclaim the pages freed by [`Store::purge_tests`]
+    /// Rebuild the database file to reclaim the pages freed by [`Store::purge_key`]
     /// (a `DELETE` only moves them to the freelist). Run once after an eviction batch.
     pub fn vacuum(&self) -> Result<()> {
         self.conn.execute_batch("VACUUM").context("vacuuming")?;
@@ -584,16 +675,17 @@ mod tests {
             .unwrap();
         assert!(done.contains("hello") && done.contains("ripgrep") && !done.contains("curl"));
 
-        // hello resolves to its two drv'd tests (the errored one is not stored).
+        // hello resolves to its two drv'd tests (the errored one is not stored),
+        // each paired with the package it hangs off.
         let hd = s.tests_drvs_for(c, sys, &pkgs(&["hello"])).unwrap();
         assert_eq!(hd.len(), 2);
         assert_eq!(
             hd.get("hello.tests.run"),
-            Some(&"/nix/store/a.drv".to_string())
+            Some(&("hello".to_string(), "/nix/store/a.drv".to_string()))
         );
         assert_eq!(
             hd.get("hello.tests.version"),
-            Some(&"/nix/store/b.drv".to_string())
+            Some(&("hello".to_string(), "/nix/store/b.drv".to_string()))
         );
         // ripgrep is cached-done but has no test drvs.
         assert!(
@@ -612,7 +704,62 @@ mod tests {
     }
 
     #[test]
-    fn purge_tests_drops_one_key_only() {
+    fn resolutions_round_trip_the_trichotomy() {
+        let dir = std::env::temp_dir().join(format!("npb-sel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
+        let sys = "---/aarch64-linux";
+        let want = |attr: &str, drv: Option<&str>, threw: bool| {
+            (
+                attr.to_string(),
+                Resolved {
+                    drv_path: drv.map(str::to_string),
+                    threw,
+                },
+            )
+        };
+        let rows = vec![
+            want("git", Some("/nix/store/aaa-git.drv"), false),
+            // Present but throws under this profile (⏩)...
+            want("broken", None, true),
+            // ...versus no such attr path at all (➖). Both are cached facts, so
+            // neither costs an evaluation again.
+            want("typo", None, false),
+        ];
+        s.cache_resolutions("treeA", sys, &rows).unwrap();
+
+        let asked: Vec<String> = ["git", "broken", "typo", "never-asked"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let got = s.resolved_attrs("treeA", sys, &asked).unwrap();
+        // Stored drvs come back with their `/nix/store/….drv` affixes restored.
+        assert_eq!(
+            got.get("git").unwrap().drv_path.as_deref(),
+            Some("/nix/store/aaa-git.drv")
+        );
+        assert_eq!(got.get("broken").unwrap(), &rows[1].1);
+        assert_eq!(got.get("typo").unwrap(), &rows[2].1);
+        // An attr never resolved has no entry — distinct from one resolved to
+        // nothing, which is why a missing row can't mean "absent".
+        assert!(!got.contains_key("never-asked"));
+
+        // Keys don't leak across trees or profile-qualified systems.
+        assert!(s.resolved_attrs("treeB", sys, &asked).unwrap().is_empty());
+        assert!(
+            s.resolved_attrs("treeA", "ubi/aarch64-linux", &asked)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Evicting the key takes the resolutions with it (`--clean` lockstep).
+        s.purge_key("treeA", sys).unwrap();
+        assert!(s.resolved_attrs("treeA", sys, &asked).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_key_drops_one_key_only() {
         let dir = std::env::temp_dir().join(format!("npb-purge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut s = Store::open(&dir.join("npb.sqlite")).unwrap();
@@ -641,7 +788,7 @@ mod tests {
         .unwrap();
 
         // Evicting treeA removes exactly its rows (1 test_drv) and leaves treeB.
-        assert_eq!(s.purge_tests("treeA", sys).unwrap(), 1);
+        assert_eq!(s.purge_key("treeA", sys).unwrap(), 1);
         assert!(
             s.tests_cached_pkgs("treeA", sys, &pkgs(&["hello"]))
                 .unwrap()
@@ -665,7 +812,7 @@ mod tests {
         );
 
         // Purging an unknown key is a no-op, and VACUUM after a batch is fine.
-        assert_eq!(s.purge_tests("treeA", sys).unwrap(), 0);
+        assert_eq!(s.purge_key("treeA", sys).unwrap(), 0);
         s.vacuum().unwrap();
 
         let _ = fs::remove_dir_all(&dir);

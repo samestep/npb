@@ -7,9 +7,11 @@
 //! The last-*used* time is the file's mtime, which `eval::eval_pairs` re-stamps
 //! on every cache hit (`evalfile::touch_eval`) so a reused base eval stays warm.
 //!
-//! Evicting an eval file also purges that `(tree, system)`'s `tests` rows
-//! (`store::Store::purge_tests`): the tests cache is keyed on the same tree, so
-//! the two travel together and the DB stays proportional to the eval corpus.
+//! Evicting an eval file also purges that `(tree, system)`'s cached rows
+//! (`store::Store::purge_key` — `tests` and selector resolutions alike): both are
+//! keyed on the same tree, so they travel with it and the DB stays proportional
+//! to the eval corpus. A selector run (`-p`) writes no eval file, so its key is
+//! not part of that corpus and nothing here evicts it (DESIGN §4).
 //! The append-only observation log is left untouched — it's keyed on drvpath (no
 //! tree to evict by), tiny, and the one thing expensive to re-derive (it
 //! remembers *failures*, DESIGN.md §5).
@@ -243,7 +245,7 @@ fn gather(root: &std::path::Path) -> Result<Vec<Eval>> {
     Ok(out)
 }
 
-/// Evict eval files per `spec`, purge each evicted `(tree, system)`'s `tests`
+/// Evict eval files per `spec`, purge each evicted `(tree, system)`'s cached
 /// rows, and vacuum the DB once. This is the whole `--clean` action — it reviews
 /// nothing. It first prints exactly what it *would* remove and asks for
 /// confirmation on stdin, deleting only on a yes. Nothing is touched until confirmed.
@@ -284,7 +286,7 @@ pub fn clean(spec: &CleanSpec) -> Result<()> {
     for &i in &victims {
         let f = &files[i];
         fs::remove_file(&f.path).with_context(|| format!("removing {}", f.path.display()))?;
-        rows += store.purge_tests(&f.tree, &f.system)?;
+        rows += store.purge_key(&f.tree, &f.system)?;
     }
     store.vacuum()?;
 

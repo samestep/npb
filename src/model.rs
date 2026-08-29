@@ -100,6 +100,91 @@ impl Profile {
     }
 }
 
+/// What a review covers: the whole changed set, or exactly the attrs
+/// `-p`/`--package` named (DESIGN §6).
+///
+/// A *delta* review asks "what did this change break?", and derives its attrs
+/// from the diff of two whole-set evals. A *selection* asks "what does this
+/// change do to _these_ attrs?", so npb evaluates just those on both trees and
+/// diffs them. Its value is **reach**: a whole-set walk only descends into
+/// attrsets marked `recurseForDerivations`, so plenty of real attrs — a
+/// `python311Packages.foo`, a `<pkg>.tests.<name>` — are in no changed set and
+/// can be reviewed no other way.
+///
+/// A selection needs no whole-set eval at all, which is the other half of the
+/// point: on a cold cache it turns minutes of enumerating ~114k attrs into
+/// seconds of evaluating the handful you named. What it does *not* give up is
+/// the warm re-run — those resolutions are cached like any other pure eval fact
+/// (`store::sel_drv`), so re-running a report's reproduction command stays
+/// near-instant, with no nixpkgs import at all.
+///
+/// It replaces exactly one step, and nothing downstream. npb's pipeline is: pick
+/// the attrs to review, add their `passthru.tests` unless `--no-tests`, build,
+/// report. `-p` replaces the *first* step — the whole-set diff that would
+/// otherwise pick them — the way `--head` replaces the working-tree guess. So a
+/// named package's tests come along exactly as a changed package's would, and
+/// every named attr is reported whether or not the change touches it: "nothing
+/// here regressed" is the answer the flag asked for, and it is the one a diff
+/// cannot give. That makes `⏩→⏩` and `➖→➖` reachable in a selection (§8), the
+/// latter being how a misspelled attr shows itself.
+///
+/// **Attrs are matched exactly**, with no subtrees or globs, because nothing in
+/// npb's Rust reads structure out of an attr path — attrs are opaque keys here,
+/// and where structure is needed it comes from the evaluator, as `nix-eval-jobs`'
+/// pre-split `attrPath` ([`TestJob`]) or a `lib.attrByPath (lib.splitString ".")`
+/// inside a generated expression. The string a matcher would have to parse is
+/// ambiguous anyway: the eval file keeps `nix-eval-jobs`' quoting, so a dotted
+/// *name* (`rubyPackages."http_parser.rb"`) and a dotted *path* look alike.
+///
+/// Leaving an attr out removes a *target*, never a dependency: an unnamed package
+/// that some named target needs is still built by nix as part of that target's
+/// closure, and the observation it produces is keyed on its drvpath like any
+/// other (DESIGN §2), so it lands in the log all the same. A later run without
+/// the flag finds it already decided. Narrowing a review narrows a report; it
+/// doesn't discard knowledge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Coverage {
+    /// The whole changed set: diff two whole-set evals.
+    #[default]
+    All,
+    /// Exactly these attrs, resolved on both trees (`-p`). Never empty.
+    Only(Vec<String>),
+}
+
+impl Coverage {
+    /// The attrs a selection named, or `None` for a delta review. This is the
+    /// one question that changes which phases run at all (DESIGN §6).
+    pub fn only(&self) -> Option<&[String]> {
+        match self {
+            Coverage::Only(attrs) => Some(attrs),
+            Coverage::All => None,
+        }
+    }
+}
+
+/// What one attr named with `-p` evaluates to at one `(tree, system, profile)`.
+///
+/// A pure fact, cached in `store::sel_drv` — which is what keeps a selector
+/// review's re-run instant without an eval file (DESIGN §4). It carries the same
+/// trichotomy the eval-file format does: a drv; no drv but `threw`, meaning it is
+/// broken/unsupported/insecure under the profile or forces something that is
+/// (⏩); or no drv and not `threw`, meaning the attr path isn't there at all (➖).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub drv_path: Option<String>,
+    pub threw: bool,
+}
+
+impl Resolved {
+    /// The `➖` case: nothing at that attr path on this tree.
+    pub fn absent() -> Self {
+        Self {
+            drv_path: None,
+            threw: false,
+        }
+    }
+}
+
 /// Result of evaluating one attribute on one platform at one commit under a
 /// given [`Profile`].
 ///
@@ -321,5 +406,32 @@ mod tests {
         // The storage key prefixes the system with the token.
         assert_eq!(strict.qualify("x86_64-linux"), "---/x86_64-linux");
         assert_eq!(all.qualify("aarch64-darwin"), "ubi/aarch64-darwin");
+    }
+
+    #[test]
+    fn coverage_defaults_to_the_whole_delta() {
+        // The default covers the whole changed set and names nothing.
+        assert_eq!(Coverage::default(), Coverage::All);
+        assert!(Coverage::All.only().is_none());
+
+        // A selection carries exactly the attrs it was given, in order.
+        let only = Coverage::Only(vec!["git".into(), "python313Packages.requests".into()]);
+        assert_eq!(
+            only.only(),
+            Some(&["git".to_string(), "python313Packages.requests".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn resolved_distinguishes_absent_from_threw() {
+        // The trichotomy the report needs: a drv, ⏩ threw, ➖ absent.
+        let absent = Resolved::absent();
+        assert_eq!(absent.drv_path, None);
+        assert!(!absent.threw);
+        let threw = Resolved {
+            drv_path: None,
+            threw: true,
+        };
+        assert_ne!(absent, threw);
     }
 }

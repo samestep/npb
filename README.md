@@ -115,6 +115,7 @@ That command may not give you the same result if you run it yourself, but `npb`'
   - [`--patch`](#--patch)
   - [`--no-merge`](#--no-merge)
   - [`--no-tests`](#--no-tests)
+  - [`-p`, `--package`](#-p---package)
   - [`--allow-unsupported`](#--allow-unsupported)
   - [`--allow-broken`](#--allow-broken)
   - [`--allow-insecure`](#--allow-insecure)
@@ -243,6 +244,14 @@ By default, `npb` includes all `passthru.tests` for packages that changed betwee
 
 ```sh
 npb --no-tests
+```
+
+### `-p`, `--package`
+
+By default, `npb` determines the set of non-test packages by finding all changes. To provide a custom set of packages instead:
+
+```sh
+npb -ppython3{,{11..15}}Packages.dirty-equals
 ```
 
 ### `--allow-unsupported`

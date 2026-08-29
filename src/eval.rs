@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::evalfile::{eval_path, write_eval};
 use crate::live;
-use crate::model::{AttrEval, Profile, Rev, TestJob};
+use crate::model::{AttrEval, Profile, Resolved, Rev, TestJob};
 
 /// The nixpkgs `config` attrset for a [`Profile`] (DESIGN.md §6). npb evaluates
 /// under the profile the user means — strict by default — so a
@@ -745,6 +745,164 @@ fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &
          (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
         build_expr(repo, rev, system, config)
     )
+}
+
+/// Which of [`resolve_attrs`]' requests get a node in the progress tree: the ones
+/// with something left to resolve.
+///
+/// A side whose attrs are all cached has no items, hence no shard — and a group
+/// with no shards is never marked running or done, so it would sit blue at
+/// `0 / 0` for the whole run while its phase line showed yellow, since the parent
+/// rollup reads a waiting child as "still running" (`live::eff_state`). Both
+/// sibling phases already avoid this: `instantiate_prepare` drops its empty
+/// requests, and `reveal_system_tests` never creates the leaf at all. The
+/// returned indices map a group back to its request.
+fn live_requests(requests: &[(Rev, String, Vec<String>)]) -> Vec<usize> {
+    requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, attrs))| !attrs.is_empty())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Resolve the attrs a selector review named (`-p`) to their drvs at each
+/// `(tree, system)`, through the same shard scheduler as every other targeted
+/// eval (DESIGN §6). `requests` is `(rev, system, attrs)` — callers pass only the
+/// attrs not already cached (`store::sel_drv`), so a warm re-run calls this with
+/// nothing and does no work at all, which is what keeps a selector report's
+/// reproduction command instant.
+///
+/// Returns one [`Resolved`] per *requested* attr, in the request's order, filling
+/// in the attrs `nix-eval-jobs` said nothing about: a `lib.attrByPath` miss
+/// evaluates to `null`, which yields no job line, and that silence is exactly the
+/// `➖ absent` fact (a typo'd `-p`, or a real attr path that isn't there on this
+/// side). An attr that *threw* does produce a line — with an `error` and no
+/// `drvPath` — so ⏩ and ➖ stay distinct, as they are in the eval-file format.
+///
+/// One shard per request, never sub-sliced up front, exactly like
+/// [`eval_tests`]/[`instantiate_execute`]: the cost is the per-key nixpkgs
+/// import, so splitting a handful of attrs across shards would only re-pay it.
+///
+/// **A named attr must resolve to a derivation, not a subtree.** `nix-eval-jobs`
+/// recurses into an attrset marked `recurseForDerivations`, so `-p
+/// python313Packages` would quietly become ~11k rows; such a row comes back with
+/// a multi-element `attrPath` (`["python313Packages", "APScheduler"]`) whose
+/// first element is the attr that was asked for, so it is detected without
+/// parsing anything, and refused. Naming a whole set is a plausible thing to
+/// want, but it is a different feature with different costs.
+pub fn resolve_attrs(
+    repo: &Path,
+    requests: &[(Rev, String, Vec<String>)],
+    profile: Profile,
+    tree: &live::Tree,
+    handle: live::LiveHandle<'_>,
+) -> Result<Vec<Vec<(String, Resolved)>>> {
+    let live = live_requests(requests);
+    if live.is_empty() {
+        return Ok(requests.iter().map(|_| Vec::new()).collect());
+    }
+    // Light workers (no `.drv` writes, a handful of attrs), so the full-set eval's
+    // per-slot budget fits — unlike `tests`, this never forces a `nixosTest`.
+    let slots = default_slots(SLOT_MEM_MB);
+    let groups: Vec<(String, String)> = live
+        .iter()
+        .map(|&i| (requests[i].1.clone(), requests[i].0.display.clone()))
+        .collect();
+    let nodes = add_phase(tree, "resolve", &groups, Leaf::Count);
+    let labels: Vec<String> = live
+        .iter()
+        .map(|&i| format!("{} {}", requests[i].0.display, requests[i].1))
+        .collect();
+    let items: Vec<Vec<String>> = live.iter().map(|&i| requests[i].2.clone()).collect();
+    let meta: Vec<(&Rev, &str)> = live
+        .iter()
+        .map(|&i| (&requests[i].0, requests[i].1.as_str()))
+        .collect();
+    let shard_size = items.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let results: Vec<Mutex<Vec<(String, Resolved)>>> =
+        live.iter().map(|_| Mutex::new(Vec::new())).collect();
+
+    run_shards(
+        "resolve",
+        nodes,
+        labels,
+        items,
+        shard_size,
+        slots,
+        // One streamed job per requested attr — except the absent ones, which
+        // stream nothing, so the count can legitimately stop short of the total.
+        true,
+        handle,
+        |gi, label, attrs, on_item| {
+            let (rev, system) = meta[gi];
+            let expr = select_expr(repo, &rev.commit, system, attrs, &profile_config(profile));
+            let rows = stream_jobs(
+                &expr,
+                1,
+                DEFAULT_WORKER_MEM_MB,
+                false,
+                label,
+                |raw| raw,
+                || on_item(1),
+            )?;
+            rows.into_iter()
+                .map(|raw| {
+                    // The wrapper attrset's name *is* the attr that was asked for,
+                    // so element 0 identifies the request even when the attr path
+                    // it names contains dots. More than one element means
+                    // nix-eval-jobs recursed into a set (above).
+                    let asked = raw.attr_path.first().cloned().unwrap_or_default();
+                    if raw.attr_path.len() > 1 {
+                        bail!(
+                            "-p {asked} names a package set, not a package: it contains \
+                             {} (and others). Name the packages you want reviewed.",
+                            raw.attr_path.join(".")
+                        );
+                    }
+                    let threw = raw.drv_path.is_none();
+                    Ok((
+                        asked,
+                        Resolved {
+                            drv_path: raw.drv_path,
+                            threw,
+                        },
+                    ))
+                })
+                .collect()
+        },
+        |gi, rows| {
+            results[gi].lock().unwrap().extend(rows);
+            Ok(())
+        },
+        // No salvage. The rows a partial pass streamed are individually true, but
+        // *absence* is only meaningful for a stream that ran to completion — a
+        // truncated one is indistinguishable from "that attr isn't there" — so the
+        // shard is re-run whole rather than concluding ➖ from a dead worker.
+        None,
+    )?;
+
+    // Back to one entry per request, in the caller's order: a side that had
+    // nothing to resolve contributes nothing (its attrs were already cached).
+    let mut resolved: Vec<HashMap<String, Resolved>> =
+        requests.iter().map(|_| HashMap::new()).collect();
+    for (&i, rows) in live.iter().zip(results) {
+        resolved[i] = rows.into_inner().unwrap().into_iter().collect();
+    }
+    // Fill in the attrs that streamed nothing: silence means absent.
+    Ok(requests
+        .iter()
+        .zip(resolved)
+        .map(|((_, _, asked), by_attr)| {
+            asked
+                .iter()
+                .map(|a| {
+                    let r = by_attr.get(a).cloned().unwrap_or_else(Resolved::absent);
+                    (a.clone(), r)
+                })
+                .collect()
+        })
+        .collect())
 }
 
 /// A prepared instantiate: its (blue) tree nodes and the non-empty requests they
@@ -1594,5 +1752,42 @@ mod tests {
         assert!(e.contains("builtins.listToAttrs"));
         assert!(e.contains(r#""hello" "#));
         assert!(e.contains(r#""with\"quote" "#));
+    }
+
+    #[test]
+    fn only_sides_with_work_get_a_resolve_node() {
+        let rev = |label: &str| Rev {
+            tree: format!("tree-{label}"),
+            commit: format!("commit-{label}"),
+            label: label.into(),
+            display: label.into(),
+        };
+        let req = |label: &str, system: &str, attrs: &[&str]| {
+            (
+                rev(label),
+                system.to_string(),
+                attrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        // A system whose attrs were all cached (both sides empty) contributes no
+        // group at all — otherwise its leaves would sit blue at `0 / 0` forever
+        // and drag the phase line to yellow after everything finished.
+        let requests = vec![
+            req("base", "x86_64-linux", &["git"]),
+            req("head", "x86_64-linux", &["git"]),
+            req("base", "aarch64-linux", &[]),
+            req("head", "aarch64-linux", &[]),
+            // ...and a system cached on one side only keeps the other side.
+            req("base", "aarch64-darwin", &[]),
+            req("head", "aarch64-darwin", &["git"]),
+        ];
+        assert_eq!(live_requests(&requests), vec![0, 1, 5]);
+
+        // Nothing to do anywhere: no phase, which `resolve_attrs` short-circuits on.
+        let cached = vec![
+            req("base", "x86_64-linux", &[]),
+            req("head", "x86_64-linux", &[]),
+        ];
+        assert!(live_requests(&cached).is_empty());
     }
 }
