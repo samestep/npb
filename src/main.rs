@@ -79,7 +79,7 @@ struct Cli {
     /// Don't add passthru.tests
     #[arg(long)]
     no_tests: bool,
-    /// TODO(samestep): write the `--help` text for this flag
+    /// Every non-test package to build [default: all changes]
     #[arg(short = 'p', long, value_name = "ATTR")]
     package: Vec<String>,
     /// Enable allowUnsupportedSystem in Nixpkgs config

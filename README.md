@@ -253,10 +253,10 @@ npb --no-tests
 
 ### `-p`, `--package`
 
-TODO(samestep): write this section. It documents `-p`/`--package`, which reviews only the attributes named instead of everything the change affects: `npb` evaluates just those attributes on both sides and reports each one. Worth mentioning, since it's the framing that makes the rest follow: this replaces the step where `npb` works out which packages to review, and nothing else — so the `passthru.tests` of a named package are still included (unless `--no-tests`), just as they would be for a package `npb` picked itself. Every attribute named gets reported, including ones the change turns out not to affect, since confirming that nothing regressed is usually why you named it; an attribute that doesn't exist on either side is reported as `➖ → ➖`, which is how a typo shows up. Attribute names are matched exactly, and must name a package rather than a package set, so `-p python3Packages.dirty-equals` works but `-p python313Packages` is refused. Also worth mentioning, because it is the reason to reach for this on a big rebuild: naming attributes means `npb` does not have to evaluate all of Nixpkgs on both sides, so a first run takes seconds rather than minutes — and it can reach attributes that evaluating all of Nixpkgs never reaches, like `python311Packages.dirty-equals`, whose set Nixpkgs doesn't mark for recursion, or an individual test like `python313Packages.pydantic-core.tests.pytest`.
+By default, `npb` determines the set of non-test packages by finding all changes. To provide a custom set of packages instead:
 
 ```sh
-npb -p python3Packages.dirty-equals -p python313Packages.dirty-equals
+npb -ppython3{,{11..15}}Packages.dirty-equals
 ```
 
 ### `--allow-unsupported`
