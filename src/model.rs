@@ -118,10 +118,15 @@ impl Profile {
 /// (`store::sel_drv`), so re-running a report's reproduction command stays
 /// near-instant, with no nixpkgs import at all.
 ///
-/// What it does *not* change is what a row means. The resolved attrs are diffed,
-/// so an attr identical on both sides is not a row, just as in a delta — a
-/// selection is a cheaper, wider way to _find_ the attrs a review covers, not a
-/// different reporting rule.
+/// It replaces exactly one step, and nothing downstream. npb's pipeline is: pick
+/// the attrs to review, add their `passthru.tests` unless `--no-tests`, build,
+/// report. `-p` replaces the *first* step — the whole-set diff that would
+/// otherwise pick them — the way `--head` replaces the working-tree guess. So a
+/// named package's tests come along exactly as a changed package's would, and
+/// every named attr is reported whether or not the change touches it: "nothing
+/// here regressed" is the answer the flag asked for, and it is the one a diff
+/// cannot give. That makes `⏩→⏩` and `➖→➖` reachable in a selection (§8), the
+/// latter being how a misspelled attr shows itself.
 ///
 /// **Attrs are matched exactly**, with no subtrees or globs, because nothing in
 /// npb's Rust reads structure out of an attr path — attrs are opaque keys here,

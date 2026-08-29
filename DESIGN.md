@@ -741,22 +741,23 @@ consequences:
   top-level lookup per side) where a delta review costs minutes for two
   ~114k-attr walks. This is the difference between npb being usable on a
   setuptools-class rebuild and not.
-- **A row is still a change.** The named attrs are resolved, then diffed, so an
-  attr that comes out identical on both sides is not a row — the same rule
-  `evalfile::changed_set` applies structurally to a delta, and the reason `⏩→⏩`
-  and `➖→➖` are unreachable in _either_ mode (§8). It also means an unchanged
-  named attr never reaches the `tests` phase, exactly as it wouldn't have in a
-  delta. A selection is a cheaper, wider way to _find_ the attrs a review covers;
-  what npb then says about them is unchanged.
-- **A `-p` that resolves to nothing is simply no rows**, like any other attr the
-  change doesn't affect. Making it an error was tried and backed out: the
-  condition can't be stated per system — a Linux-only package reviewed on Darwin
-  resolves to nothing there and is perfectly legitimate — so it needs a
-  quantifier over every side of every `--system`, and a rule that awkward to
-  state is a rule about the wrong thing. npb is a diff; asking it about an attr
-  that isn't there is answered by the absence of rows, and the reproduction
-  command in the report says what was asked for. (nixpkgs-review does `die`
-  here; it has no equivalent of npb's multi-system runs to complicate it.)
+- **It replaces one step, not the pipeline.** npb picks the attrs to review, adds
+  their `passthru.tests` unless `--no-tests`, builds, and reports. `-p` replaces
+  the *first* step and nothing else — the way `--head` replaces the working-tree
+  guess without changing what happens to the revision it names. So a named
+  package's tests come along exactly as a changed package's would, and
+  `--no-tests` means the same thing it always did: skip the step that adds them.
+- **Every named attr is reported**, whether or not the change touches it. That is
+  the point of naming it: "I think this might have moved, tell me it didn't" is a
+  question a diff can't answer, and the person who asked for the flag
+  [said so](https://github.com/samestep/npb/pull/3#issuecomment-5386738586) after
+  trying the other way. So `⏩→⏩` and `➖→➖` are reachable in a selection (§8) —
+  the latter being how a misspelled attr shows itself, which is why naming an
+  attr that resolves nowhere is a row and not an error. (Making it an error was
+  tried and backed out for a second reason: the condition can't be stated per
+  system, since a Linux-only package reviewed on Darwin legitimately resolves to
+  nothing there, so it needs a quantifier over every side of every `--system` —
+  and a rule that awkward to state is a rule about the wrong thing.)
 - **A named attr must be a derivation, not a subtree.** `nix-eval-jobs` recurses
   into a `recurseForDerivations` attrset, so `-p python313Packages` would quietly
   become ~11k rows. Such a row arrives with a multi-element `attrPath` whose first
@@ -783,13 +784,22 @@ quoting, so a dotted _name_ (`rubyPackages."http_parser.rb"` — 34 such attrs i
 one aarch64-linux eval) and a dotted _path_ look alike.
 
 **Tests follow the attrs a review covers, for free.** The `tests` phase expands
-whatever the changed set holds (`changed_names`), so a selection expands the
-attrs it named that actually changed, and a delta expands the packages that
-changed — neither needs the flag, or the diff, to know what a test row is called.
-It carries the delta's blind spot with it: a change to a package's
-`passthru.tests` that leaves the package itself untouched is invisible either way,
-since tests are only ever enumerated from a changed package. A selection is the
-way out, since it can name the test.
+whatever the changed set holds (`changed_names`), so a selection expands every
+attr it named and a delta expands the packages that changed — neither needs the
+flag, or the diff, to know what a test row is called. The two modes then differ
+only in how their test rows are filtered, which is the same difference as for
+their packages: a delta reports changes, so an unchanged test is not a row
+(`changed_tests`); a selection reports what it was given, and a named package's
+tests were given with it (`paired_tests`).
+
+The delta's blind spot rides along: a change to a package's `passthru.tests` that
+leaves the package itself untouched is invisible, since tests are only ever
+enumerated from a package that is already being reviewed. A selection is the way
+out, since it can name the test — `-p python313Packages.pydantic-core.tests.pytest`
+reviews a test whose package didn't move (§6's `pydantic-core` case). Enumerating
+`passthru.tests` for *every* package would close the hole and was measured at
+roughly an order of magnitude on the whole-set eval, which is not a trade npb
+makes by default; as an opt-in flag it stays a separate feature.
 
 One wrinkle *is* a selection's own. `-p` can name a `tests` attr directly, which
 puts a test derivation in the changed set, and the phase then enumerates *that*
@@ -1162,13 +1172,14 @@ accepted gap of §5: a target nix never reached with nothing verifiably failing
 in its closure). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
-Of the 6 × 6 = 36 pairs, **34** can appear in a report: every combination except
-the two a diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no change,
-§6) and ➖→➖ (an attr with no derivation on either side is never a row). Every
-other pair, including ⏩→➖ and ➖→⏩, is reachable. This holds in both coverage
-modes: a selection diffs the attrs it resolved just as a delta diffs the attrs it
-walked (§6), so naming an attr with `-p` gets it _considered_, never reported
-unconditionally.
+Of the 6 × 6 = 36 pairs, **34** can appear in a _delta_ report: every combination
+except the two the diff can't see at all — ⏩→⏩ (a `None` drv on both sides is no
+change, §6) and ➖→➖ (an attr in neither eval is never a row). Every other pair,
+including ⏩→➖ and ➖→⏩, is reachable. A **selection** (`-p`, §6) reaches all
+**36**, because it reports every attr it was named rather than every attr that
+changed: an attr that throws on both sides is still the answer to a question
+someone asked, and ➖→➖ is how a `-p` that resolved to nothing — a typo, or a path
+that isn't on either tree — shows itself.
 Sections are ordered **worst-delta-first**: each state has a goodness on the
 build-outcome axis (`✅` > `⏩` > `🚫` > `❌`, with `➖` absent slotted just under
 `✅` as _new_/_gone_), and a section sorts by the signed delta

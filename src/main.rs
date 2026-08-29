@@ -1124,27 +1124,18 @@ fn selected_changed_sets(
         let (b, h) = (&resolved[2 * i], &resolved[2 * i + 1]);
         let rows: Vec<evalfile::ChangedAttr> = wanted
             .iter()
-            .filter_map(|attr| {
+            .map(|attr| {
                 let get = |m: &HashMap<String, model::Resolved>| {
                     m.get(attr).cloned().unwrap_or_else(model::Resolved::absent)
                 };
                 let (base, head) = (get(b), get(h));
-                // Identical on both sides is not a row — the same rule
-                // `evalfile::changed_set` applies structurally to a delta, which
-                // is why this is a changed set and not a listing. So `⏩→⏩` and
-                // `➖→➖` stay unreachable in either mode (DESIGN §6, §8), and an
-                // unchanged attr never reaches the `tests` phase, exactly as it
-                // wouldn't have in a delta.
-                if base == head {
-                    return None;
-                }
-                Some(evalfile::ChangedAttr {
+                evalfile::ChangedAttr {
                     attr: attr.clone(),
                     base_drv: base.drv_path,
                     head_drv: head.drv_path,
                     base_threw: base.threw,
                     head_threw: head.threw,
-                })
+                }
             })
             .collect();
         out.insert(sys.clone(), rows);
@@ -1284,7 +1275,15 @@ fn run_phases(
             let bmap = acc.store.tests_drvs_for(&base.tree, &key, &base_names)?;
             let hmap = acc.store.tests_drvs_for(&head.tree, &key, &head_names)?;
             let (bmap, hmap) = drop_self_tests(&bmap, &hmap, changed);
-            changed.extend(evalfile::changed_tests(&bmap, &hmap));
+            // A delta reports changes, so an unchanged test isn't one. A
+            // selection reports the attrs it was given, and a named package's
+            // tests are given with it — "no regression here" is the answer it was
+            // asked for (DESIGN §6).
+            changed.extend(if coverage.only().is_some() {
+                evalfile::paired_tests(&bmap, &hmap)
+            } else {
+                evalfile::changed_tests(&bmap, &hmap)
+            });
         }
     }
 
