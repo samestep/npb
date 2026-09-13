@@ -62,11 +62,12 @@ fn output_in_cache(agent: &ureq::Agent, out_path: &str) -> bool {
     let Some(hash) = store_hash(out_path) else {
         return false;
     };
-    // ureq returns Err for 4xx/5xx and transport errors; only 2xx is Ok.
-    agent
-        .head(&format!("{CACHE}/{hash}.narinfo"))
-        .call()
-        .is_ok()
+    // ureq returns Err for 4xx/5xx (`http_status_as_error`, the default) and for
+    // transport errors; only 2xx is Ok. ureq 3 no longer retries an idempotent
+    // request on its own the way 2.x did, so a transient failure reads as a miss
+    // here — which only costs building (or re-probing next run) that drv, never
+    // a wrong fact, since a miss records nothing (DESIGN §7).
+    agent.head(format!("{CACHE}/{hash}.narinfo")).call().is_ok()
 }
 
 // --- `nix derivation show` JSON (only the output paths) ----------------------
@@ -174,11 +175,12 @@ pub fn in_cache_many(drvs: &[String], mut on_batch: impl FnMut(&[(String, bool)]
     if drvs.is_empty() {
         return;
     }
-    let agent = ureq::AgentBuilder::new()
+    let agent = ureq::Agent::config_builder()
         .max_idle_connections(PROBE_CONCURRENCY)
         .max_idle_connections_per_host(PROBE_CONCURRENCY)
-        .timeout(Duration::from_secs(15))
-        .build();
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .new_agent();
     // Resolved `(drv, its output paths)` flow from the producer to the probe
     // workers (shared receiver behind a mutex); each worker's verdict then flows
     // back to this thread over `res` for `on_result` to consume in order.

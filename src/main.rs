@@ -517,10 +517,13 @@ fn path_str(p: &std::path::Path) -> Result<&str> {
 /// `--pr`, npb won't proceed on a diff it couldn't fetch).
 fn fetch_compare_diff(expr: &str) -> Result<String> {
     let url = format!("{UPSTREAM}/compare/{expr}.diff");
+    // `read_to_string` caps the body at 10 MiB by default, the same cap ureq 2's
+    // `into_string` had; a compare diff past that fails loudly either way.
     ureq::get(&url)
         .call()
         .with_context(|| format!("fetching {url}"))?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .with_context(|| format!("reading the diff from {url}"))
 }
 
