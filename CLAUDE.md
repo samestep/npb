@@ -64,3 +64,11 @@ When removing a feature, still remove all of its dead code in the same change
 (enum variants, struct fields, table columns, parsing, tests, doc references),
 but a removal that changes a stored format or a user-facing interface is a
 breaking change, held to the rule above.
+
+## `CHANGELOG.md` is written by hand
+
+Don't add or edit entries in `CHANGELOG.md` as part of a change. The
+maintainer writes the changelog themselves at release time, in their own words,
+after seeing the whole set of changes going into a version. If a change is
+worth a changelog line, say so in your final summary (what a user would notice,
+in a sentence) so it can be written up then — but leave the file alone.
