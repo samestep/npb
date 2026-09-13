@@ -750,7 +750,14 @@ second time; a rust mass-rebuild that changed `texlivePackages."texlive.infra"`
 left that `.drv` unwritten and surfaced only in the build phase as an opaque
 `nix-store` "path is not valid". Upstream's since-landed `--select` flag is a
 root-transform function, not per-path selection, so it does not replace this.)
-Four consequences:
+The walk along those elements (`eval::SELECT_NIX`) also mirrors how
+`nix-eval-jobs` reaches a job — `findAlongAttrPath` **auto-calls** a function it
+meets on the way, applying a lambda whose formals all have defaults to `{ }` —
+because the full-set eval lists attrs that exist only on the far side of such a
+call (`androidenv.composeAndroidPackages.emulator`; `composeAndroidPackages` is a
+function), where a plain `lib.attrByPath` sees `null`, streams no job, and
+leaves the drv unwritten. Same rule at the leaf; a missing element still
+resolves to `null`, which is the `➖ absent` signal below. Four consequences:
 
 - **No whole-set eval at all.** A cold selector run costs seconds (a lazy
   top-level lookup per side) where a delta review costs minutes for two
@@ -849,7 +856,7 @@ _do_ need the `.drv` present in the store — the narinfo probe (§7, which read
 drv's output paths) and the local build (`nix build <drv>^*`, §5) — get it from
 a just-in-time `eval::instantiate` step: one `nix-eval-jobs` run per
 `(commit, system)`, instantiation on, over exactly the changed attr paths
-(nested and quoted paths included, via the element-list `lib.attrByPath`
+(nested, quoted, and function-reached paths included, via the element-list
 selector above), run right before building —
 _minus_ the changed set's `passthru.tests` rows, whose recipes the `tests` eval
 already wrote while it was evaluating them (below). Those are the heaviest

@@ -179,11 +179,27 @@ fn requested_attr(attr_path: &[String], requested: &[String]) -> Option<String> 
     requested.get(i).cloned()
 }
 
+/// The Nix side of the two targeted selectors: `select path` walks `pkgs` along
+/// a list of attr elements the way nix-eval-jobs itself does. nix-eval-jobs
+/// reaches each job by `findAlongAttrPath`, which **auto-calls** a function it
+/// meets on the way (Nix's `autoCallFunction`: a lambda whose formals all have
+/// defaults is applied to `{ }`; a functor is called first and the result
+/// auto-called), so the full-set eval lists attrs like
+/// `androidenv.composeAndroidPackages.emulator` — `composeAndroidPackages` is a
+/// function — and a plain `lib.attrByPath` would find `null` there (`?` on a
+/// function is `false`), stream no job, and leave the drv unwritten. `autoCall`
+/// mirrors that rule at every step and at the leaf. One gap, harmless in
+/// practice: `builtins.functionArgs` can't tell `{ }: …` (formals, auto-called
+/// by nix-eval-jobs) from `x: …` (not), so a package set spelled `{ }: { … }`
+/// is not called — nothing in nixpkgs' walk is. A missing element yields `null`,
+/// which nix-eval-jobs ignores (no job line): the `➖ absent` signal.
+const SELECT_NIX: &str = "autoCall = v: if lib.isAttrs v && v ? __functor then autoCall (v.__functor v)      else if lib.isFunction v && builtins.functionArgs v != { } then v { } else v;      select = path: autoCall (lib.foldl (acc: name: let v = autoCall acc;      in if lib.isAttrs v && v ? ${name} then v.${name} else null) pkgs path);";
+
 /// The selector list both targeted expressions interpolate: one
 /// `{ name = "_i"; path = [ "elem" … ]; }` per requested attr path, `name` a
 /// [`job_name`] and `path` its [`attr_path_elements`], each escaped for a Nix
-/// string. The Nix side selects with `lib.attrByPath path`, so an element that
-/// contains a dot is looked up whole instead of being split again.
+/// string. The Nix side selects with `select path` ([`SELECT_NIX`]), so an
+/// element that contains a dot is looked up whole instead of being split again.
 fn nix_selector_list(paths: &[String]) -> String {
     paths
         .iter()
@@ -395,8 +411,10 @@ let
   pkgs = @PKGS@;
   lib = pkgs.lib;
   host = pkgs.stdenv.hostPlatform;
+  @SELECT@
   # One `{ name; path; }` per package (see nix_selector_list): the node is named
-  # `name`, and `path` is the package's attr path as a list of elements.
+  # `name`, and `path` is the package's attr path as a list of elements, walked
+  # by `select` above.
   attrs = [ @ATTRS@];
   # Drop tests unavailable under the run's profile (see build_tests_expr doc),
   # recursing through `tests` sub-attrsets. Stops at derivations (never forces
@@ -418,7 +436,7 @@ let
     # errors only its own `<pkg>.tests`, never the whole run.
     tests =
       let
-        pkg = lib.attrByPath path null pkgs;
+        pkg = select path;
         t = if pkg == null then null else (pkg.tests or null);
       in
         if lib.isDerivation t || lib.isAttrs t then mark t
@@ -433,6 +451,7 @@ lib.listToAttrs (map (a: lib.nameValuePair a.name (node a.path)) attrs)
             "@PKGS@",
             &build_expr(repo, rev, system, &profile_config(profile)),
         )
+        .replace("@SELECT@", SELECT_NIX)
         .replace("@ATTRS@", &list)
         .replace("@ALLOW_UNSUP@", nixbool(profile.unsupported))
         .replace("@ALLOW_INSEC@", nixbool(profile.insecure))
@@ -816,11 +835,12 @@ fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], config: &s
 /// A job expression selecting exactly `paths` out of the package set — each an
 /// attr path, possibly dotted/nested (`python3Packages.foo`, a test path like
 /// `grafana.tests.grafana.basic`, or one with a quoted element like
-/// `texlivePackages."texlive.infra"`). One job per path, named [`job_name`]
-/// and selected by `lib.attrByPath` over its element list
-/// ([`nix_selector_list`]), forced per-attr in the worker, so a path that no
-/// longer resolves errors only itself. The caller maps a streamed job back to
-/// the path it asked for with [`requested_attr`].
+/// `texlivePackages."texlive.infra"`, or one through a function like
+/// `androidenv.composeAndroidPackages.emulator`). One job per path, named
+/// [`job_name`] and selected by walking its element list the way nix-eval-jobs
+/// would ([`SELECT_NIX`], [`nix_selector_list`]), forced per-attr in the
+/// worker, so a path that no longer resolves errors only itself. The caller
+/// maps a streamed job back to the path it asked for with [`requested_attr`].
 ///
 /// The element list matters twice over: nix-eval-jobs would mangle a dotted,
 /// quoted attr string used as a job *name* (see [`job_name`]), and a naive
@@ -830,8 +850,8 @@ fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], config: &s
 fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &str) -> String {
     let list = nix_selector_list(paths);
     format!(
-        "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
-         (map (a: {{ name = a.name; value = lib.attrByPath a.path null pkgs; }}) [ {list}])",
+        "let pkgs = {}; lib = pkgs.lib; {SELECT_NIX} in builtins.listToAttrs \
+         (map (a: {{ name = a.name; value = select a.path; }}) [ {list}])",
         build_expr(repo, rev, system, config)
     )
 }
@@ -1965,7 +1985,8 @@ mod tests {
             e.contains(r#"{ name = "_1"; path = [ "texlivePackages" "texlive.infra" ]; }"#),
             "{e}"
         );
-        assert!(e.contains("lib.attrByPath a.path null pkgs"));
+        assert!(e.contains("value = select a.path"));
+        assert!(e.contains(SELECT_NIX));
         // The attr string is never a job name, and nothing re-splits it on `.`.
         assert!(!e.contains(r#"name = "texlivePackages"#));
         assert!(!e.contains("splitString"));
@@ -1988,7 +2009,8 @@ mod tests {
             e.contains(r#"{ name = "_0"; path = [ "rubyPackages" "http_parser.rb" ]; }"#),
             "{e}"
         );
-        assert!(e.contains("lib.attrByPath path null pkgs"));
+        assert!(e.contains("pkg = select path"));
+        assert!(e.contains(SELECT_NIX));
         assert!(!e.contains("splitString"));
     }
 
