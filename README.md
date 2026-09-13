@@ -343,7 +343,7 @@ npb --version
 
 This project owes its existence to its primary inspiration, Jörg Thalheim's [nixpkgs-review](https://github.com/Mic92/nixpkgs-review), which serves a similar purpose but makes different design tradeoffs.
 
-The development of this project was AI-assisted. There is no AI-generated text in this README, `npb --help`, or `npb`'s generated reports.
+The development of this project was AI-assisted. There is no AI-generated text in this README, in [`CHANGELOG.md`](CHANGELOG.md), in `npb --help`, or in `npb`'s generated reports.
 
 ## License
 
