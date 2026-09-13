@@ -65,10 +65,14 @@ struct RawJob {
     /// dotted label is wanted — see the test eval.
     attr_path: Vec<String>,
     /// `None` when evaluation of the attr **threw** (the job line carries an
-    /// `error` message instead, which we don't keep — re-evaluating reproduces
-    /// it). Under the run's profile, that's exactly a broken/unsupported/insecure
-    /// attr, or one forcing such a dependency (DESIGN §6).
+    /// `error` message instead). Under the run's profile, that's exactly a
+    /// broken/unsupported/insecure attr, or one forcing such a dependency
+    /// (DESIGN §6).
     drv_path: Option<String>,
+    /// The in-band error of a job that threw. Not persisted anywhere —
+    /// re-evaluating reproduces it — but the `instantiate` phase quotes it when a
+    /// recipe it was asked to write did not land (see [`instantiate_execute`]).
+    error: Option<String>,
 }
 
 fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
@@ -78,15 +82,22 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     }
 }
 
-/// Map a `tests` job to a [`TestJob`]. Label from `attrPath` (unquoted
-/// elements) rather than `attr` (which nix-eval-jobs quotes for the dotted
-/// package component, e.g. `"python3Packages.requests".tests.foo`): element 0
-/// is the package we asked for, and the whole path joined is the clean
-/// `<pkg>.tests.<name>` label.
-fn raw_to_test_job(raw: RawJob) -> TestJob {
+/// Map a `tests` job to a [`TestJob`]. Element 0 of `attrPath` is the synthetic
+/// job name the selector gave the package's node ([`job_name`]), which maps back
+/// to the package in `pkgs` that was asked for — spelled exactly as it was asked,
+/// quoting included; the remaining (unquoted) elements are the path below it, so
+/// the whole label is `<pkg>.tests.<name>`.
+fn raw_to_test_job(raw: RawJob, pkgs: &[String]) -> TestJob {
+    let pkg_attr = requested_attr(&raw.attr_path, pkgs).unwrap_or_default();
+    let rest: Vec<&str> = raw.attr_path.iter().skip(1).map(String::as_str).collect();
+    let test_attr = if rest.is_empty() {
+        pkg_attr.clone()
+    } else {
+        format!("{pkg_attr}.{}", rest.join("."))
+    };
     TestJob {
-        pkg_attr: raw.attr_path.first().cloned().unwrap_or_default(),
-        test_attr: raw.attr_path.join("."),
+        pkg_attr,
+        test_attr,
         drv_path: raw.drv_path,
     }
 }
@@ -105,12 +116,85 @@ fn nix_escape(s: &str) -> String {
 
 /// A space-separated Nix string-list body — `"a" "b" ` — each element escaped
 /// for a Nix `"..."` literal. Shared by every expression builder that
-/// interpolates a list of attr names/paths ([`shard_expr`], [`select_expr`],
-/// [`build_tests_expr`]), so the escaping lives in one place.
+/// interpolates a list of attr names/paths ([`shard_expr`], and via
+/// [`nix_selector_list`] the two targeted selectors), so the escaping lives in
+/// one place.
 fn nix_string_list(items: &[String]) -> String {
     items
         .iter()
         .map(|s| format!("\"{}\" ", nix_escape(s)))
+        .collect()
+}
+
+/// Split an attr path into its elements, honouring the quoting nix-eval-jobs
+/// (and Nix's own `-A` syntax) uses for an element that contains a dot:
+/// `texlivePackages."texlive.infra"` is *two* elements, the second being the
+/// attribute literally named `texlive.infra`. This is the one place npb's Rust
+/// looks inside an attr string — the selectors need the elements to hand
+/// nix-eval-jobs a list (DESIGN §6). A dot splits only outside quotes; the quotes
+/// themselves are dropped. (nix-eval-jobs writes no escapes inside a quoted
+/// element, so none are interpreted — an attr name containing a literal `"` is
+/// not representable in its output to begin with, and nixpkgs has none.)
+fn attr_path_elements(attr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in attr.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// The synthetic top-level name the selectors give the `i`th requested attr
+/// path: `_0`, `_1`, … — never the attr string itself. nix-eval-jobs re-selects
+/// every top-level job *by name* in its worker, re-joining the name through
+/// `attrPathJoin`, which wraps any element containing a `.` in quotes without
+/// escaping quotes already inside it — so a name like
+/// `texlivePackages."texlive.infra"` comes back as
+/// `"texlivePackages."texlive.infra""`, is parsed as `texlivePackages.texlive`,
+/// and the job errors "attribute not found" without ever reaching our selector
+/// (<https://github.com/nix-community/nix-eval-jobs/blob/11f75b4/src/worker.cc#L102>).
+/// A name with no dot and no quote survives that round trip untouched, and the
+/// real attr path travels beside it as a *list* of elements ([`nix_selector_list`]).
+fn job_name(i: usize) -> String {
+    format!("_{i}")
+}
+
+/// Inverse of [`job_name`]: which requested attr a streamed job's top-level
+/// element names, or `None` for a name we didn't mint.
+fn job_index(name: &str) -> Option<usize> {
+    name.strip_prefix('_')?.parse().ok()
+}
+
+/// The attr that was asked for, from a streamed job's `attrPath`: element 0 is a
+/// [`job_name`], and `requested` is the slice it indexes (the shard's items, in
+/// the order the selector listed them).
+fn requested_attr(attr_path: &[String], requested: &[String]) -> Option<String> {
+    let i = job_index(attr_path.first()?)?;
+    requested.get(i).cloned()
+}
+
+/// The selector list both targeted expressions interpolate: one
+/// `{ name = "_i"; path = [ "elem" … ]; }` per requested attr path, `name` a
+/// [`job_name`] and `path` its [`attr_path_elements`], each escaped for a Nix
+/// string. The Nix side selects with `lib.attrByPath path`, so an element that
+/// contains a dot is looked up whole instead of being split again.
+fn nix_selector_list(paths: &[String]) -> String {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            format!(
+                "{{ name = \"{}\"; path = [ {}]; }} ",
+                job_name(i),
+                nix_string_list(&attr_path_elements(p))
+            )
+        })
         .collect()
 }
 
@@ -304,13 +388,15 @@ fn build_tests_expr(
     attrs: &[String],
     profile: Profile,
 ) -> String {
-    let list = nix_string_list(attrs);
+    let list = nix_selector_list(attrs);
     let nixbool = |b| if b { "true" } else { "false" };
     const TEMPLATE: &str = r#"
 let
   pkgs = @PKGS@;
   lib = pkgs.lib;
   host = pkgs.stdenv.hostPlatform;
+  # One `{ name; path; }` per package (see nix_selector_list): the node is named
+  # `name`, and `path` is the package's attr path as a list of elements.
   attrs = [ @ATTRS@];
   # Drop tests unavailable under the run's profile (see build_tests_expr doc),
   # recursing through `tests` sub-attrsets. Stops at derivations (never forces
@@ -326,20 +412,20 @@ let
       lib.mapAttrs (_: v: let r = builtins.tryEval (mark v); in if r.success then r.value else v) t
       // { recurseForDerivations = true; }
     else t;
-  node = name: {
+  node = path: {
     recurseForDerivations = true;
     # Forced per-attr in a nix-eval-jobs worker: a package that fails to evaluate
     # errors only its own `<pkg>.tests`, never the whole run.
     tests =
       let
-        pkg = lib.attrByPath (lib.splitString "." name) null pkgs;
+        pkg = lib.attrByPath path null pkgs;
         t = if pkg == null then null else (pkg.tests or null);
       in
         if lib.isDerivation t || lib.isAttrs t then mark t
         else { recurseForDerivations = true; };
   };
 in
-lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
+lib.listToAttrs (map (a: lib.nameValuePair a.name (node a.path)) attrs)
 // { recurseForDerivations = true; }
 "#;
     TEMPLATE
@@ -445,7 +531,7 @@ pub fn eval_tests(
                 // `--no-instantiate` never altered a `drvPath`.
                 true,
                 label,
-                raw_to_test_job,
+                |raw| raw_to_test_job(raw, pkgs),
                 || on_item(1),
             )
         },
@@ -728,21 +814,24 @@ fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], config: &s
 }
 
 /// A job expression selecting exactly `paths` out of the package set — each an
-/// attr path, possibly dotted/nested (`python3Packages.foo`, or a test path like
-/// `grafana.tests.grafana.basic`). One job per path, forced per-attr in the
-/// worker, so a path that no longer resolves errors only itself.
+/// attr path, possibly dotted/nested (`python3Packages.foo`, a test path like
+/// `grafana.tests.grafana.basic`, or one with a quoted element like
+/// `texlivePackages."texlive.infra"`). One job per path, named [`job_name`]
+/// and selected by `lib.attrByPath` over its element list
+/// ([`nix_selector_list`]), forced per-attr in the worker, so a path that no
+/// longer resolves errors only itself. The caller maps a streamed job back to
+/// the path it asked for with [`requested_attr`].
 ///
-/// TODO(nix-eval-jobs#412): this hand-rolled selector — and the identical
-/// `splitString "."` trick in [`build_tests_expr`] — is the wrapper-expr
-/// workaround that a native `--select <attrpath>` (emitting the literal selector
-/// as `attr`) would replace. `splitString "."` also mis-splits a quoted path
-/// element like `haskell.compiler."ghc94"`, which `--select` would handle
-/// correctly. Adopt it (in both spots) once it lands upstream.
+/// The element list matters twice over: nix-eval-jobs would mangle a dotted,
+/// quoted attr string used as a job *name* (see [`job_name`]), and a naive
+/// `lib.splitString "."` on the Nix side would split the quoted element too.
+/// (Upstream's `--select` flag, once hoped to replace this, landed as a
+/// root-transform function rather than per-path selection, so this stays.)
 fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &str) -> String {
-    let list = nix_string_list(paths);
+    let list = nix_selector_list(paths);
     format!(
         "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
-         (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
+         (map (a: {{ name = a.name; value = lib.attrByPath a.path null pkgs; }}) [ {list}])",
         build_expr(repo, rev, system, config)
     )
 }
@@ -848,16 +937,21 @@ pub fn resolve_attrs(
             )?;
             rows.into_iter()
                 .map(|raw| {
-                    // The wrapper attrset's name *is* the attr that was asked for,
-                    // so element 0 identifies the request even when the attr path
-                    // it names contains dots. More than one element means
-                    // nix-eval-jobs recursed into a set (above).
-                    let asked = raw.attr_path.first().cloned().unwrap_or_default();
+                    // The wrapper attrset's synthetic name maps element 0 back to
+                    // the attr that was asked for, however that attr path is
+                    // spelled. More than one element means nix-eval-jobs recursed
+                    // into a set (above).
+                    let asked = requested_attr(&raw.attr_path, attrs).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "nix-eval-jobs streamed a job {:?} that maps to no requested attr",
+                            raw.attr_path
+                        )
+                    })?;
                     if raw.attr_path.len() > 1 {
                         bail!(
                             "-p {asked} names a package set, not a package: it contains \
-                             {} (and others). Name the packages you want reviewed.",
-                            raw.attr_path.join(".")
+                             {asked}.{} (and others). Name the packages you want reviewed.",
+                            raw.attr_path[1..].join(".")
                         );
                     }
                     let threw = raw.drv_path.is_none();
@@ -980,6 +1074,14 @@ pub fn instantiate_execute(
         .iter()
         .map(|r| format!("{} {}", r.rev.display, r.system))
         .collect();
+    // Per group, the attrs whose job streamed an in-band *error* instead of a
+    // drv, with that error: the phase's only diagnostic for a recipe that did not
+    // land (the gate below). A per-attr error never fails nix-eval-jobs itself —
+    // its exit code stays 0 — so this is the one place the text is caught.
+    let errors: Vec<Mutex<HashMap<String, String>>> = requests
+        .iter()
+        .map(|_| Mutex::new(HashMap::new()))
+        .collect();
     let items: Vec<Vec<String>> = requests
         .iter()
         .map(|r| r.attrs.iter().map(|(attr, _)| attr.clone()).collect())
@@ -1003,7 +1105,7 @@ pub fn instantiate_execute(
     run_shards(
         "instantiate",
         nodes,
-        labels,
+        labels.clone(),
         items,
         shard_size,
         slots,
@@ -1019,19 +1121,27 @@ pub fn instantiate_execute(
                 paths,
                 &profile_config(profile),
             );
-            // Streamed rows are discarded (mapped to `()`); the `.drv` writes are
-            // the point. The per-job callback drives the live count.
-            stream_jobs(
+            // The `.drv` writes are the point; of the streamed rows only the
+            // error ones are kept (attr, error), for the gate below. The per-job
+            // callback drives the live count.
+            let rows = stream_jobs(
                 &expr,
                 1,
                 DEFAULT_WORKER_MEM_MB,
                 true,
                 label,
-                |_| (),
+                |raw: RawJob| {
+                    let attr = requested_attr(&raw.attr_path, paths)?;
+                    Some((attr, raw.error?))
+                },
                 || on_item(1),
-            )
+            )?;
+            Ok(rows.into_iter().flatten().collect())
         },
-        |_, _| Ok(()),
+        |gi, rows: Vec<(String, String)>| {
+            errors[gi].lock().unwrap().extend(rows);
+            Ok(())
+        },
         // The durable record: a `.drv` a dead worker had already written is in the
         // store and content-addressed, hence as good as one this pass wrote (§6),
         // so a retry owes only the attrs whose recipe is still missing.
@@ -1051,7 +1161,47 @@ pub fn instantiate_execute(
                 .cloned()
                 .collect())
         }),
-    )
+    )?;
+
+    // The gate: is every recipe this phase was asked for now actually in the
+    // store? nix-eval-jobs exits 0 when a job errors in band, so a pass whose
+    // jobs all "completed" can still have left a `.drv` unwritten — and the next
+    // consumer of that drv (the build phase, an hour later) would only see an
+    // opaque `nix-store` complaint about an invalid path. Ask the store, the
+    // same durable record the abort retry consults, and name the attrs instead.
+    let mut report = Vec::new();
+    for (gi, r) in requests.iter().enumerate() {
+        let wanted: Vec<String> = r.attrs.iter().map(|(_, d)| d.clone()).collect();
+        let missing = absent(&wanted)?;
+        if missing.is_empty() {
+            continue;
+        }
+        let errs = errors[gi].lock().unwrap();
+        report.push(format!(
+            "{}: {} of {} requested derivations were not written:",
+            labels[gi],
+            missing.len(),
+            wanted.len()
+        ));
+        for (attr, drv) in &r.attrs {
+            if !missing.contains(drv) {
+                continue;
+            }
+            report.push(format!("  {attr} -> {drv}"));
+            match errs.get(attr) {
+                Some(e) => report.extend(e.lines().map(|l| format!("    {l}"))),
+                None => report.push("    (nix-eval-jobs streamed no job for it)".into()),
+            }
+        }
+    }
+    if !report.is_empty() {
+        bail!(
+            "instantiate left derivations unwritten (nix-eval-jobs reported them in band and \
+             exited 0), so the build would fail on an invalid `.drv`:\n{}",
+            report.join("\n")
+        );
+    }
+    Ok(())
 }
 
 // --- the shard scheduler (shared by the full-set eval and the tests eval) ---
@@ -1752,6 +1902,112 @@ mod tests {
         assert!(e.contains("builtins.listToAttrs"));
         assert!(e.contains(r#""hello" "#));
         assert!(e.contains(r#""with\"quote" "#));
+    }
+
+    #[test]
+    fn attr_path_elements_honours_quoting() {
+        let el = attr_path_elements;
+        assert_eq!(el("hello"), ["hello"]);
+        assert_eq!(el("python3Packages.foo"), ["python3Packages", "foo"]);
+        // A quoted element is one attribute whose *name* contains a dot.
+        assert_eq!(
+            el("texlivePackages.\"texlive.infra\""),
+            ["texlivePackages", "texlive.infra"]
+        );
+        assert_eq!(
+            el("tests.pkg-config.defaultPkgConfigPackages.\"gtk+-2.0\""),
+            [
+                "tests",
+                "pkg-config",
+                "defaultPkgConfigPackages",
+                "gtk+-2.0"
+            ]
+        );
+        // Quotes in the middle of a path, and a test path below them.
+        assert_eq!(
+            el("haskell.compiler.\"ghc94\".tests.x"),
+            ["haskell", "compiler", "ghc94", "tests", "x"]
+        );
+    }
+
+    #[test]
+    fn job_names_round_trip_and_survive_nix_eval_jobs() {
+        for i in [0, 1, 17, 48575] {
+            let n = job_name(i);
+            // No dot and no quote: exactly what nix-eval-jobs' attrPathJoin
+            // passes through untouched when it re-selects the job by name.
+            assert!(!n.contains('.') && !n.contains('"'), "{n}");
+            assert_eq!(job_index(&n), Some(i));
+        }
+        assert_eq!(job_index("hello"), None);
+        assert_eq!(job_index("_x"), None);
+        let asked = vec!["a.b".to_string(), "c.\"d.e\"".to_string()];
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            requested_attr(&path(&["_1", "tests", "t"]), &asked),
+            Some("c.\"d.e\"".into())
+        );
+        assert_eq!(requested_attr(&path(&["_2"]), &asked), None);
+        assert_eq!(requested_attr(&[], &asked), None);
+    }
+
+    #[test]
+    fn select_expr_selects_element_lists_under_synthetic_names() {
+        let e = select_expr(
+            Path::new("/repo"),
+            "abc123",
+            "x86_64-linux",
+            &["hello".into(), "texlivePackages.\"texlive.infra\"".into()],
+            "{ }",
+        );
+        assert!(e.contains(r#"{ name = "_0"; path = [ "hello" ]; }"#), "{e}");
+        assert!(
+            e.contains(r#"{ name = "_1"; path = [ "texlivePackages" "texlive.infra" ]; }"#),
+            "{e}"
+        );
+        assert!(e.contains("lib.attrByPath a.path null pkgs"));
+        // The attr string is never a job name, and nothing re-splits it on `.`.
+        assert!(!e.contains(r#"name = "texlivePackages"#));
+        assert!(!e.contains("splitString"));
+    }
+
+    #[test]
+    fn tests_expr_uses_the_same_selector_list() {
+        let e = build_tests_expr(
+            Path::new("/repo"),
+            "abc123",
+            "x86_64-linux",
+            &["rubyPackages.\"http_parser.rb\"".into()],
+            Profile {
+                broken: false,
+                unsupported: false,
+                insecure: false,
+            },
+        );
+        assert!(
+            e.contains(r#"{ name = "_0"; path = [ "rubyPackages" "http_parser.rb" ]; }"#),
+            "{e}"
+        );
+        assert!(e.contains("lib.attrByPath path null pkgs"));
+        assert!(!e.contains("splitString"));
+    }
+
+    #[test]
+    fn test_jobs_map_back_to_the_requested_package() {
+        let pkgs = vec!["rubyPackages.\"http_parser.rb\"".to_string()];
+        let raw = |path: &[&str]| RawJob {
+            attr: String::new(),
+            attr_path: path.iter().map(|s| s.to_string()).collect(),
+            drv_path: Some("/nix/store/x.drv".into()),
+            error: None,
+        };
+        // The label keeps the package spelled as it was asked for (quoting
+        // included), then the unquoted path below it.
+        let j = raw_to_test_job(raw(&["_0", "tests", "basic"]), &pkgs);
+        assert_eq!(j.pkg_attr, pkgs[0]);
+        assert_eq!(j.test_attr, "rubyPackages.\"http_parser.rb\".tests.basic");
+        let j = raw_to_test_job(raw(&["_0", "tests"]), &pkgs);
+        assert_eq!(j.test_attr, "rubyPackages.\"http_parser.rb\".tests");
     }
 
     #[test]

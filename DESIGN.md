@@ -733,9 +733,24 @@ attrs no changed set contains.
 **What a selection does.** For each named attr, npb resolves it on both trees —
 one targeted `nix-eval-jobs` run per `(tree, system)` over a `lib.attrByPath`
 selector (`eval::resolve_attrs`, the same `select_expr` the `instantiate` phase
-uses, so the attr-path splitting stays on the Nix side and npb's Rust keeps
-treating attrs as opaque keys) — and pairs the two sides into a row. Three
-consequences:
+uses) — and pairs the two sides into a row. The selector hands `nix-eval-jobs`
+each attr path as a **list of elements** under a synthetic, dot-free job name
+(`_0`, `_1`, …), never as the attr string itself, and the caller maps a streamed
+job back to what it asked for by that name. Both halves are forced by
+`nix-eval-jobs`: it re-selects every top-level job _by name_ in its worker, and
+its `attrPathJoin` re-quotes an element containing a dot without escaping the
+quotes already inside it, so a name like `texlivePackages."texlive.infra"` comes
+back as `"texlivePackages."texlive.infra""`, is parsed as
+`texlivePackages.texlive`, and errors "attribute not found" in band — with exit
+code 0
+([worker.cc](https://github.com/nix-community/nix-eval-jobs/blob/11f75b4/src/worker.cc#L102)).
+(An earlier selector named the job after the attr string and split it on the
+Nix side with `lib.splitString "."`, which mis-split the same quoted element a
+second time; a rust mass-rebuild that changed `texlivePackages."texlive.infra"`
+left that `.drv` unwritten and surfaced only in the build phase as an opaque
+`nix-store` "path is not valid". Upstream's since-landed `--select` flag is a
+root-transform function, not per-path selection, so it does not replace this.)
+Four consequences:
 
 - **No whole-set eval at all.** A cold selector run costs seconds (a lazy
   top-level lookup per side) where a delta review costs minutes for two
@@ -777,11 +792,13 @@ partial fact belongs: SQLite (`sel_drv`, §4), holding the same trichotomy the
 eval-file format carries — a drv, no drv but it threw (⏩), or absent (➖). A warm
 selector re-run resolves nothing, imports nothing, and answers from the log.
 
-**Attrs are matched exactly.** No subtrees, no globs, no prefixes: nowhere in
-npb's Rust is an attr path anything but an opaque key, and the string a matcher
-would have to parse is ambiguous anyway — the eval file keeps `nix-eval-jobs`'
-quoting, so a dotted _name_ (`rubyPackages."http_parser.rb"` — 34 such attrs in
-one aarch64-linux eval) and a dotted _path_ look alike.
+**Attrs are matched exactly.** No subtrees, no globs, no prefixes: an attr path
+is an opaque key everywhere in npb's Rust but one place — `eval::attr_path_elements`,
+the quote-aware split the two selectors use to build their element lists. The
+eval file keeps `nix-eval-jobs`' quoting, so a dotted _name_
+(`rubyPackages."http_parser.rb"` — 34 such attrs in one aarch64-linux eval) is
+told from a dotted _path_ by its quotes, and that split reads them; nothing else
+looks inside the string, and nothing matches on it.
 
 **Tests follow the attrs a review covers, for free.** The `tests` phase expands
 whatever the changed set holds (`changed_names`), so a selection expands every
@@ -832,7 +849,8 @@ _do_ need the `.drv` present in the store — the narinfo probe (§7, which read
 drv's output paths) and the local build (`nix build <drv>^*`, §5) — get it from
 a just-in-time `eval::instantiate` step: one `nix-eval-jobs` run per
 `(commit, system)`, instantiation on, over exactly the changed attr paths
-(nested paths included, via `lib.attrByPath`), run right before building —
+(nested and quoted paths included, via the element-list `lib.attrByPath`
+selector above), run right before building —
 _minus_ the changed set's `passthru.tests` rows, whose recipes the `tests` eval
 already wrote while it was evaluating them (below). Those are the heaviest
 evaluations in the whole run, and evaluating a `nixosTest` **twice** — once to
@@ -883,6 +901,18 @@ it is simply re-materialized, no worse than before. The import is per
 `(commit, system)` (one shard, above), so a side is skipped whole only when _all_
 its recipes are present — one absent drv still pays that side's import, with
 instantiation trimmed to the absent attrs.
+
+**And the pass is gated on the store, not on nix-eval-jobs' exit code.** A
+per-attr eval error is reported in band and leaves the exit code 0, so a pass
+whose jobs all "completed" can still have left a requested `.drv` unwritten —
+and the next thing to touch that drv would be the build phase, an hour later,
+failing with an opaque `nix-store` "path is not valid". So once the pass ends,
+`instantiate_execute` re-asks the store (`absent_drvs`, the same durable record
+the retry below consults) whether every drv it was asked for is now valid, and
+one that is not fails the run right there, naming the attr, its drv, and the
+in-band error nix-eval-jobs streamed for it (kept from the rows for exactly this;
+everything else about a row is discarded). Never asserting what wasn't observed
+(§5) cuts both ways: a recipe the store doesn't hold is not "instantiated".
 
 **Which makes an aborted pass cheap: the same filter _is_ the retry.** This phase
 is the one that salvages partial work (above), and it needs nothing new to do it —
