@@ -1,6 +1,6 @@
 [package]
 name = "npb"
-version = "1.1.2"
+version = "1.1.3"
 publish = false
 edition = "2024"
 

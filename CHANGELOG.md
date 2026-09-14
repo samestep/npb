@@ -1,5 +1,9 @@
 # Changelog for `npb`
 
+## 1.1.3
+
+- Improve performance when searching for failed dependencies ([`7e4d47a`](https://github.com/samestep/npb/commit/7e4d47a26a4f05a753eb270b5147a052dd216a30))
+
 ## 1.1.2
 
 - Fix `instantiate` counts resetting to zero when finished ([`b8a5051`](https://github.com/samestep/npb/commit/b8a505160d84692333b061dfcb786fa665030ca0))
