@@ -1,4 +1,4 @@
-# Changelog
+# Changelog for `npb`
 
 ## 1.1.2
 
