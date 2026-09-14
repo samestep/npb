@@ -298,10 +298,16 @@ never a bare failure inferred from nix's ambiguous exit code.
 **Forward-propagating failures, and self-healing them.** Recording a
 dependency's failure is only half the recovery. The changed-set _target_ a
 failed dependency blocks never gets its own build activity, so before building,
-the driver drops any target whose **build closure** (`nix-store --query
---requisites` on its `.drv`) contains a still-failing dependency, recording a
-`DepFailed` immediately (committed, so a ^C keeps it and the next run skips the
-dependent without re-pulling the failing dependency). Two properties make this
+the driver drops any target whose **build closure** contains a still-failing
+dependency, recording a `DepFailed` immediately (committed, so a ^C keeps it and
+the next run skips the dependent without re-pulling the failing dependency). The
+blocked set is attributed from the _culprit's_ side (`blocked_by_failing`): one
+union `nix-store --query --requisites` over all the targets says which failing
+candidates any of them reaches at all, and each verified culprit's
+`--referrers-closure` is then intersected with the targets — one `nix-store`
+call per culprit, normally a handful, rather than one per target. (The
+per-target forward walk it replaced spent hours on a staging-next changed set,
+~115k uncached targets, to attribute a single block.) Two properties make this
 both sound and _self-correcting_:
 
 - **Verified, not assumed.** `Store::failing_drvs` (drvs with a local failure
@@ -310,9 +316,9 @@ both sound and _self-correcting_:
   (`verify_failing`: are its outputs actually still invalid?) before it may
   block anything. A dependency that has since built or been substituted — a
   flaky failure, a since-fixed one — drops out, and never blocks a dependent on
-  stale news. (A target's own drv is excluded from its culprit search:
-  `--requisites` lists a drv among its own inputs, and a re-opened target still
-  carries its old failure, so without this a target would block _itself_.)
+  stale news. (A target is never its own culprit: both closure queries list a
+  drv itself, and a re-opened target still carries its old failure, so without
+  the exclusion a target would block _itself_.)
 - **Self-healing via the culprit `blocker`.** A recorded `DepFailed` stores the
   culprit dependency's output paths (`Observation::blocker`). A later run
   re-checks those paths' validity **offline** — one `nix-store

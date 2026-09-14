@@ -313,33 +313,46 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
     Ok(invalid.into_inner().unwrap())
 }
 
-/// The build closure of `drvs` as a set of store paths — every input `.drv`
-/// (and source) nix would need to realise them, transitively (`nix-store
-/// --query --requisites`). Used to propagate a known failure forward
-/// (DESIGN.md §5): if a target's closure contains a drv recorded as failing,
-/// building the target would only `DepFail`, so it can be skipped.
-fn drv_closure(drvs: &[&str]) -> Result<HashSet<String>> {
-    if drvs.is_empty() {
-        return Ok(HashSet::new());
-    }
-    // Chunked to stay under ARG_MAX; the requisites of a set of drvs is the
-    // union of each drv's requisites, so unioning the per-chunk output is exact.
-    let mut reqs = HashSet::new();
-    for chunk in drvs.chunks(NIX_STORE_ARG_CHUNK) {
+/// One `nix-store --query <op>` over `paths`, as the set of paths it prints.
+/// Chunked to stay under ARG_MAX; both closure directions distribute over set
+/// union (the closure of a set is the union of its members' closures), so
+/// unioning the per-chunk output is exact.
+fn store_query(op: &str, paths: &[&str]) -> Result<HashSet<String>> {
+    let mut acc = HashSet::new();
+    for chunk in paths.chunks(NIX_STORE_ARG_CHUNK) {
         let out = Command::new(crate::NIX_STORE)
-            .args(["--query", "--requisites"])
+            .args(["--query", op])
             .args(chunk)
             .output()
-            .context("running nix-store --query --requisites")?;
+            .with_context(|| format!("running nix-store --query {op}"))?;
         if !out.status.success() {
             anyhow::bail!(
-                "nix-store --query --requisites failed: {}",
+                "nix-store --query {op} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        reqs.extend(cache::lines(&out.stdout));
+        acc.extend(cache::lines(&out.stdout));
     }
-    Ok(reqs)
+    Ok(acc)
+}
+
+/// The build closure of `drvs` as a set of store paths — every input `.drv`
+/// (and source) nix would need to realise them, transitively (`nix-store
+/// --query --requisites`), the drvs themselves included. Used to propagate a
+/// known failure forward (DESIGN.md §5): if a target's closure contains a drv
+/// recorded as failing, building the target would only `DepFail`, so it can
+/// be skipped.
+fn drv_closure(drvs: &[&str]) -> Result<HashSet<String>> {
+    store_query("--requisites", drvs)
+}
+
+/// The exact reverse of [`drv_closure`]: every store path whose build closure
+/// contains `drv` — the drvs that would pull it in as an input, transitively
+/// (`nix-store --query --referrers-closure`), `drv` itself included. Answered
+/// from the store's own reference table, so it costs about the same as a
+/// forward closure query regardless of how many dependents there are.
+fn drv_dependents(drv: &str) -> Result<HashSet<String>> {
+    store_query("--referrers-closure", &[drv])
 }
 
 /// Did this drv's build succeed — are all its outputs valid in the local
@@ -517,6 +530,69 @@ fn verify_failing(candidates: &HashSet<String>) -> Result<HashMap<String, Vec<St
         .into_iter()
         .filter(|(_, outs)| outs.is_empty() || outs.iter().any(|o| invalid.contains(o)))
         .collect())
+}
+
+/// Which of `targets` are blocked by a **verified** still-failing drv drawn from
+/// `failing` (the log's candidates, `Store::failing_drvs`), each mapped to its
+/// culprit's output paths — the `blocker` of the `DepFailed` to record, which is
+/// what lets the block self-heal offline later (DESIGN.md §5). Shared by pass
+/// 1b (before the batch) and the post-batch leftover sweep.
+///
+/// Attributed from the *culprit's* side. One union closure query over all the
+/// targets says which candidates any of them can reach at all; those are
+/// verified against the store; then each verified culprit is walked
+/// *backwards* (`drv_dependents`) and its dependents intersected with the
+/// targets. That is one `nix-store` call per culprit — normally a handful —
+/// where a per-target forward walk is one call per target, which on a
+/// staging-next changed set (~115k uncached targets) took hours to attribute a
+/// single block. Culprits are visited in path order, so a target reachable from
+/// several gets the same one every run (any verified culprit is a valid
+/// blocker), and the walk stops once every target has one. A target is never
+/// its own culprit: both closure queries list a drv itself, and a re-opened
+/// target still carries its own failure in the log, so without the exclusion a
+/// target would block *itself* forever.
+fn blocked_by_failing(
+    targets: &[&str],
+    failing: &HashSet<String>,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut blocked: HashMap<String, Vec<String>> = HashMap::new();
+    if targets.is_empty() || failing.is_empty() {
+        return Ok(blocked);
+    }
+    let reachable: HashSet<String> = drv_closure(targets)?
+        .into_iter()
+        .filter(|d| failing.contains(d))
+        .collect();
+    let mut culprits: Vec<(String, Vec<String>)> =
+        verify_failing(&reachable)?.into_iter().collect();
+    culprits.sort();
+    let target_set: HashSet<&str> = targets.iter().copied().collect();
+    for (culprit, outs) in culprits {
+        if blocked.len() == target_set.len() {
+            break;
+        }
+        for d in drv_dependents(&culprit)? {
+            if d != culprit && target_set.contains(d.as_str()) && !blocked.contains_key(&d) {
+                blocked.insert(d, outs.clone());
+            }
+        }
+    }
+    Ok(blocked)
+}
+
+/// Record one `DepFailed` per blocked drv, in path order so the log reads the
+/// same way run to run.
+fn record_dep_blocks(store: &mut Store, blocked: &HashMap<String, Vec<String>>) -> Result<()> {
+    let mut drvs: Vec<&String> = blocked.keys().collect();
+    drvs.sort();
+    for drv in drvs {
+        store.add_observation(&Observation {
+            drv_path: drv.clone(),
+            outcome: Outcome::DepFailed,
+            blocker: blocked[drv].clone(),
+        })?;
+    }
+    Ok(())
 }
 
 /// For each target, consult `policy` against the observation log; then build the
@@ -844,47 +920,15 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         store.failing_drvs()?
     };
     if !failing.is_empty() && !to_build.is_empty() {
-        // One union query first: only the drvs whose closure actually reaches the
-        // log's failing set are worth the per-drv verification (drv_outputs + a
-        // validity probe), and a since-healed candidate drops out here.
         let cand: Vec<&str> = to_build
             .iter()
             .map(|&i| targets[i].drv_path.as_str())
             .collect();
-        let reachable: HashSet<String> = drv_closure(&cand)?
-            .into_iter()
-            .filter(|d| failing.contains(d))
-            .collect();
-        let verified = verify_failing(&reachable)?;
-        if !verified.is_empty() {
-            let mut still_build = Vec::new();
-            let mut blocked_seen: HashSet<&str> = HashSet::new();
-            for &i in &to_build {
-                let drv = targets[i].drv_path.as_str();
-                // A still-failing dependency in this target's closure is the
-                // culprit; its outputs become the block's `blocker`. Exclude the
-                // target itself: `--requisites` lists a drv among its own inputs,
-                // and a re-opened target still carries its own failure in the log,
-                // so without this a target would block *itself* forever.
-                let culprit = drv_closure(&[drv])?
-                    .into_iter()
-                    .filter(|d| d != drv)
-                    .find_map(|d| verified.get(&d).cloned());
-                match culprit {
-                    None => still_build.push(i),
-                    // Aliased attrs share a drv — record the block once.
-                    Some(blocker) => {
-                        if blocked_seen.insert(drv) {
-                            store.add_observation(&Observation {
-                                drv_path: drv.to_string(),
-                                outcome: Outcome::DepFailed,
-                                blocker,
-                            })?;
-                        }
-                    }
-                }
-            }
-            to_build = still_build;
+        let blocked = blocked_by_failing(&cand, &failing)?;
+        if !blocked.is_empty() {
+            // Keyed by drv, so aliased attrs sharing one record the block once.
+            record_dep_blocks(&mut store, &blocked)?;
+            to_build.retain(|&i| !blocked.contains_key(&targets[i].drv_path));
         }
     }
 
@@ -970,12 +1014,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .collect();
         if !leftover.is_empty() {
             let built_map = build_outcomes(&leftover)?;
-            // Pass 2 may have just added this batch's own dependency failures.
-            let failing_now = if policy.retry {
-                HashSet::new()
-            } else {
-                store.failing_drvs()?
-            };
+            let mut unresolved: Vec<&str> = Vec::new();
             for &drv in &leftover {
                 if built_map.get(drv).copied().unwrap_or(false) {
                     store.add_observation(&Observation {
@@ -983,26 +1022,17 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                         outcome: Outcome::Built,
                         blocker: Vec::new(),
                     })?;
-                    continue;
-                }
-                if failing_now.is_empty() {
-                    continue;
-                }
-                // Exclude the target itself (see pass 1b): a leftover target that
-                // failed to build isn't blocked *by itself*, and its own drv is in
-                // its `--requisites`.
-                let reachable: HashSet<String> = drv_closure(&[drv])?
-                    .into_iter()
-                    .filter(|d| d != drv && failing_now.contains(d))
-                    .collect();
-                if let Some(blocker) = verify_failing(&reachable)?.into_values().next() {
-                    store.add_observation(&Observation {
-                        drv_path: drv.to_string(),
-                        outcome: Outcome::DepFailed,
-                        blocker,
-                    })?;
+                } else {
+                    unresolved.push(drv);
                 }
             }
+            // Pass 2 may have just added this batch's own dependency failures.
+            let failing_now = if policy.retry || unresolved.is_empty() {
+                HashSet::new()
+            } else {
+                store.failing_drvs()?
+            };
+            record_dep_blocks(&mut store, &blocked_by_failing(&unresolved, &failing_now)?)?;
         }
     }
 
