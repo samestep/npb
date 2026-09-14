@@ -1141,25 +1141,28 @@ pub fn instantiate_execute(
                 paths,
                 &profile_config(profile),
             );
-            // The `.drv` writes are the point; of the streamed rows only the
-            // error ones are kept (attr, error), for the gate below. The per-job
-            // callback drives the live count.
-            let rows = stream_jobs(
+            // The `.drv` writes are the point; a streamed row carries only its
+            // in-band error, if any, for the gate below. Every job still yields
+            // one row (`None` for a recipe that landed): when the group's last
+            // shard finishes, `run_shards` pins the node's count to the row
+            // total, so dropping the successes here would show `0 / N` the
+            // moment the row turned green. The per-job callback drives the
+            // live count in the meantime.
+            stream_jobs(
                 &expr,
                 1,
                 DEFAULT_WORKER_MEM_MB,
                 true,
                 label,
-                |raw: RawJob| {
-                    let attr = requested_attr(&raw.attr_path, paths)?;
-                    Some((attr, raw.error?))
-                },
+                |raw: RawJob| requested_attr(&raw.attr_path, paths).zip(raw.error),
                 || on_item(1),
-            )?;
-            Ok(rows.into_iter().flatten().collect())
+            )
         },
-        |gi, rows: Vec<(String, String)>| {
-            errors[gi].lock().unwrap().extend(rows);
+        |gi, rows: Vec<Option<(String, String)>>| {
+            errors[gi]
+                .lock()
+                .unwrap()
+                .extend(rows.into_iter().flatten());
             Ok(())
         },
         // The durable record: a `.drv` a dead worker had already written is in the
