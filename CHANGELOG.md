@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2
+
+- Fix `instantiate` counts resetting to zero when finished ([`b8a5051`](https://github.com/samestep/npb/commit/b8a505160d84692333b061dfcb786fa665030ca0))
+
 ## 1.1.1
 
 - Allow attr paths containing functions that can be auto-called with `{ }` ([`3287434`](https://github.com/samestep/npb/commit/32874341be93f0a85d972301e15f62bec4f07f36))
