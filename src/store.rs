@@ -200,21 +200,28 @@ impl Store {
         Ok(out)
     }
 
-    /// Every drv whose history is failures-only — at least one observation, none
-    /// of them a success. This is exactly the failures-only condition
-    /// [`crate::model::BuildPolicy::decide`] applies per drv, lifted to a set so
-    /// the build driver can propagate a known failure *forward* through the
-    /// dependency graph (DESIGN.md §5): any target whose build closure contains
-    /// such a drv would only `DepFail`, so it can be skipped without building. A
-    /// drv with any recorded `Built` — its own build, or cache presence (§7) —
-    /// is excluded: nix wouldn't re-attempt it as a dependency, so it blocks
-    /// nothing.
+    /// Every drv with a recorded *direct* failure and no success — at least one
+    /// `Failed`, no `Built` — the candidate culprits the build driver propagates
+    /// *forward* through the dependency graph (DESIGN.md §5): any target whose
+    /// build closure contains such a drv would only `DepFail`, so it can be
+    /// skipped without building. A drv with any recorded `Built` — its own
+    /// build, or cache presence (§7) — is excluded: nix wouldn't re-attempt it
+    /// as a dependency, so it blocks nothing.
+    ///
+    /// A `DepFailed`-only drv is excluded too, though `decide` skips it as a
+    /// target: it was never attempted, so its outputs are always invalid and
+    /// `verify_failing` would "verify" it as a culprit. In the run whose
+    /// stale-block re-check re-opens it, that would block every dependent of it
+    /// in the same build set — healing a dependency chain one level per run. It
+    /// is never needed as a culprit anyway: whatever actually failed beneath it
+    /// is in its dependents' closures too, and is a candidate in its own right.
     pub fn failing_drvs(&self) -> Result<std::collections::HashSet<String>> {
         // The enum code is interpolated from the mapper so the query can't
         // drift from it (an integer literal in a STRICT column).
         let sql = format!(
             "SELECT drv_path FROM observation GROUP BY drv_path \
-             HAVING SUM(outcome = {built}) = 0",
+             HAVING SUM(outcome = {failed}) > 0 AND SUM(outcome = {built}) = 0",
+            failed = outcome_code(Outcome::Failed),
             built = outcome_code(Outcome::Built),
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -614,19 +621,15 @@ mod tests {
         // d: only a success (e.g. a recorded cache hit) -> NOT failing.
         s.add_observation(&obs("/nix/store/d.drv", Outcome::Built))
             .unwrap();
-        // e: dep-failed only -> failing.
+        // e: dep-failed only -> NOT failing: never attempted, so it can't be
+        // a culprit (its outputs are invalid only because it never built).
         s.add_observation(&obs("/nix/store/e.drv", Outcome::DepFailed))
             .unwrap();
 
         let failing = s.failing_drvs().unwrap();
         assert_eq!(
             failing,
-            [
-                "/nix/store/a.drv".to_string(),
-                "/nix/store/e.drv".to_string()
-            ]
-            .into_iter()
-            .collect()
+            ["/nix/store/a.drv".to_string()].into_iter().collect()
         );
 
         let _ = fs::remove_dir_all(&dir);

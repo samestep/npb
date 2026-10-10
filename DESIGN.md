@@ -311,15 +311,20 @@ per-target forward walk it replaced spent hours on a staging-next changed set,
 ~115k uncached targets, to attribute a single block.) Two properties make this
 both sound and _self-correcting_:
 
-- **Verified, not assumed.** `Store::failing_drvs` (drvs with a local failure
-  and no success _in the log_) is only a **candidate** set; each candidate
+- **Verified, not assumed.** `Store::failing_drvs` (drvs with a direct
+  `Failed` and no success _in the log_) is only a **candidate** set; each candidate
   reachable from a target's closure is re-checked against the store
   (`verify_failing`: are its outputs actually still invalid?) before it may
   block anything. A dependency that has since built or been substituted — a
   flaky failure, a since-fixed one — drops out, and never blocks a dependent on
   stale news. (A target is never its own culprit: both closure queries list a
   drv itself, and a re-opened target still carries its old failure, so without
-  the exclusion a target would block _itself_.)
+  the exclusion a target would block _itself_.) A `DepFailed`-only drv is never
+  a candidate: it was never attempted, so its outputs are invalid _because_ it
+  never built, and "verifying" it would let a re-opened target block its own
+  dependents in the same batch — re-opening a blocked chain one level per run.
+  Whatever actually failed beneath it is a candidate in its own right, and sits
+  in those dependents' closures too.
 - **Self-healing via the culprit `blocker`.** A recorded `DepFailed` stores the
   culprit dependency's output paths (`Observation::blocker`). A later run
   re-checks those paths' validity **offline** — one `nix-store

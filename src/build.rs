@@ -1593,4 +1593,72 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// The self-heal must re-open a whole blocked chain in ONE run, not one level
+    /// per run. `dep` failed (and has since built); `mid` and `top` were both
+    /// blocked by it, and `top` depends on `mid`. Both blocks are stale, so both
+    /// are re-attempted — and `mid`'s own `DepFailed`-only history must not make
+    /// it a culprit for `top`: unbuilt, its outputs are invalid, so
+    /// `verify_failing` would "verify" it, and pass 1b would drop `top` from the
+    /// very batch that builds `mid`, re-blocking it until the next run.
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn stale_dependency_blocks_reopen_a_chain_in_one_run() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npb-chain-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npb.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npb-chain-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
+                 mid = mk "npb-chain-mid-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+                 top = mk "npb-chain-top-{nonce}" {{ args = ["-c" ": ${{mid}}; echo ok > $out"]; }};
+               in {{ inherit dep mid top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let mid = instantiate(&expr, "mid");
+        let top = instantiate(&expr, "top");
+        let dep_outs = cache::drv_outputs(&dep).unwrap();
+
+        // The culprit has healed: realize `dep` so its outputs are valid.
+        let ok = Command::new(crate::NIX)
+            .args(["build", "--no-link", &format!("{dep}^*")])
+            .args(["--extra-experimental-features", "nix-command"])
+            .status()
+            .expect("building the dependency");
+        assert!(ok.success(), "the healed dependency should build");
+
+        // Plant what a prior run left: `dep` failed, and blocked both targets.
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&planted(&dep, Outcome::Failed)).unwrap();
+            let blocker: Vec<&str> = dep_outs.iter().map(String::as_str).collect();
+            s.add_observation(&planted_block(&mid, &blocker)).unwrap();
+            s.add_observation(&planted_block(&top, &blocker)).unwrap();
+        }
+
+        let targets = [&mid, &top].map(|d| Target {
+            drv_path: d.clone(),
+        });
+        build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        for drv in [&mid, &top] {
+            let obs = s.load_observations(drv).unwrap();
+            assert!(
+                obs.iter().any(|o| o.outcome == Outcome::Built),
+                "both stale blocks must re-open and build in one run: {drv} {obs:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
