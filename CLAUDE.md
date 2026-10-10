@@ -72,3 +72,27 @@ maintainer writes the changelog themselves at release time, in their own words,
 after seeing the whole set of changes going into a version. If a change is
 worth a changelog line, say so in your final summary (what a user would notice,
 in a sentence) so it can be written up then — but leave the file alone.
+
+## Cutting a release
+
+Releases have been cut from memory, and steps get skipped (1.1.1 and 1.2.0
+shipped with a stale `Cargo.lock`). When asked to prepare a release, or when a
+task ends in one, do these in order, each its own commit on `main`:
+
+1. **Refresh both lockfiles:** `nix flake update`, and `cargo update` in the
+   dev shell. Run `nix flake check`, then commit them together as "Update
+   `flake.lock` and `Cargo.lock`" (or name just the one that changed). Do both
+   every release: `Cargo.lock` matters more, since it's what Nixpkgs builds
+   npb from, while `flake.lock` only reaches people using the flake directly —
+   but neither should go stale.
+2. **The release commit**, "Release version X.Y.Z": bump `version` in
+   `Cargo.toml`, let `Cargo.lock` pick it up, and add the `## X.Y.Z` heading to
+   `CHANGELOG.md`. The entries under it are the maintainer's to write (see
+   above) — stop and ask for them rather than drafting them into the file. Run
+   `nix flake check` before committing.
+3. **Tag it:** `git tag vX.Y.Z` (a lightweight tag, like the existing ones) on
+   the release commit. Reports link npb's version to `tree/vX.Y.Z`, so that
+   link is broken until the tag is pushed.
+4. **Push** `main` and the tag together — `git push origin main vX.Y.Z` — once
+   the maintainer confirms; a pushed tag is a published release. If you can't
+   push, say that both still need pushing.
