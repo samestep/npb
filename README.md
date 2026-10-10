@@ -281,7 +281,13 @@ npb --allow-insecure
 
 ### `--overlay`
 
-TODO
+To apply a Nixpkgs overlay:
+
+```sh
+npb --overlay 'final: prev: { pypy311Packages = final.lib.recurseIntoAttrs prev.pypy311Packages; }'
+```
+
+This argument can be repeated.
 
 ### `--retry`
 

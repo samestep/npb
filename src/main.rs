@@ -91,7 +91,7 @@ struct Cli {
     /// Set allowInsecurePredicate to true in Nixpkgs config
     #[arg(long)]
     allow_insecure: bool,
-    /// TODO
+    /// Nixpkgs overlay expression
     #[arg(long, value_name = "EXPR")]
     overlay: Vec<String>,
     /// Try to build derivations that have failed before
