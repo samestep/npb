@@ -828,10 +828,19 @@ enum HeadRepro {
     Embed { anchor: String, diff: String },
 }
 
-/// Quote `s` as one POSIX shell word: wrapped in single quotes, inside which
-/// nothing is special, with each embedded `'` spelled `'\''` (close, escaped
-/// quote, reopen). Newlines need no escaping inside single quotes.
+/// Quote `s` as one POSIX shell word. A word made only of characters no shell
+/// treats specially anywhere in a word (letters, digits, `._+-/:@,`) is left
+/// bare, so the common `-p hello -s x86_64-linux` reads as typed. Anything
+/// else is wrapped in single quotes, inside which nothing is special, with
+/// each embedded `'` spelled `'\''` (close, escaped quote, reopen); newlines
+/// need no escaping inside single quotes. The bare set is deliberately narrow:
+/// `"` would be stripped (so `-p texlivePackages."texlive.infra"` would name a
+/// different, three-element path), and `=`/`~` expand at a word's start in zsh.
 fn shell_quote(s: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || "._+-/:@,".contains(c);
+    if !s.is_empty() && s.chars().all(bare) {
+        return s.to_string();
+    }
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -880,11 +889,11 @@ fn repro_command(
     // would reproduce a different report (DESIGN §8).
     if let Some(attrs) = coverage.only() {
         for a in attrs {
-            flags.push_str(&format!(" -p {a}"));
+            flags.push_str(&format!(" -p {}", shell_quote(a)));
         }
     }
     for s in systems {
-        flags.push_str(&format!(" -s {s}"));
+        flags.push_str(&format!(" -s {}", shell_quote(s)));
     }
     match head {
         HeadRepro::Commit(sha) => format!("npb --base {base_sha} --head {sha}{flags}"),
@@ -2236,6 +2245,22 @@ mod tests {
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -p git -p hello -s sys");
 
+        // An attr path with a quoted element is quoted whole, or the shell would
+        // strip the `"`s and the repro would select a different path.
+        let cmd = repro_command(
+            "aaa",
+            &HeadRepro::Commit("bbb".into()),
+            false,
+            &strict,
+            false,
+            &Coverage::Only(vec!["texlivePackages.\"texlive.infra\"".into()]),
+            &["x86_64-linux".into()],
+        );
+        assert_eq!(
+            cmd,
+            "npb --base aaa --head bbb -p 'texlivePackages.\"texlive.infra\"' -s x86_64-linux"
+        );
+
         // Overlays change what evaluates, so each is echoed, in order, as one
         // shell word each.
         let overlays = Profile {
@@ -2260,13 +2285,38 @@ mod tests {
 
     #[test]
     fn shell_quote_round_trips_through_sh() {
-        for s in ["", "plain", "it's", "''", "a\nb", "$HOME `x` \"q\" \\ !"] {
+        for s in [
+            "",
+            "plain",
+            "it's",
+            "''",
+            "a\nb",
+            "$HOME `x` \"q\" \\ !",
+            "texlivePackages.\"texlive.infra\"",
+            "python3Packages.foo-bar",
+            "gtk+3",
+            "x86_64-linux",
+            "a,b:c@d/e",
+            "=x",
+            "~",
+            "*",
+            "a b",
+        ] {
             let out = std::process::Command::new("sh")
                 .args(["-c", &format!("printf %s {}", shell_quote(s))])
                 .output()
                 .unwrap();
             assert_eq!(String::from_utf8(out.stdout).unwrap(), s);
         }
+        // Only words that need it are quoted.
+        assert_eq!(
+            shell_quote("python3Packages.foo-bar"),
+            "python3Packages.foo-bar"
+        );
+        assert_eq!(shell_quote("x86_64-linux"), "x86_64-linux");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("=x"), "'=x'");
+        assert_eq!(shell_quote("~"), "'~'");
     }
 
     #[test]

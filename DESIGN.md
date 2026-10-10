@@ -1316,10 +1316,14 @@ on a **pinned base** and a head whose **tree** is pinned: because the eval is
 tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
 review byte-for-byte, and npb re-mints the merge itself — the command never names
 a synthetic (local-only) commit. Only report-shaping flags are echoed
-(`--no-merge`, the profile's `--allow-broken`/`--allow-unsupported`/`--allow-insecure`,
-`--no-tests`, each `-p` of a selection (§6), and an explicit `-s` per system,
-since the default system is host-specific); `--retry` and the eval-sizing
-knobs don't change the changeset, so they're omitted. What varies is only how the
+(`--no-merge`, the profile's `--allow-broken`/`--allow-unsupported`/`--allow-insecure`
+and each `--overlay` in order, `--no-tests`, each `-p` of a selection (§6), and an
+explicit `-s` per system, since the default system is host-specific); `--retry`
+and the eval-sizing knobs don't change the changeset, so they're omitted. Every
+user-supplied value among them (an overlay, a `-p` attr path, a system) is one
+shell word, single-quoted unless it is made only of characters no shell treats
+specially (`shell_quote`) — so `-p 'texlivePackages."texlive.infra"'` keeps its
+quoted element, while `-p hello -s x86_64-linux` reads as typed. What varies is only how the
 _head_'s tree is recovered on another machine:
 
 - a committed / explicit head is already a fetchable commit → `--head <sha>`;
