@@ -19,7 +19,7 @@
 //! `DepFailed` carries its culprit's outputs (`Observation::blocker`) so a
 //! since-healed dependency un-blocks its dependents automatically, no `--retry`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -444,16 +444,27 @@ fn build_outcomes(drvs: &[&str]) -> Result<HashMap<String, bool>> {
 }
 
 /// For each target with a `DepFailed`-only history, whether its recorded block is
-/// now **stale** — the culprit dependency's outputs (`Observation::blocker`) are
-/// all valid in the store, so it has built or been substituted since (DESIGN.md
-/// §5). This is the self-healing check, and it is deliberately **offline**: one
-/// `nix-store --check-validity` over the stored blocker paths, needing no `.drv`
-/// and no closure walk, so a fully-cached run stays instant. A `DepFailed` with
-/// no recorded blocker (its culprit unknown) is treated conservatively as *not*
-/// stale — it keeps blocking until `--retry`. The store-validity signal mirrors,
-/// for a dependency, what a recorded `Built` already does for a target
-/// (`flaky_success_wins`): a later success outranks an earlier failure.
+/// now **stale** — its culprit dependency has built or been substituted since,
+/// so the target is re-attempted (DESIGN.md §5). Two signals, both **offline**
+/// (no `.drv`, no closure walk), so a fully-cached run stays instant:
+///
+/// - the culprit's outputs (`Observation::blocker`) are all valid in the store —
+///   one `nix-store --check-validity` over the stored blocker paths; or
+/// - the log says the culprit healed: a drv whose `Failed` row recorded exactly
+///   those outputs has a later `Built` ([`Store::healed_failure_outputs`]). This
+///   is what keeps a block from outliving its culprit once the culprit's outputs
+///   are garbage-collected — npb keeps no GC roots, and nothing would ever
+///   rebuild the culprit while its dependents stay skipped. Consulted only when
+///   some block isn't already stale by the first signal.
+///
+/// A `DepFailed` with no recorded blocker (its culprit unknown) is treated
+/// conservatively as *not* stale — it keeps blocking until `--retry`; so is one
+/// whose culprit's `Failed` row recorded no outputs (nothing to match). The
+/// store-validity signal mirrors, for a dependency, what a recorded `Built`
+/// already does for a target (`flaky_success_wins`): a later success outranks an
+/// earlier failure.
 fn stale_dep_blocks(
+    store: &Store,
     targets: &[Target],
     obs_by_drv: &HashMap<String, Vec<Observation>>,
 ) -> Result<HashMap<String, bool>> {
@@ -479,10 +490,22 @@ fn stale_dep_blocks(
         return Ok(HashMap::new());
     }
     let invalid = invalid_paths(&all_paths)?;
+    let valid = |blocker: &[String]| blocker.iter().all(|p| !invalid.contains(p));
+    // Compared as sets: the same outputs, however they were ordered when recorded.
+    let healed: HashSet<BTreeSet<String>> = if per_target.iter().all(|(_, b)| valid(b)) {
+        HashSet::new()
+    } else {
+        store
+            .healed_failure_outputs()?
+            .into_iter()
+            .map(|outs| outs.into_iter().collect())
+            .collect()
+    };
     Ok(per_target
         .into_iter()
         .map(|(drv, blocker)| {
-            let stale = blocker.iter().all(|p| !invalid.contains(p));
+            let stale = valid(&blocker)
+                || healed.contains(&blocker.iter().cloned().collect::<BTreeSet<_>>());
             (drv, stale)
         })
         .collect())
@@ -568,17 +591,31 @@ fn recheck_direct_failures(
     })
 }
 
-/// From a set of candidate failing drvs (drawn from the observation log), the
-/// subset that is **actually still failing** — some output is invalid in the
-/// store — mapped to that drv's output paths (its `blocker` if it culprits a
-/// dependent). A candidate whose outputs are now all valid has healed since (a
-/// rebuild, or an unrelated build substituted it) and is dropped, so a stale
-/// failure fact can never re-block. Callers pass candidates drawn from an
-/// instantiated target's closure, so each candidate's `.drv` is present and
-/// `drv_outputs` resolves.
-fn verify_failing(candidates: &HashSet<String>) -> Result<HashMap<String, Vec<String>>> {
+/// What re-checking candidate failing drvs against the store turned up
+/// ([`verify_failing`]).
+#[derive(Default)]
+struct FailingCheck {
+    /// Candidates **actually still failing** — some output invalid in the store —
+    /// mapped to their output paths (the `blocker` if one culprits a dependent).
+    failing: HashMap<String, Vec<String>>,
+    /// Candidates whose outputs are now all valid: they built or were
+    /// substituted since their failure, so record a `Built` (DESIGN §5).
+    healed: HashSet<String>,
+}
+
+/// Split a set of candidate failing drvs (drawn from the observation log) into
+/// those **actually still failing** and those that have **healed** — all
+/// outputs now valid, because a rebuild or an unrelated build realized them
+/// since. A healed candidate never blocks, and the caller records its `Built`
+/// ([`record_healed`]): without that row it would stay a candidate, and once
+/// its outputs were garbage-collected it would "verify" as failing again and
+/// falsely block every dependent. (A dependency's *success* is otherwise never
+/// recorded, so this is how a failed dependency's later success reaches the
+/// log.) Callers pass candidates drawn from an instantiated target's closure,
+/// so each candidate's `.drv` is present and `drv_outputs` resolves.
+fn verify_failing(candidates: &HashSet<String>) -> Result<FailingCheck> {
     if candidates.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(FailingCheck::default());
     }
     let mut per_drv: Vec<(String, Vec<String>)> = Vec::new();
     let mut all = Vec::new();
@@ -588,10 +625,30 @@ fn verify_failing(candidates: &HashSet<String>) -> Result<HashMap<String, Vec<St
         per_drv.push((d.clone(), outs));
     }
     let invalid = invalid_paths(&all)?;
-    Ok(per_drv
-        .into_iter()
-        .filter(|(_, outs)| outs.is_empty() || outs.iter().any(|o| invalid.contains(o)))
-        .collect())
+    let mut check = FailingCheck::default();
+    for (drv, outs) in per_drv {
+        if outs.is_empty() || outs.iter().any(|o| invalid.contains(o)) {
+            check.failing.insert(drv, outs);
+        } else {
+            check.healed.insert(drv);
+        }
+    }
+    Ok(check)
+}
+
+/// Record a `Built` for each drv [`verify_failing`] found healed, in path order
+/// so the log reads the same way run to run.
+fn record_healed(store: &mut Store, healed: &HashSet<String>) -> Result<()> {
+    let mut drvs: Vec<&String> = healed.iter().collect();
+    drvs.sort();
+    for drv in drvs {
+        store.add_observation(&Observation {
+            drv_path: drv.clone(),
+            outcome: Outcome::Built,
+            blocker: Vec::new(),
+        })?;
+    }
+    Ok(())
 }
 
 /// Which of `targets` are blocked by a **verified** still-failing drv drawn from
@@ -613,20 +670,23 @@ fn verify_failing(candidates: &HashSet<String>) -> Result<HashMap<String, Vec<St
 /// its own culprit: both closure queries list a drv itself, and a re-opened
 /// target still carries its own failure in the log, so without the exclusion a
 /// target would block *itself* forever.
-fn blocked_by_failing(
-    targets: &[&str],
-    failing: &HashSet<String>,
-) -> Result<HashMap<String, Vec<String>>> {
+///
+/// Also returns the reachable candidates that turned out healed, for the caller
+/// to record ([`record_healed`]).
+fn blocked_by_failing(targets: &[&str], failing: &HashSet<String>) -> Result<Blocks> {
     let mut blocked: HashMap<String, Vec<String>> = HashMap::new();
     if targets.is_empty() || failing.is_empty() {
-        return Ok(blocked);
+        return Ok(Blocks {
+            blocked,
+            healed: HashSet::new(),
+        });
     }
     let reachable: HashSet<String> = drv_closure(targets)?
         .into_iter()
         .filter(|d| failing.contains(d))
         .collect();
-    let mut culprits: Vec<(String, Vec<String>)> =
-        verify_failing(&reachable)?.into_iter().collect();
+    let FailingCheck { failing, healed } = verify_failing(&reachable)?;
+    let mut culprits: Vec<(String, Vec<String>)> = failing.into_iter().collect();
     culprits.sort();
     let target_set: HashSet<&str> = targets.iter().copied().collect();
     for (culprit, outs) in culprits {
@@ -639,7 +699,15 @@ fn blocked_by_failing(
             }
         }
     }
-    Ok(blocked)
+    Ok(Blocks { blocked, healed })
+}
+
+/// What [`blocked_by_failing`] found, both keyed on drvpath.
+struct Blocks {
+    /// Each blocked target, mapped to its culprit's output paths.
+    blocked: HashMap<String, Vec<String>>,
+    /// Reachable candidates that verified as healed.
+    healed: HashSet<String>,
 }
 
 /// Record one `DepFailed` per blocked drv, in path order so the log reads the
@@ -695,7 +763,7 @@ fn drvs_to_materialize_at(
     // A stale dep-block re-opens its target (it will be re-attempted), so its
     // `.drv` is needed again — compute staleness the same offline way the build
     // driver does, keeping the two decisions in lockstep.
-    let stale = stale_dep_blocks(targets, &obs_by_drv)?;
+    let stale = stale_dep_blocks(&store, targets, &obs_by_drv)?;
     let mut need = HashSet::new();
     for t in targets {
         let obs = obs_by_drv
@@ -955,7 +1023,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // recorded dependency-block has gone stale (its culprit built or was
     // substituted since; `stale_dep_blocks`, offline). Skips are silent — a
     // fully-cached run must print nothing.
-    let stale = stale_dep_blocks(targets, &obs_by_drv)?;
+    let stale = stale_dep_blocks(&store, targets, &obs_by_drv)?;
     let dep_stale = |drv: &str| stale.get(drv).copied().unwrap_or(false);
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
@@ -975,18 +1043,20 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // (`verify_failing`), so a since-rebuilt/substituted dependency no longer
     // blocks; and the recorded `DepFailed` carries the culprit's output paths as
     // its `blocker`, so a later run can re-check the block offline and re-attempt
-    // the dependent the moment the culprit heals. `--retry` disables propagation.
-    let failing = if policy.retry {
-        HashSet::new()
-    } else {
-        store.failing_drvs()?
-    };
-    if !failing.is_empty() && !to_build.is_empty() {
+    // the dependent the moment the culprit heals. A candidate that verifies as
+    // healed is recorded `Built` (`record_healed`), so it stops being a
+    // candidate. `--retry` disables propagation.
+    //
+    // The candidates are loaded even under `--retry`: pass 2 consults them to
+    // record a failed dependency's later success.
+    let candidates = store.failing_drvs()?;
+    if !policy.retry && !candidates.is_empty() && !to_build.is_empty() {
         let cand: Vec<&str> = to_build
             .iter()
             .map(|&i| targets[i].drv_path.as_str())
             .collect();
-        let blocked = blocked_by_failing(&cand, &failing)?;
+        let Blocks { blocked, healed } = blocked_by_failing(&cand, &candidates)?;
+        record_healed(&mut store, &healed)?;
         if !blocked.is_empty() {
             // Keyed by drv, so aliased attrs sharing one record the block once.
             record_dep_blocks(&mut store, &blocked)?;
@@ -1035,16 +1105,26 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     blocker,
                 })?;
                 recorded.insert(drv.to_string(), outcome);
-            } else if !built {
+            } else if built {
+                // A transitive dependency that built. Nix's store validity
+                // remembers a success, so it normally needs no row — but one
+                // with a recorded failure (a `--retry`, or a flaky dependency)
+                // gets its `Built`, or it would stay a candidate and falsely
+                // block its dependents once its outputs are garbage-collected.
+                if candidates.contains(drv) {
+                    store.add_observation(&Observation {
+                        drv_path: drv.to_string(),
+                        outcome: Outcome::Built,
+                        blocker: Vec::new(),
+                    })?;
+                }
+            } else {
                 // A transitive *dependency* that failed on its own. Record it
                 // (keyed on its drvpath, like every fact) so a later run
                 // propagates the failure forward — skipping any target that would
-                // re-pull it (pass 1b) — and so ^C keeps it. A dependency
-                // *success* needs no row: nix's own store validity already
-                // remembers it, and `verify_failing` consults exactly that so a
-                // healed dependency stops blocking. Its own outputs are recorded
-                // as the `blocker` too, so a dependency that later builds out of
-                // band self-heals just like a requested target (DESIGN §5).
+                // re-pull it (pass 1b) — and so ^C keeps it. Its own outputs
+                // are recorded as the `blocker` too, so a dependency that later
+                // builds out of band self-heals (`verify_failing`; DESIGN §5).
                 store.add_observation(&Observation {
                     drv_path: drv.to_string(),
                     outcome: Outcome::Failed,
@@ -1094,7 +1174,9 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             } else {
                 store.failing_drvs()?
             };
-            record_dep_blocks(&mut store, &blocked_by_failing(&unresolved, &failing_now)?)?;
+            let Blocks { blocked, healed } = blocked_by_failing(&unresolved, &failing_now)?;
+            record_healed(&mut store, &healed)?;
+            record_dep_blocks(&mut store, &blocked)?;
         }
     }
 
@@ -1787,6 +1869,237 @@ mod tests {
                 "both stale blocks must re-open and build in one run: {drv} {obs:?}"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed dependency that has since healed must be recorded `Built`, or it
+    /// stays a failure candidate forever: once its outputs are garbage-collected
+    /// it "verifies" as failing again and falsely blocks every dependent. Here
+    /// `dep` has a recorded failure but valid outputs; reviewing `top` heals it.
+    /// Then `dep`'s output is deleted (a GC) and a fresh dependent `top2` must
+    /// still build — nix rebuilds `dep` — rather than be skipped as `DepFailed`.
+    #[test]
+    #[ignore = "builds and deletes real derivations via nix; needs nix, nom"]
+    fn healed_dependency_failure_does_not_reblock_after_gc() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npb-regc-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npb.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npb-regc-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
+                 top = mk "npb-regc-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+                 top2 = mk "npb-regc-top2-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok2 > $out"]; }};
+               in {{ inherit dep top top2; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+        let top2 = instantiate(&expr, "top2");
+        let dep_outs = cache::drv_outputs(&dep).unwrap();
+
+        // `dep` failed once (a flaky dependency), and has since built.
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&Observation {
+                drv_path: dep.clone(),
+                outcome: Outcome::Failed,
+                blocker: dep_outs.clone(),
+            })
+            .unwrap();
+        }
+        let ok = Command::new(crate::NIX)
+            .args(["build", "--no-link", &format!("{dep}^*")])
+            .args(["--extra-experimental-features", "nix-command"])
+            .status()
+            .expect("building the dependency");
+        assert!(ok.success(), "the healed dependency should build");
+
+        build_targets_at(&db, &[target(&top)], BuildPolicy::default()).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            assert!(
+                s.load_observations(&dep)
+                    .unwrap()
+                    .iter()
+                    .any(|o| o.outcome == Outcome::Built),
+                "a verified-healed dependency is recorded Built"
+            );
+        }
+
+        // Garbage-collect `dep`'s output; a new dependent must not be blocked.
+        let deleted = Command::new(crate::NIX_STORE)
+            .arg("--delete")
+            .args(&dep_outs)
+            .status()
+            .expect("deleting the dependency's output");
+        assert!(
+            deleted.success(),
+            "the dependency's output should be deletable"
+        );
+
+        build_targets_at(&db, &[target(&top2)], BuildPolicy::default()).unwrap();
+        let s = Store::open(&db).unwrap();
+        let obs = s.load_observations(&top2).unwrap();
+        assert!(
+            obs.iter().any(|o| o.outcome == Outcome::Built),
+            "a GC'd healed dependency must not re-block its dependents: {obs:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dependency with a recorded failure that builds in the batch — here under
+    /// `--retry` — gets its success recorded too, so it stops being a candidate.
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn dependency_success_after_failure_is_recorded() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npb-depok-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npb.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npb-depok-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
+                 top = mk "npb-depok-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&planted(&dep, Outcome::Failed)).unwrap();
+        }
+
+        build_targets_at(&db, &[target(&top)], BuildPolicy { retry: true }).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        let obs = s.load_observations(&dep).unwrap();
+        assert_eq!(
+            obs.last().map(|o| o.outcome),
+            Some(Outcome::Built),
+            "the dependency's success after a recorded failure is recorded: {obs:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A flaky dependency that built once and fails again is a culprit again: its
+    /// *latest* direct outcome decides. Otherwise its dependent has no culprit to
+    /// name — left unrecorded (❔) and re-attempted, rebuilding the dependency,
+    /// every run — instead of `DepFailed` (🚫).
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn dependency_failing_again_after_a_success_blocks_its_dependent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npb-refail-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npb.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npb-refail-dep-{nonce}" {{ args = ["-c" "exit 1"]; }};
+                 top = mk "npb-refail-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+        // `dep` failed once and then built (its output since garbage-collected).
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&planted(&dep, Outcome::Failed)).unwrap();
+            s.add_observation(&planted(&dep, Outcome::Built)).unwrap();
+        }
+
+        // Now it fails again, as a dependency of `top`.
+        build_targets_at(&db, &[target(&top)], BuildPolicy::default()).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        let dep_outs = cache::drv_outputs(&dep).unwrap();
+        let top_obs = s.load_observations(&top).unwrap();
+        assert_eq!(
+            top_obs.iter().map(|o| o.outcome).collect::<Vec<_>>(),
+            vec![Outcome::DepFailed],
+            "the re-failed dependency must block its dependent: {top_obs:?}"
+        );
+        assert_eq!(top_obs[0].blocker, dep_outs, "blocked by `dep`");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dep-block must not outlive its culprit's recovery just because the
+    /// culprit's outputs were garbage-collected since. `dep` failed (blocking
+    /// `top`), later built — its `Built` is on record — and was then GC'd: its
+    /// outputs are invalid, so the store alone can't show the block is stale, but
+    /// the log can. `top` is re-attempted, and nix rebuilds `dep` for it.
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn dep_block_lifts_when_its_culprit_healed_even_after_gc() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npb-blockgc-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npb.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npb-blockgc-dep-{nonce}" {{ args = ["-c" "echo ok > $out"]; }};
+                 top = mk "npb-blockgc-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+        let dep_outs = cache::drv_outputs(&dep).unwrap();
+        // Never built here, so `dep`'s outputs are invalid — as after a GC.
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&Observation {
+                drv_path: dep.clone(),
+                outcome: Outcome::Failed,
+                blocker: dep_outs.clone(),
+            })
+            .unwrap();
+            let blocker: Vec<&str> = dep_outs.iter().map(String::as_str).collect();
+            s.add_observation(&planted_block(&top, &blocker)).unwrap();
+            s.add_observation(&planted(&dep, Outcome::Built)).unwrap();
+        }
+
+        build_targets_at(&db, &[target(&top)], BuildPolicy::default()).unwrap();
+
+        let obs = Store::open(&db).unwrap().load_observations(&top).unwrap();
+        assert!(
+            obs.iter().any(|o| o.outcome == Outcome::Built),
+            "a block whose culprit healed must lift, even after a GC: {obs:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

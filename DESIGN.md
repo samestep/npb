@@ -292,10 +292,11 @@ copies the outputs back, so a drv counts as stopped only when its _last_
 activity does — the hook goal's, after the copy; `BuildActivities`.) This
 fires for **every** drv nix builds, not just the requested set — a transitive
 **dependency** that fails is recorded too (keyed on its own drvpath; a
-dependency _success_ needs no row, since nix's store validity already remembers
-it — and the propagation below re-checks exactly that validity). Interrupting the batch therefore keeps every
-fact observed so far — including the failures nix itself forgets — and a re-run
-only re-pays for the in-flight and never-started builds. Requested targets with
+dependency _success_ normally needs no row, since nix's store validity already
+remembers it — except one with a recorded failure, which gets its `Built` so it
+stops being a failure candidate; see below). Interrupting the batch therefore
+keeps every fact observed so far — including the failures nix itself forgets —
+and a re-run only re-pays for the in-flight and never-started builds. Requested targets with
 no build activity (blocked by a failed dep, or already valid) are attributed in
 a post-batch step that records only what it can ground in the store: `Built`
 (outputs valid) or a `DepFailed` naming a _verified still-failing_ culprit —
@@ -316,13 +317,24 @@ per-target forward walk it replaced spent hours on a staging-next changed set,
 ~115k uncached targets, to attribute a single block.) Two properties make this
 both sound and _self-correcting_:
 
-- **Verified, not assumed.** `Store::failing_drvs` (drvs with a direct
-  `Failed` and no success _in the log_) is only a **candidate** set; each candidate
+- **Verified, not assumed.** `Store::failing_drvs` (drvs whose _latest_ direct
+  outcome in the log — of their `Built`/`Failed` rows — is a `Failed`) is only a
+  **candidate** set; each candidate
   reachable from a target's closure is re-checked against the store
   (`verify_failing`: are its outputs actually still invalid?) before it may
   block anything. A dependency that has since built or been substituted — a
   flaky failure, a since-fixed one — drops out, and never blocks a dependent on
-  stale news. (A target is never its own culprit: both closure queries list a
+  stale news; it is also recorded `Built` there and then (`record_healed`), as
+  is a candidate that builds successfully in the batch. Without that row it
+  would stay a candidate for good — a dependency's success is otherwise never
+  recorded — and the moment its outputs were garbage-collected (npb keeps no GC
+  roots) it would "verify" as failing again and falsely block every dependent.
+  The _latest_ outcome decides, not "ever built": a flaky dependency that fails
+  again after a success is a candidate again, so its dependents are blocked
+  (`🚫`) rather than left with no culprit — unrecorded `❔`, re-attempted and the
+  dependency rebuilt every run. (A target's own state keeps "any success wins",
+  `flaky_success_wins`: that asks whether it can build at all.)
+  (A target is never its own culprit: both closure queries list a
   drv itself, and a re-opened target still carries its old failure, so without
   the exclusion a target would block _itself_.) A `DepFailed`-only drv is never
   a candidate: it was never attempted, so its outputs are invalid _because_ it
@@ -338,7 +350,14 @@ both sound and _self-correcting_:
   dependent is re-attempted with **no `--retry` needed**, and its success (or a
   fresh block on whatever is still broken) supersedes the stale row. This is the
   dependency-side of `flaky_success_wins`: a later success outranks an earlier
-  failure, read from the store rather than from a recorded `Built`.
+  failure, read from the store rather than from a recorded `Built`. The store
+  alone isn't enough, though: once a healed culprit's outputs are
+  garbage-collected they're invalid again, and nothing would ever rebuild it
+  while its dependents stay skipped. So a block is also stale when the _log_
+  says its culprit healed — a drv whose `Failed` row recorded those same outputs
+  (a direct failure records its own) has a later `Built`
+  (`Store::healed_failure_outputs`), still offline. The dependent is then
+  re-attempted, and nix rebuilds (or substitutes) the culprit for it.
 
 A **direct** failure (a drv's own build failed) is stickier by contrast —
 presumed to recur, `--retry` to re-attempt — because it _is_ a fact about that

@@ -200,13 +200,21 @@ impl Store {
         Ok(out)
     }
 
-    /// Every drv with a recorded *direct* failure and no success — at least one
-    /// `Failed`, no `Built` — the candidate culprits the build driver propagates
-    /// *forward* through the dependency graph (DESIGN.md §5): any target whose
-    /// build closure contains such a drv would only `DepFail`, so it can be
-    /// skipped without building. A drv with any recorded `Built` — its own
-    /// build, or cache presence (§7) — is excluded: nix wouldn't re-attempt it
-    /// as a dependency, so it blocks nothing.
+    /// Every drv whose most recent *direct* outcome is a failure — of its
+    /// `Built`/`Failed` rows, the latest is `Failed` — the candidate culprits the
+    /// build driver propagates *forward* through the dependency graph (DESIGN.md
+    /// §5): any target whose build closure contains such a drv would only
+    /// `DepFail`, so it can be skipped without building.
+    ///
+    /// The *latest* outcome decides, not "ever built". A drv whose latest is a
+    /// `Built` — its own build, a healed failure (`verify_failing`), or cache
+    /// presence (§7) — blocks nothing, even once its outputs are garbage-collected
+    /// (nix just rebuilds it). But a flaky dependency that built once and has
+    /// failed since *is* a candidate again: excluding it for good would leave its
+    /// dependents with no culprit to name — unrecorded `❔`, re-attempted (and the
+    /// dependency rebuilt) every run, instead of `🚫`. (A *target*'s report state
+    /// and `decide` keep "any success wins" — `flaky_success_wins` — which asks a
+    /// different question: can this drv build at all.)
     ///
     /// A `DepFailed`-only drv is excluded too, though `decide` skips it as a
     /// target: it was never attempted, so its outputs are always invalid and
@@ -218,9 +226,13 @@ impl Store {
     pub fn failing_drvs(&self) -> Result<std::collections::HashSet<String>> {
         // The enum code is interpolated from the mapper so the query can't
         // drift from it (an integer literal in a STRICT column).
+        // Each `Failed` row that is its drv's latest direct row: one indexed
+        // `MAX(id)` lookup per failure row, not a scan of the whole log per drv.
         let sql = format!(
-            "SELECT drv_path FROM observation GROUP BY drv_path \
-             HAVING SUM(outcome = {failed}) > 0 AND SUM(outcome = {built}) = 0",
+            "SELECT DISTINCT o.drv_path FROM observation o \
+             WHERE o.outcome = {failed} AND o.id = ( \
+                 SELECT MAX(id) FROM observation \
+                 WHERE drv_path = o.drv_path AND outcome IN ({failed}, {built}))",
             failed = outcome_code(Outcome::Failed),
             built = outcome_code(Outcome::Built),
         );
@@ -230,6 +242,31 @@ impl Store {
         for row in rows {
             // Stored stripped; callers compare against full `/nix/store` drv paths.
             out.insert(restore_drv(Some(&row?)).expect("Some maps to Some"));
+        }
+        Ok(out)
+    }
+
+    /// The recorded outputs of every drv that **failed and has since built**:
+    /// the `blocker` of each of its `Failed` rows (a direct failure records the
+    /// drv's own outputs there), for each drv whose latest direct outcome is a
+    /// `Built`. A `DepFailed` names its culprit only by those same outputs, so
+    /// this is how the build driver recognizes a block whose culprit has healed
+    /// even once the culprit's outputs are garbage-collected (DESIGN.md §5).
+    pub fn healed_failure_outputs(&self) -> Result<Vec<Vec<String>>> {
+        let sql = format!(
+            "SELECT DISTINCT o.blocker FROM observation o \
+             WHERE o.outcome = {failed} AND o.blocker IS NOT NULL AND ( \
+                 SELECT outcome FROM observation \
+                 WHERE drv_path = o.drv_path AND outcome IN ({failed}, {built}) \
+                 ORDER BY id DESC LIMIT 1) = {built}",
+            failed = outcome_code(Outcome::Failed),
+            built = outcome_code(Outcome::Built),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?.split('\n').map(restore_out).collect());
         }
         Ok(out)
     }
@@ -612,8 +649,8 @@ mod tests {
             .unwrap();
         s.add_observation(&obs("/nix/store/a.drv", Outcome::DepFailed))
             .unwrap();
-        // b: failed then built — a flaky local success, or a later cache hit
-        // (recorded as the same Built, §7) -> NOT failing.
+        // b: failed then built — a flaky local success, a healed failure, or a
+        // later cache hit (recorded as the same Built, §7) -> NOT failing.
         s.add_observation(&obs("/nix/store/b.drv", Outcome::Failed))
             .unwrap();
         s.add_observation(&obs("/nix/store/b.drv", Outcome::Built))
@@ -625,14 +662,67 @@ mod tests {
         // a culprit (its outputs are invalid only because it never built).
         s.add_observation(&obs("/nix/store/e.drv", Outcome::DepFailed))
             .unwrap();
+        // f: failed, built, failed again — a flaky drv whose latest outcome is a
+        // failure -> failing again.
+        for o in [Outcome::Failed, Outcome::Built, Outcome::Failed] {
+            s.add_observation(&obs("/nix/store/f.drv", o)).unwrap();
+        }
+        // g: failed, then a later dep-block -> still failing: a `DepFailed` is
+        // not a direct outcome, so the latest direct one is the failure.
+        s.add_observation(&obs("/nix/store/g.drv", Outcome::Failed))
+            .unwrap();
+        s.add_observation(&obs("/nix/store/g.drv", Outcome::DepFailed))
+            .unwrap();
 
         let failing = s.failing_drvs().unwrap();
         assert_eq!(
             failing,
-            ["/nix/store/a.drv".to_string()].into_iter().collect()
+            ["/nix/store/a.drv", "/nix/store/f.drv", "/nix/store/g.drv"]
+                .into_iter()
+                .map(String::from)
+                .collect()
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn healed_failure_outputs_are_failures_whose_latest_is_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("npb.sqlite")).unwrap();
+        let obs = |drv: &str, outcome, blocker: &[&str]| Observation {
+            drv_path: drv.into(),
+            outcome,
+            blocker: blocker.iter().map(|p| p.to_string()).collect(),
+        };
+        let (ao, bo, co) = ("/nix/store/aaa-a", "/nix/store/bbb-b", "/nix/store/ccc-c");
+        // a: failed, then built -> healed; its failure's outputs are reported.
+        s.add_observation(&obs(
+            "/nix/store/a.drv",
+            Outcome::Failed,
+            &[ao, "/nix/store/aaa-a-dev"],
+        ))
+        .unwrap();
+        s.add_observation(&obs("/nix/store/a.drv", Outcome::Built, &[]))
+            .unwrap();
+        // b: built, then failed -> latest is a failure, not healed.
+        s.add_observation(&obs("/nix/store/b.drv", Outcome::Built, &[]))
+            .unwrap();
+        s.add_observation(&obs("/nix/store/b.drv", Outcome::Failed, &[bo]))
+            .unwrap();
+        // c: failed only -> not healed.
+        s.add_observation(&obs("/nix/store/c.drv", Outcome::Failed, &[co]))
+            .unwrap();
+        // d: failed with no recorded outputs, then built -> nothing to report.
+        s.add_observation(&obs("/nix/store/d.drv", Outcome::Failed, &[]))
+            .unwrap();
+        s.add_observation(&obs("/nix/store/d.drv", Outcome::Built, &[]))
+            .unwrap();
+
+        assert_eq!(
+            s.healed_failure_outputs().unwrap(),
+            vec![vec![ao.to_string(), "/nix/store/aaa-a-dev".to_string()]]
+        );
     }
 
     #[test]
