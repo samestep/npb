@@ -21,38 +21,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::evalfile::{eval_path, write_eval};
 use crate::live;
 use crate::model::{AttrEval, Profile, Resolved, Rev, TestJob};
-
-/// The nixpkgs `config` attrset for a [`Profile`] (DESIGN.md §6). npb evaluates
-/// under the profile the user means — strict by default — so a
-/// broken/unsupported/insecure package (and anything forcing such a dependency)
-/// throws and falls out, precisely and for free; the throw *is* the signal, so
-/// there's no `--meta` and no post-hoc reclassification. `allowUnfree` is always
-/// on and `allowAliases` always off (both matching nixpkgs-review): aliases like
-/// `claude-code-bin` resolve to the same drv as their target, so evaluating them
-/// only adds a redundant attr to the changed set (collapsed onto its target's
-/// line in the report, but still noise); `allowAliases = false` makes them throw
-/// and fall out at eval, exactly as ofborg/nixpkgs-review see the package set.
-/// The three allow-flags are added only when the profile permits them. The
-/// profile is part of the eval cache key ([`Profile::qualify`]), so different
-/// profiles never share an eval file.
-fn profile_config(profile: Profile) -> String {
-    let mut s = String::from("{ allowUnfree = true; allowAliases = false;");
-    if profile.broken {
-        s.push_str(" allowBroken = true;");
-    }
-    if profile.unsupported {
-        s.push_str(" allowUnsupportedSystem = true;");
-    }
-    if profile.insecure {
-        s.push_str(" allowInsecurePredicate = _: true;");
-    }
-    s.push_str(" }");
-    s
-}
 
 // --- nix-eval-jobs output ---------------------------------------------------
 
@@ -215,29 +188,45 @@ fn nix_selector_list(paths: &[String]) -> String {
 }
 
 /// Build the whole-package-set Nix expression `nix-eval-jobs` walks, under the
-/// nixpkgs `config` of the run's [`Profile`] ([`profile_config`]). The revision's
+/// nixpkgs arguments of the run's [`Profile`] ([`Profile::nix_args`]). The revision's
 /// source is fetched by `builtins.fetchGit` at `rev` (a commit — real or the
 /// synthetic one minted for the working tree; the eval depends only on the tree
 /// it resolves to, which is why the cache keys on the tree, not this commit — see
 /// [`Rev`]). Interpolants are escaped via [`nix_escape`] (the repo path in
 /// particular is user input, `--nixpkgs`).
-fn build_expr(repo: &Path, rev: &str, system: &str, config: &str) -> String {
+fn build_expr(repo: &Path, rev: &str, system: &str, args: &str) -> String {
     format!(
         "import (builtins.fetchGit {{ url = \"{}\"; rev = \"{}\"; }}) \
-         {{ system = \"{}\"; config = {config}; }}",
+         {{ system = \"{}\"; {args} }}",
         nix_escape(&repo.display().to_string()),
         nix_escape(rev),
         nix_escape(system),
     )
 }
 
-/// Scrub the evaluator's environment of the variables nixpkgs is known to
-/// leak into derivations via `builtins.getEnv` (drbd bakes `$SHELL` into its
-/// Makefile patch), so cached evals don't depend on the shell npb was launched
-/// from — `getEnv` then returns `""`, matching a hermetic evaluation.
-fn scrub_env(cmd: &mut Command) -> &mut Command {
-    cmd.env_remove("SHELL");
-    cmd
+/// Percent-encode a filesystem path for a `file://` URL: every byte outside
+/// the unreserved set and `/` becomes `%XX`, so a `$TMPDIR` with spaces or `%`
+/// still names the right file.
+fn percent_encode_path(path: &str) -> String {
+    path.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Run the evaluator in Nix's pure evaluation mode, so an eval depends only on
+/// the expression npb wrote — which is what the eval cache keys on. Without it,
+/// nixpkgs reads ambient state: overlays from `~/.config/nixpkgs/overlays` or
+/// `<nixpkgs-overlays>`, and anything via `builtins.getEnv` (drbd bakes
+/// `$SHELL` into its Makefile patch). Pure mode makes `getEnv` return `""`,
+/// rejects `<…>` lookups, paths outside the store, and unhashed fetches, and
+/// still allows npb's own `fetchGit` (it is pinned by `rev`).
+fn pure_eval(cmd: &mut Command) -> &mut Command {
+    cmd.args(["--option", "pure-eval", "true"])
 }
 
 /// Run one `nix-eval-jobs --expr <expr>` (with `workers` workers each capped at
@@ -265,11 +254,14 @@ fn stream_jobs<T>(
 
     // nix-eval-jobs takes the expression inline (`--expr E`) or as a file-path
     // positional. The `tests` expression lists every changed package, so on a
-    // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn);
-    // writing it to a temp file and passing the path works for any size (and the
-    // small shard/full-set exprs don't care). The evaluated expression is
-    // byte-identical either way — same drvs — so this doesn't affect the cached
-    // evals. Kept alive until the child exits (nix-eval-jobs reads it at start).
+    // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn), so
+    // the expression goes in a temp file. But pure eval ([`pure_eval`]) forbids
+    // reading that file — as a positional, an `import`, even once copied into the
+    // store — so the small inline `--expr` imports it through a `fetchurl` locked
+    // to its SHA-256: a locked fetch is the one way pure mode reads a local file.
+    // The evaluated expression is byte-identical either way — same drvs — so this
+    // doesn't affect the cached evals. Kept alive until the child exits (each
+    // worker fetches it on start, and a restarted worker does so again).
     let mut expr_file = tempfile::Builder::new()
         .prefix("npb-eval-")
         .suffix(".nix")
@@ -279,6 +271,18 @@ fn stream_jobs<T>(
         .write_all(expr.as_bytes())
         .and_then(|()| expr_file.flush())
         .context("writing nix-eval-jobs expr file")?;
+    let path = expr_file
+        .path()
+        .to_str()
+        .context("nix-eval-jobs expr file path is not UTF-8")?;
+    let sha256: String = Sha256::digest(expr.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let import = format!(
+        "import (builtins.fetchurl {{ url = \"file://{}\"; sha256 = \"{sha256}\"; }})",
+        nix_escape(&percent_encode_path(path)),
+    );
     let workers_s = workers.to_string();
     let max_s = per_worker_mb.to_string();
     let mut cmd = Command::new(crate::NIX_EVAL_JOBS);
@@ -293,8 +297,8 @@ fn stream_jobs<T>(
     if !instantiate {
         cmd.arg("--no-instantiate");
     }
-    let mut child = scrub_env(&mut cmd)
-        .arg(expr_file.path())
+    let mut child = pure_eval(&mut cmd)
+        .args(["--expr", &import])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -402,7 +406,7 @@ fn build_tests_expr(
     rev: &str,
     system: &str,
     attrs: &[String],
-    profile: Profile,
+    profile: &Profile,
 ) -> String {
     let list = nix_selector_list(attrs);
     let nixbool = |b| if b { "true" } else { "false" };
@@ -449,7 +453,7 @@ lib.listToAttrs (map (a: lib.nameValuePair a.name (node a.path)) attrs)
     TEMPLATE
         .replace(
             "@PKGS@",
-            &build_expr(repo, rev, system, &profile_config(profile)),
+            &build_expr(repo, rev, system, &profile.nix_args()),
         )
         .replace("@SELECT@", SELECT_NIX)
         .replace("@ATTRS@", &list)
@@ -495,7 +499,7 @@ pub fn eval_tests(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
     nodes: Vec<Arc<live::Node>>,
-    profile: Profile,
+    profile: &Profile,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<TestJob>>> {
     if requests.is_empty() {
@@ -796,12 +800,12 @@ fn add_phase(
 /// space the shards partition. Cheap (well under a second warm): forcing
 /// `attrNames` touches no derivations. The literal `recurseForDerivations`
 /// key is dropped to mirror how `nix-eval-jobs` skips it when walking a set.
-fn enumerate_names(repo: &Path, rev: &str, system: &str, config: &str) -> Result<Vec<String>> {
+fn enumerate_names(repo: &Path, rev: &str, system: &str, args: &str) -> Result<Vec<String>> {
     let expr = format!(
         "builtins.attrNames ({})",
-        build_expr(repo, rev, system, config)
+        build_expr(repo, rev, system, args)
     );
-    let out = scrub_env(
+    let out = pure_eval(
         Command::new(crate::NIX_INSTANTIATE).args(["--eval", "--strict", "--json", "-E", &expr]),
     )
     .output()
@@ -823,12 +827,12 @@ fn enumerate_names(repo: &Path, rev: &str, system: &str, config: &str) -> Result
 /// per-attr in the worker, so walk semantics and error isolation match the
 /// monolithic root exactly — validated byte-for-byte against a whole-set eval
 /// (DESIGN §6).
-fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], config: &str) -> String {
+fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], args: &str) -> String {
     let list = nix_string_list(names);
     format!(
         "let pkgs = {}; in builtins.listToAttrs \
          (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
-        build_expr(repo, rev, system, config)
+        build_expr(repo, rev, system, args)
     )
 }
 
@@ -847,12 +851,12 @@ fn shard_expr(repo: &Path, rev: &str, system: &str, names: &[String], config: &s
 /// `lib.splitString "."` on the Nix side would split the quoted element too.
 /// (Upstream's `--select` flag, once hoped to replace this, landed as a
 /// root-transform function rather than per-path selection, so this stays.)
-fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], config: &str) -> String {
+fn select_expr(repo: &Path, rev: &str, system: &str, paths: &[String], args: &str) -> String {
     let list = nix_selector_list(paths);
     format!(
         "let pkgs = {}; lib = pkgs.lib; {SELECT_NIX} in builtins.listToAttrs \
          (map (a: {{ name = a.name; value = select a.path; }}) [ {list}])",
-        build_expr(repo, rev, system, config)
+        build_expr(repo, rev, system, args)
     )
 }
 
@@ -903,7 +907,7 @@ fn live_requests(requests: &[(Rev, String, Vec<String>)]) -> Vec<usize> {
 pub fn resolve_attrs(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
-    profile: Profile,
+    profile: &Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<(String, Resolved)>>> {
@@ -945,7 +949,7 @@ pub fn resolve_attrs(
         handle,
         |gi, label, attrs, on_item| {
             let (rev, system) = meta[gi];
-            let expr = select_expr(repo, &rev.commit, system, attrs, &profile_config(profile));
+            let expr = select_expr(repo, &rev.commit, system, attrs, &profile.nix_args());
             let rows = stream_jobs(
                 &expr,
                 1,
@@ -1080,7 +1084,7 @@ pub fn instantiate_prepare(tree: &live::Tree, requests: Vec<InstRequest>) -> Opt
 pub fn instantiate_execute(
     repo: &Path,
     inst: Instantiate,
-    profile: Profile,
+    profile: &Profile,
     handle: live::LiveHandle<'_>,
     absent: &(dyn Fn(&[String]) -> Result<HashSet<String>> + Sync),
 ) -> Result<()> {
@@ -1134,13 +1138,7 @@ pub fn instantiate_execute(
         handle,
         |gi, label, paths, on_item| {
             let r = &requests[gi];
-            let expr = select_expr(
-                repo,
-                &r.rev.commit,
-                &r.system,
-                paths,
-                &profile_config(profile),
-            );
+            let expr = select_expr(repo, &r.rev.commit, &r.system, paths, &profile.nix_args());
             // The `.drv` writes are the point; a streamed row carries only its
             // in-band error, if any, for the gate below. Every job still yields
             // one row (`None` for a recipe that landed): when the group's last
@@ -1622,16 +1620,16 @@ fn finish_shard<T>(
 pub fn eval_pairs(
     repo: &Path,
     pairs: &[(Rev, String)],
-    profile: Profile,
+    profile: &Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
     // Called with a bare `system` the moment one of its eval files lands, so the
     // caller can compute that system's diff and show its `tests` early (DESIGN §9).
     on_eval_done: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
-    // The nixpkgs config every shard evaluates under, and the profile token that
+    // The nixpkgs arguments every shard evaluates under, and the profile token that
     // prefixes each eval file's system key on disk (`Profile::qualify`).
-    let config = profile_config(profile);
+    let args = profile.nix_args();
     let mut todo: Vec<usize> = Vec::new();
     // Systems with a cache hit this run — signalled to `on_eval_done` once the
     // eval nodes exist (below), so their `tests` can appear early while the cold
@@ -1718,7 +1716,7 @@ pub fn eval_pairs(
         handle,
         |gi, _label, _slice, on_item| {
             let (rev, system) = meta[gi];
-            let names = enumerate_names(repo, &rev.commit, system, &config)?;
+            let names = enumerate_names(repo, &rev.commit, system, &args)?;
             on_item(names.len());
             Ok(names)
         },
@@ -1752,7 +1750,7 @@ pub fn eval_pairs(
         // Evaluate one shard by streaming its own one-worker `nix-eval-jobs`.
         |gi, label, names, on_item| {
             let (rev, system) = meta[gi];
-            let expr = shard_expr(repo, &rev.commit, system, names, &config);
+            let expr = shard_expr(repo, &rev.commit, system, names, &args);
             stream_jobs(
                 &expr,
                 1,
@@ -1789,7 +1787,7 @@ pub fn eval_two(
     base: &Rev,
     head: &Rev,
     systems: &[String],
-    profile: Profile,
+    profile: &Profile,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
     on_eval_done: &(dyn Fn(&str) + Sync),
@@ -1844,34 +1842,30 @@ mod tests {
     }
 
     #[test]
-    fn profile_config_reflects_the_allow_flags() {
-        // Strict allows only unfree; each axis adds exactly its allow-flag.
-        let strict = Profile {
-            broken: false,
-            unsupported: false,
-            insecure: false,
-        };
+    fn percent_encode_path_keeps_plain_paths_and_escapes_the_rest() {
         assert_eq!(
-            profile_config(strict),
-            "{ allowUnfree = true; allowAliases = false; }"
+            percent_encode_path("/tmp/npb-eval-Ab1_.nix"),
+            "/tmp/npb-eval-Ab1_.nix"
         );
-        let all = Profile {
-            broken: true,
-            unsupported: true,
-            insecure: true,
-        };
-        let c = profile_config(all);
-        assert!(c.contains("allowBroken = true"));
-        assert!(c.contains("allowUnsupportedSystem = true"));
-        assert!(c.contains("allowInsecurePredicate = _: true"));
+        assert_eq!(
+            percent_encode_path("/my tmp/100%/é"),
+            "/my%20tmp/100%25/%C3%A9"
+        );
     }
 
     #[test]
     fn full_expr_fetches_and_imports() {
         let repo = Path::new("/repo");
-        let full = build_expr(repo, "abc123", "aarch64-linux", "{ allowBroken = true; }");
+        let full = build_expr(
+            repo,
+            "abc123",
+            "aarch64-linux",
+            "config = { allowBroken = true; };",
+        );
         assert!(full.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
-        assert!(full.contains("allowBroken = true"));
+        assert!(
+            full.ends_with(r#"{ system = "aarch64-linux"; config = { allowBroken = true; }; }"#)
+        );
     }
 
     #[test]
@@ -2002,10 +1996,11 @@ mod tests {
             "abc123",
             "x86_64-linux",
             &["rubyPackages.\"http_parser.rb\"".into()],
-            Profile {
+            &Profile {
                 broken: false,
                 unsupported: false,
                 insecure: false,
+                overlays: vec![],
             },
         );
         assert!(

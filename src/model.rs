@@ -8,6 +8,8 @@
 //! Nothing here performs I/O. That keeps the model deterministic and trivially
 //! testable and lets the orchestration layer own all the impurity.
 
+use sha2::{Digest, Sha256};
+
 /// A revision to evaluate, split into the two git identities it plays plus a
 /// display label (DESIGN.md §6).
 ///
@@ -65,29 +67,73 @@ pub struct Rev {
 /// `allowUnfree` is always on (matching nixpkgs-review), so it isn't a profile
 /// axis.
 ///
-/// The profile is part of the eval cache key: it prefixes the on-disk system
-/// token ([`Profile::qualify`]) so evals under different profiles never collide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `overlays` are the user's `--overlay` expressions, in order, appended to the
+/// nixpkgs `overlays` argument verbatim. npb never looks inside them: an
+/// overlay is opaque Nix text, and the eval runs in pure mode, so that text (on
+/// top of the tree and system) is all the eval can depend on.
+///
+/// The profile is part of the eval cache key: [`Profile::qualify`] prefixes the
+/// system with a hash of [`Profile::nix_args`], so evals under different
+/// profiles never collide.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub broken: bool,
     pub unsupported: bool,
     pub insecure: bool,
+    pub overlays: Vec<String>,
 }
 
 impl Profile {
-    /// The canonical three-character profile token: one position each for
-    /// unsupported / broken / insecure, its letter when allowed else `-`. So
-    /// strict is `---`, allow-everything `ubi`, allow-unsupported-and-insecure
-    /// `u-i`. Deterministic and filesystem-safe — it names the profile's eval
-    /// subtree on disk.
+    /// The arguments npb passes to nixpkgs for this profile (DESIGN.md §6),
+    /// minus `system`: the `config` attrset and the `overlays` list, as the body
+    /// of an attrset (`config = { … }; overlays = [ … ];`) that `eval::build_expr`
+    /// splices in. Pure string building, but it lives here rather than in `eval`
+    /// because it is also exactly what [`Profile::token`] hashes.
+    ///
+    /// `allowUnfree` is always on and `allowAliases` always off (both matching
+    /// nixpkgs-review): aliases like `claude-code-bin` resolve to the same drv as
+    /// their target, so evaluating them only adds a redundant attr to the changed
+    /// set (collapsed onto its target's line in the report, but still noise);
+    /// `allowAliases = false` makes them throw and fall out at eval, exactly as
+    /// ofborg/nixpkgs-review see the package set. The three allow-flags are added
+    /// only when the profile permits them.
+    ///
+    /// Each `--overlay` goes into the list verbatim, in order, wrapped in
+    /// parentheses on lines of its own — so a trailing `#` comment in the user's
+    /// text can't swallow the closing paren. The list is always given, even
+    /// empty, so nixpkgs never falls back to looking for overlays in the
+    /// environment.
+    pub fn nix_args(&self) -> String {
+        let mut s = String::from("config = { allowUnfree = true; allowAliases = false;");
+        if self.broken {
+            s.push_str(" allowBroken = true;");
+        }
+        if self.unsupported {
+            s.push_str(" allowUnsupportedSystem = true;");
+        }
+        if self.insecure {
+            s.push_str(" allowInsecurePredicate = _: true;");
+        }
+        s.push_str(" }; overlays = [");
+        for o in &self.overlays {
+            s.push_str(" (\n");
+            s.push_str(o);
+            s.push_str("\n)");
+        }
+        s.push_str(" ];");
+        s
+    }
+
+    /// The profile's name on disk: the SHA-256 of [`Profile::nix_args`], in
+    /// lowercase hex. The args are the only part of the eval expression that
+    /// varies besides the tree and the system, which have their own places in
+    /// the key, so hashing them keys on everything else the eval can see — and
+    /// any change to how npb spells them is a new directory, never a stale hit.
     pub fn token(&self) -> String {
-        let f = |on, c| if on { c } else { '-' };
-        format!(
-            "{}{}{}",
-            f(self.unsupported, 'u'),
-            f(self.broken, 'b'),
-            f(self.insecure, 'i'),
-        )
+        Sha256::digest(self.nix_args().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// The storage key for an eval on `system` under this profile:
@@ -381,31 +427,74 @@ mod tests {
         assert_eq!(retry.decide(&o, true), Decision::Build);
     }
 
-    #[test]
-    fn profile_token_and_qualify() {
-        // The three-character token: unsupported / broken / insecure, letter when
-        // allowed else `-`. Strict is all dashes; allow-everything spells `ubi`.
-        let strict = Profile {
+    fn strict() -> Profile {
+        Profile {
             broken: false,
             unsupported: false,
             insecure: false,
-        };
+            overlays: vec![],
+        }
+    }
+
+    #[test]
+    fn nix_args_reflect_the_allow_flags() {
+        // Strict allows only unfree; each axis adds exactly its allow-flag.
+        assert_eq!(
+            strict().nix_args(),
+            "config = { allowUnfree = true; allowAliases = false; }; overlays = [ ];"
+        );
         let all = Profile {
             broken: true,
             unsupported: true,
             insecure: true,
+            ..strict()
         };
-        let ui = Profile {
-            broken: false,
-            unsupported: true,
-            insecure: true,
+        let c = all.nix_args();
+        assert!(c.contains("allowBroken = true"));
+        assert!(c.contains("allowUnsupportedSystem = true"));
+        assert!(c.contains("allowInsecurePredicate = _: true"));
+    }
+
+    #[test]
+    fn nix_args_append_overlays_in_order() {
+        let p = Profile {
+            overlays: vec![
+                "final: prev: { } # trailing comment".into(),
+                "_: _: { }".into(),
+            ],
+            ..strict()
         };
-        assert_eq!(strict.token(), "---");
-        assert_eq!(all.token(), "ubi");
-        assert_eq!(ui.token(), "u-i");
+        // Each on lines of its own, so the comment ends before the closing paren.
+        assert!(p.nix_args().ends_with(
+            "overlays = [ (\nfinal: prev: { } # trailing comment\n) (\n_: _: { }\n) ];"
+        ));
+    }
+
+    #[test]
+    fn token_is_the_sha256_of_the_nix_args() {
+        // Checkable by hand: `printf %s '<nix_args>' | sha256sum`.
+        assert_eq!(
+            strict().token(),
+            "f48805a3c2ef2554c296ef9c8826748e728bcad7e93b010b689a3a2215832404"
+        );
         // The storage key prefixes the system with the token.
-        assert_eq!(strict.qualify("x86_64-linux"), "---/x86_64-linux");
-        assert_eq!(all.qualify("aarch64-darwin"), "ubi/aarch64-darwin");
+        assert_eq!(
+            strict().qualify("x86_64-linux"),
+            format!("{}/x86_64-linux", strict().token())
+        );
+        // Every input to the args is in the hash: each flag, and the overlays,
+        // including their order.
+        let with = |overlays: &[&str]| Profile {
+            overlays: overlays.iter().map(|o| o.to_string()).collect(),
+            ..strict()
+        };
+        let broken = Profile {
+            broken: true,
+            ..strict()
+        };
+        assert_ne!(broken.token(), strict().token());
+        assert_ne!(with(&["a"]).token(), strict().token());
+        assert_ne!(with(&["a", "b"]).token(), with(&["b", "a"]).token());
     }
 
     #[test]

@@ -91,6 +91,9 @@ struct Cli {
     /// Set allowInsecurePredicate to true in Nixpkgs config
     #[arg(long)]
     allow_insecure: bool,
+    /// Nixpkgs overlay expression
+    #[arg(long, value_name = "EXPR")]
+    overlay: Vec<String>,
     /// Try to build derivations that have failed before
     #[arg(long)]
     retry: bool,
@@ -825,6 +828,13 @@ enum HeadRepro {
     Embed { anchor: String, diff: String },
 }
 
+/// Quote `s` as one POSIX shell word: wrapped in single quotes, inside which
+/// nothing is special, with each embedded `'` spelled `'\''` (close, escaped
+/// quote, reopen). Newlines need no escaping inside single quotes.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// The shell command a report prints (DESIGN §8) so anyone can reproduce its
 /// exact changeset — not the ambiguous invocation the author typed (`npb` alone
 /// is a different changeset per machine and day), but the resolved identity.
@@ -842,7 +852,7 @@ fn repro_command(
     base_sha: &str,
     head: &HeadRepro,
     no_merge: bool,
-    profile: Profile,
+    profile: &Profile,
     no_tests: bool,
     coverage: &Coverage,
     systems: &[String],
@@ -859,6 +869,9 @@ fn repro_command(
     }
     if profile.insecure {
         flags.push_str(" --allow-insecure");
+    }
+    for o in &profile.overlays {
+        flags.push_str(&format!(" --overlay {}", shell_quote(o)));
     }
     if no_tests {
         flags.push_str(" --no-tests");
@@ -991,7 +1004,7 @@ fn reveal_system_tests(
     systems: &[String],
     base: &Rev,
     head: &Rev,
-    profile: Profile,
+    profile: &Profile,
     sys: &str,
     changed: &[evalfile::ChangedAttr],
 ) -> Result<()> {
@@ -1071,7 +1084,7 @@ fn selected_changed_sets(
     base: &Rev,
     head: &Rev,
     systems: &[String],
-    profile: Profile,
+    profile: &Profile,
     attrs: &[String],
     store: &mut store::Store,
     tree: &live::Tree,
@@ -1157,7 +1170,7 @@ fn run_phases(
     base: &Rev,
     head: &Rev,
     systems: &[String],
-    profile: Profile,
+    profile: &Profile,
     policy: BuildPolicy,
     tests: bool,
     coverage: &Coverage,
@@ -1392,11 +1405,13 @@ fn run(cli: Cli) -> Result<()> {
 
     // Tests run by default; --no-tests opts out.
     let tests = !cli.no_tests;
-    // The evaluation profile: strict by default; each --allow-* flag widens it.
+    // The evaluation profile: strict by default; each --allow-* flag widens it,
+    // and each --overlay is appended to the nixpkgs overlays in order.
     let profile = Profile {
         broken: cli.allow_broken,
         unsupported: cli.allow_unsupported,
         insecure: cli.allow_insecure,
+        overlays: cli.overlay.clone(),
     };
     let policy = BuildPolicy { retry: cli.retry };
     // What this review covers (DESIGN §6): the whole changed set, or exactly the
@@ -1512,7 +1527,7 @@ fn run(cli: Cli) -> Result<()> {
             ensure_distinct_trees(&base, &head)?;
 
             let (per_system_changed, targets) = run_phases(
-                &repo, &base, &head, &systems, profile, policy, tests, &coverage, &tree, handle,
+                &repo, &base, &head, &systems, &profile, policy, tests, &coverage, &tree, handle,
             )?;
             Ok((
                 base,
@@ -1643,7 +1658,7 @@ fn run(cli: Cli) -> Result<()> {
         &base.commit,
         &head_repro,
         cli.no_merge,
-        profile,
+        &profile,
         !tests,
         &coverage,
         &systems,
@@ -2140,18 +2155,20 @@ mod tests {
             broken: false,
             unsupported: false,
             insecure: false,
+            overlays: vec![],
         };
         let all = Profile {
             broken: true,
             unsupported: true,
             insecure: true,
+            overlays: vec![],
         };
         // Committed head: plain --base/--head, only report-shaping flags echoed.
         let cmd = repro_command(
             "aaa",
             &HeadRepro::Commit("bbb".into()),
             false,
-            strict,
+            &strict,
             false,
             &Coverage::All,
             &["x86_64-linux".into()],
@@ -2162,7 +2179,7 @@ mod tests {
             "aaa",
             &HeadRepro::Commit("bbb".into()),
             true,
-            all,
+            &all,
             true,
             &Coverage::All,
             &["a".into(), "b".into()],
@@ -2181,7 +2198,7 @@ mod tests {
                 expr: "fork...m2".into(),
             },
             false,
-            strict,
+            &strict,
             false,
             &Coverage::All,
             &["sys".into()],
@@ -2196,7 +2213,7 @@ mod tests {
                 diff: "--- a\n+++ b\n".into(),
             },
             false,
-            strict,
+            &strict,
             false,
             &Coverage::All,
             &["sys".into()],
@@ -2212,12 +2229,44 @@ mod tests {
             "aaa",
             &HeadRepro::Commit("bbb".into()),
             false,
-            strict,
+            &strict,
             false,
             &Coverage::Only(vec!["git".into(), "hello".into()]),
             &["sys".into()],
         );
         assert_eq!(cmd, "npb --base aaa --head bbb -p git -p hello -s sys");
+
+        // Overlays change what evaluates, so each is echoed, in order, as one
+        // shell word each.
+        let overlays = Profile {
+            overlays: vec!["final: prev: { }".into(), "_: p: {\n  x = p.y;\n}".into()],
+            ..strict
+        };
+        let cmd = repro_command(
+            "aaa",
+            &HeadRepro::Commit("bbb".into()),
+            false,
+            &overlays,
+            false,
+            &Coverage::All,
+            &["sys".into()],
+        );
+        assert_eq!(
+            cmd,
+            "npb --base aaa --head bbb --overlay 'final: prev: { }' \
+             --overlay '_: p: {\n  x = p.y;\n}' -s sys"
+        );
+    }
+
+    #[test]
+    fn shell_quote_round_trips_through_sh() {
+        for s in ["", "plain", "it's", "''", "a\nb", "$HOME `x` \"q\" \\ !"] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("printf %s {}", shell_quote(s))])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), s);
+        }
     }
 
     #[test]

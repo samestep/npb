@@ -119,6 +119,7 @@ That command may not give you the same result if you run it yourself, but `npb`'
   - [`--allow-unsupported`](#--allow-unsupported)
   - [`--allow-broken`](#--allow-broken)
   - [`--allow-insecure`](#--allow-insecure)
+  - [`--overlay`](#--overlay)
   - [`--retry`](#--retry)
   - [`-s`, `--system`](#-s---system)
   - [`--clean`](#--clean)
@@ -277,6 +278,16 @@ By default, `npb` sets [`allowInsecurePredicate`](https://nixos.org/manual/nixpk
 ```sh
 npb --allow-insecure
 ```
+
+### `--overlay`
+
+To apply a Nixpkgs overlay:
+
+```sh
+npb --overlay 'final: prev: { pypy311Packages = final.lib.recurseIntoAttrs prev.pypy311Packages; }'
+```
+
+This argument can be repeated.
 
 ### `--retry`
 

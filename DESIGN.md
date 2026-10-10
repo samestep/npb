@@ -233,7 +233,8 @@ eviction can be added additively if that ever stops being true.
 ~/.cache/nix-npb/
   format-version                # eval-cache format version (§1); a bump wipes the eval cache, keeps the log
   npb.sqlite                    # observation log (tiny) + test cache (the bulk) + selector resolutions + patch-tree cache (§8)
-  <token>/<sys>/<tree>.tsv.zst  # attr→drv maps (zstd), one file per (profile, system, eval) — evicted by --clean
+  <token>/<sys>/<tree>.tsv.zst  # attr→drv maps (zstd), one file per (profile, system, eval) — evicted by --clean;
+                                # <token> is the SHA-256 of the profile's nixpkgs args (§6)
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
@@ -372,25 +373,51 @@ nix substitutes from source instead.
 ## 6. Evaluation, its cache key, and the diff
 
 **The cache key is `(tree, system, profile)`, and it is not a can of worms —
-provided `npb` owns the config.** What determines the attr→drv map is the
-nixpkgs source _tree_, the platform, and the nixpkgs _config_ (allowlists like
+provided `npb` owns the config and the eval is pure.** What determines the
+attr→drv map is the nixpkgs source _tree_, the platform, and the arguments
+nixpkgs is imported with: its _config_ (allowlists like
 `allowBroken`/`allowUnfree`/`allowUnsupportedSystem`, `allowInsecurePredicate`,
-…). The trap is letting a user pass arbitrary Nix as config — that isn't cleanly
-hashable. `npb` avoids it by **deriving the config from a bounded profile**:
-three boolean axes (`--allow-broken` / `--allow-unsupported` / `--allow-insecure`),
+…) and its _overlays_. The config comes from a **bounded profile**: three
+boolean axes (`--allow-broken` / `--allow-unsupported` / `--allow-insecure`),
 with `allowUnfree` always on and `allowAliases` always off (both matching
 nixpkgs-review; `allowAliases = false` drops redundant alias attrs like
 `claude-code-bin`, which resolve to the same drv as their target, so ofborg /
-nixpkgs-review / npb all see the same package set). That's eight hashable
-values, not arbitrary Nix. On disk the profile is a three-character token — one
-position per axis, its letter when allowed else `-` (`---` strict, `ubi`
-allow-everything, `u-i` unsupported+insecure) — prefixed onto the system to form
-the eval key `<token>/<system>` (`model::Profile`). Drv hashes are
-_config-independent_ (the allow-flags gate **throws**, not derivation inputs),
-so the durable observation log (§3) is shared across every profile; only the
-cheap, re-derivable eval files multiply. The file format and _how_
-`nix-eval-jobs` is invoked are also part of the stored-format surface, versioned
-out of band by a `format-version` marker (§1, §4).
+nixpkgs-review / npb all see the same package set).
+
+Overlays (`--overlay`, repeatable) are the one place a user hands npb arbitrary
+Nix, and what makes that hashable is **pure evaluation** (below): every
+evaluator call runs with `pure-eval`, so an overlay can't reach a local file, a
+`<…>` lookup path, an unhashed fetch, or the environment — anything it tries
+is an evaluation error, never a silently different result. Overlays are lazy,
+so where that error lands depends on what forces it: one that breaks the
+package set's shape fails the attr-name enumeration and with it the run, while
+one confined to an attr makes that attr throw (⏩), same as any other throw.
+npb never parses an overlay: each is spliced verbatim (parenthesized, on lines
+of its own) into the `overlays` list, in order, after the flags have built the
+config. The list is passed empty rather than omitted when there are none, so
+nixpkgs never goes looking for overlays of its own (see **Eval purity**,
+below).
+
+**On disk, the profile is the SHA-256 of its Nix text.** The config and the
+overlays together are one string, `model::Profile::nix_args` (`config = { … };
+overlays = [ … ];`), and it is the only part of the eval expression that
+varies besides the tree and the system. So the eval key is
+`<sha256(nix_args)>/<system>`, 64 lowercase hex digits, with the tree naming
+the file below it: under pure eval that covers everything an eval can see.
+Hashing the exact text, rather than naming the profile's parts, means any
+change to how npb spells the args (a new default, a new flag) lands in a new
+directory instead of serving a stale eval, with no format-version bump; an
+overlay that differs only in whitespace is merely a cache miss. The previous
+three-character tokens (`---`, `ubi`, …) named impure evals and are never read
+again; they age out under `--clean` like any other unused eval.
+
+Drv paths are content-addressed, so the durable observation log (§3) stays
+sound across every profile: the allow-flags only gate **throws**, and an
+overlay that changes a package changes its drv, which is then simply a
+different key in the log. Only the cheap, re-derivable eval files multiply.
+The file format and _how_ `nix-eval-jobs` is invoked are also part of the
+stored-format surface, versioned out of band by a `format-version` marker (§1,
+§4).
 
 **Evaluate under the profile you mean; the throw is the signal.** `npb`
 evaluates under the profile the user asked for — **strict by default**. A
@@ -662,12 +689,28 @@ kills the run), so the guess is sometimes simply wrong.
 > memory" notes — the only output the phase produced, the real diagnostic having
 > been discarded on requeue — were also unfounded.
 
-**Eval purity vs `builtins.getEnv`.** A handful of nixpkgs packages leak the
-_environment_ into their derivations (drbd bakes `$SHELL` into a Makefile
-patch), so two evals of the same `(commit, system)` from different shells
-disagree on those drvs. npb scrubs the known offenders from the evaluator's
-environment (`SHELL` removed, so `getEnv` yields `""`, matching a hermetic
-eval) — the cache key stays honest without hashing the environment.
+**Eval purity.** Every evaluator call (`nix-eval-jobs`, and the
+`nix-instantiate` that enumerates attr names) runs with `pure-eval = true`
+(`eval::pure_eval`), so the cache key — tree, system, profile — really is
+everything an eval can see. Without it, nixpkgs reads ambient state: overlays
+from `~/.config/nixpkgs/overlays` or `<nixpkgs-overlays>` (applied silently,
+under a key that didn't account for them), and the environment via
+`builtins.getEnv` (drbd bakes `$SHELL` into a Makefile patch). Pure mode makes
+`getEnv` return `""`, rejects lookup paths, paths outside the store, and
+unhashed fetches, and still allows npb's own `fetchGit`, which is pinned by
+`rev`. It is also what makes `--overlay` text hashable (above). Measured on a
+full eval of three systems (2026-10, ~113k attrs each), the only drv that
+differs from an impure eval is `tests.fetchPypiLegacy.fetchSimple`, which sets
+`NETRC` only when `!inPureEvalMode`. Switching to pure eval needed no
+format-version bump: it came with the hashed profile directories (above), so
+no impure eval is ever read again.
+
+One consequence: pure mode won't read a local file, not even as
+`nix-eval-jobs`' root expression or once added to the store. npb writes its
+expressions to a temp file (a big `tests` expression overflows ARG_MAX as an
+argument) and passes a small `--expr` that imports it through a `fetchurl`
+locked to the file's SHA-256 — a locked fetch is the one way pure mode reads a
+local path.
 
 `eval(commit, system, profile)` → `{attr: AttrEval}` via `nix-eval-jobs`
 (cached, pure). Each attr carries its drv, or _no_ drv when it **threw** under
