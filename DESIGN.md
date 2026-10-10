@@ -377,9 +377,11 @@ and the same check runs. If it's still invalid it records those outputs, so the
 next run re-checks it offline instead of re-materializing — self-limiting. The
 only sticky residue is a failure whose outputs can't be resolved at all (no
 `blocker`, `.drv` GC'd), overridden as before by `--retry` or a later `Built`.
-`--retry` disables propagation entirely; the check is gated behind a non-empty
-failing set and a union-closure query, so a run with nothing failing pays
-nothing.
+`--retry` disables propagation of failures recorded _before_ the run; the check
+is gated behind a non-empty failing set and a union-closure query, so a run with
+nothing failing pays nothing. A failure nix watches happen _in_ a `--retry`
+batch still blocks its dependents in the post-batch sweep — it's as grounded as
+any fact — so they show `🚫`, not an unrecorded `❔`.
 
 **Soundness caveats (known, accepted).** Every recorded fact is now grounded in
 store validity: `Built` from valid outputs, `Failed` from a drv's own stop event

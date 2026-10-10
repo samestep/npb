@@ -1085,6 +1085,9 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         // Several targets can share a drv (aliased attrs); record it once.
         let requested: HashSet<&str> = drvs.iter().copied().collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
+        // Every drv that failed in this batch, target or dependency — the only
+        // culprits the post-batch sweep may name under `--retry`.
+        let mut failed_now: HashSet<String> = HashSet::new();
         batch_build(&drvs, |drv| {
             let built = drv_built(drv)?;
             if requested.contains(drv) {
@@ -1105,6 +1108,9 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     blocker,
                 })?;
                 recorded.insert(drv.to_string(), outcome);
+                if !built {
+                    failed_now.insert(drv.to_string());
+                }
             } else if built {
                 // A transitive dependency that built. Nix's store validity
                 // remembers a success, so it normally needs no row — but one
@@ -1130,6 +1136,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                     outcome: Outcome::Failed,
                     blocker: cache::drv_outputs(drv).unwrap_or_default(),
                 })?;
+                failed_now.insert(drv.to_string());
             }
             Ok(())
         })?;
@@ -1169,8 +1176,15 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
                 }
             }
             // Pass 2 may have just added this batch's own dependency failures.
-            let failing_now = if policy.retry || unresolved.is_empty() {
+            // Under `--retry`, *only* those: the flag sets aside failures recorded
+            // before this run, but one nix just watched happen is as grounded as
+            // any fact — without it, a target blocked by a dependency that failed
+            // in this very batch would be left unrecorded (❔) until a later
+            // default run attributed it.
+            let failing_now = if unresolved.is_empty() {
                 HashSet::new()
+            } else if policy.retry {
+                failed_now
             } else {
                 store.failing_drvs()?
             };
@@ -2100,6 +2114,47 @@ mod tests {
             obs.iter().any(|o| o.outcome == Outcome::Built),
             "a block whose culprit healed must lift, even after a GC: {obs:?}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--retry` sets aside failures recorded *before* the run, not ones that
+    /// happen in it: a target blocked by a dependency that fails in the same
+    /// `--retry` batch is attributed `DepFailed` (🚫), not left unrecorded (❔).
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn retry_attributes_blocks_from_this_batchs_failures() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npb-retryblock-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npb.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npb-retryblock-dep-{nonce}" {{ args = ["-c" "exit 1"]; }};
+                 top = mk "npb-retryblock-top-{nonce}" {{ args = ["-c" ": ${{dep}}; echo ok > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+
+        build_targets_at(&db, &[target(&top)], BuildPolicy { retry: true }).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        let top_obs = s.load_observations(&top).unwrap();
+        assert_eq!(
+            top_obs.iter().map(|o| o.outcome).collect::<Vec<_>>(),
+            vec![Outcome::DepFailed],
+            "a dependency failing in a --retry batch blocks its dependent: {top_obs:?}"
+        );
+        assert_eq!(top_obs[0].blocker, cache::drv_outputs(&dep).unwrap());
 
         let _ = fs::remove_dir_all(&dir);
     }
