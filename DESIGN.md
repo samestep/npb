@@ -284,11 +284,16 @@ direct failure / dependency cascade).
 its own SQLite autocommit) the moment that drv's build activity stops, not after
 the batch: nix registers a successful build's outputs _before_ emitting the
 activity's stop event, so output validity at stop time is the build's own
-result — **ground truth, never an exit-status guess**. This fires for **every**
-drv nix builds, not just the requested set — a transitive **dependency** that
-fails is recorded too (keyed on its own drvpath; a dependency _success_ needs no
-row, since nix's store validity already remembers it — and the propagation below
-re-checks exactly that validity). Interrupting the batch therefore keeps every
+result — **ground truth, never an exit-status guess**. (A build on a remote
+builder surfaces _two_ `actBuild` activities for its drv: the local hook goal's,
+and the remote daemon's own, which nix re-creates locally from the forwarded log.
+The remote's stops as soon as the remote build ends, _before_ `build-remote`
+copies the outputs back, so a drv counts as stopped only when its _last_
+activity does — the hook goal's, after the copy; `BuildActivities`.) This
+fires for **every** drv nix builds, not just the requested set — a transitive
+**dependency** that fails is recorded too (keyed on its own drvpath; a
+dependency _success_ needs no row, since nix's store validity already remembers
+it — and the propagation below re-checks exactly that validity). Interrupting the batch therefore keeps every
 fact observed so far — including the failures nix itself forgets — and a re-run
 only re-pays for the in-flight and never-started builds. Requested targets with
 no build activity (blocked by a failed dep, or already valid) are attributed in

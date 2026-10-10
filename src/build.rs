@@ -63,6 +63,47 @@ struct NixEvent {
 /// The `actBuild` activity type in nix's internal-json log.
 const ACT_BUILD: i64 = 105;
 
+/// The open `actBuild` activities of a batch, counted per drv, so a drv's build
+/// is reported finished only when its *last* one stops.
+///
+/// One drv can have two at once. A build sent to a remote builder opens the
+/// local hook goal's activity (`fields[1]` names the machine), and nix also
+/// re-creates every activity the remote daemon forwards — including the
+/// remote's own `actBuild` for the same drv, under a fresh id (nix 2.35
+/// `handleJSONLogMessage`). That forwarded one stops as soon as the remote
+/// build finishes, *before* `build-remote` copies the outputs back, so output
+/// validity at its stop is not the build's result. The local hook activity
+/// stops last — after the copy and the goal's own validity check — so it is
+/// the one whose stop counts.
+#[derive(Default)]
+struct BuildActivities {
+    drv_of: HashMap<u64, String>,
+    open: HashMap<String, usize>,
+}
+
+impl BuildActivities {
+    /// An `actBuild` started; whether it is the drv's first open one.
+    fn start(&mut self, id: u64, drv: &str) -> bool {
+        self.drv_of.insert(id, drv.to_string());
+        let n = self.open.entry(drv.to_string()).or_default();
+        *n += 1;
+        *n == 1
+    }
+
+    /// Some activity stopped; the drv whose build just finished, if it was that
+    /// drv's last open `actBuild`.
+    fn stop(&mut self, id: u64) -> Option<String> {
+        let drv = self.drv_of.remove(&id)?;
+        let n = self.open.get_mut(&drv).expect("a started drv is open");
+        *n -= 1;
+        if *n > 0 {
+            return None;
+        }
+        self.open.remove(&drv);
+        Some(drv)
+    }
+}
+
 /// Width the plain build log's event-kind column is left-padded to, so the store
 /// paths that follow line up. The verbs are a fixed set — `building` (8, the
 /// widest), `built`, `failed` — so a constant suffices; the log streams events
@@ -101,13 +142,16 @@ fn nom_path(nix: &str) -> OsString {
 /// the event kind then the full `.drv` store path. `--keep-going` so every drv
 /// is attempted.
 ///
-/// `on_finish(drv)` fires as *every* build activity stops — the requested
-/// drvs and their transitive dependencies alike (the caller records a
-/// dependency only when it failed; DESIGN.md §5). Nix registers a successful
-/// build's outputs *before* emitting the stop event (both the local and
-/// build-hook goals `registerValidPaths` before destroying the `actBuild`
-/// Activity — nix 2.34 `derivation-building-goal.cc`), so the callback can
-/// attribute the outcome from output validity right away. (Nix keeps the build
+/// `on_finish(drv)` fires as *every* drv's build stops — the requested drvs
+/// and their transitive dependencies alike (the caller records a dependency
+/// only when it failed; DESIGN.md §5). Nix registers a successful build's
+/// outputs *before* emitting the stop event (both the local and build-hook
+/// goals have their outputs valid before destroying the `actBuild` Activity —
+/// nix 2.34 `derivation-building-goal.cc`), so the callback can attribute the
+/// outcome from output validity right away. A remote build also surfaces the
+/// remote daemon's own `actBuild`, which stops before the outputs are copied
+/// back, so a drv counts as stopped only when its last activity does
+/// ([`BuildActivities`]). (Nix keeps the build
 /// log itself under `/nix/var/log/nix/drvs`; `nix log <drv>` retrieves it, so
 /// npb doesn't duplicate it.)
 ///
@@ -183,7 +227,7 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
         .map(|n| n.stdin.take().expect("stdin is piped"));
 
     let log = BufReader::new(nix.stderr.take().expect("stderr is piped"));
-    let mut starts: HashMap<u64, String> = HashMap::new();
+    let mut activities = BuildActivities::default();
 
     let streamed = (|| -> Result<()> {
         for line in log.lines() {
@@ -203,15 +247,15 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
                     if let (Some(id), Some(drv)) =
                         (ev.id, ev.fields.first().and_then(|v| v.as_str()))
                     {
-                        if nom_in.is_none() {
+                        let first = activities.start(id, drv);
+                        if first && nom_in.is_none() {
                             eprintln!("{:<VERB_W$}  {drv}", "building");
                         }
-                        starts.insert(id, drv.to_string());
                     }
                 }
                 "stop" => {
                     if let Some(id) = ev.id
-                        && let Some(drv) = starts.remove(&id)
+                        && let Some(drv) = activities.stop(id)
                     {
                         if nom_in.is_none() {
                             // Nix registers a success's outputs *before* this stop
@@ -1074,6 +1118,54 @@ mod tests {
         let inherited = std::env::var_os("PATH").expect("cargo runs tests with a PATH");
         assert_eq!(nom_path("nix"), inherited);
         assert_eq!(nom_path("bin/nix"), inherited);
+    }
+
+    /// A local build: one `actBuild`, whose stop finishes the drv.
+    #[test]
+    fn build_activities_local_build_finishes_on_its_stop() {
+        let mut acts = BuildActivities::default();
+        assert!(acts.start(1, "/nix/store/a.drv"));
+        assert_eq!(acts.stop(1).as_deref(), Some("/nix/store/a.drv"));
+        // Non-build activities (and repeated stops) were never started here.
+        assert_eq!(acts.stop(1), None);
+        assert_eq!(acts.stop(99), None);
+    }
+
+    /// A remote build, in the order nix 2.35 emits it (captured from an
+    /// `ssh-ng://` builder with a 200 MB output): the local hook goal's
+    /// `actBuild`, then the remote's forwarded one for the same drv. The
+    /// forwarded one stops first — before the outputs are copied back — and
+    /// must not finish the drv; only the hook activity's later stop does.
+    #[test]
+    fn build_activities_remote_build_finishes_on_the_last_stop() {
+        let drv = "/nix/store/2g1gp0h5kyx76c4z4jfs4ix1631cx7d8-npb-race-probe-big.drv";
+        let mut acts = BuildActivities::default();
+        assert!(
+            acts.start(280031867699207, drv),
+            "the hook activity opens the drv"
+        );
+        assert!(
+            !acts.start(280031867699217, drv),
+            "the forwarded remote activity is not a second build"
+        );
+        assert_eq!(
+            acts.stop(280031867699217),
+            None,
+            "the remote's stop precedes the copy-back"
+        );
+        assert_eq!(acts.stop(280031867699207).as_deref(), Some(drv));
+    }
+
+    /// Distinct drvs are counted independently, whatever the interleaving.
+    #[test]
+    fn build_activities_count_each_drv_separately() {
+        let mut acts = BuildActivities::default();
+        assert!(acts.start(1, "/nix/store/a.drv"));
+        assert!(acts.start(2, "/nix/store/b.drv"));
+        assert!(!acts.start(3, "/nix/store/a.drv"));
+        assert_eq!(acts.stop(1), None);
+        assert_eq!(acts.stop(2).as_deref(), Some("/nix/store/b.drv"));
+        assert_eq!(acts.stop(3).as_deref(), Some("/nix/store/a.drv"));
     }
 
     fn target(drv: &str) -> Target {
