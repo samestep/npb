@@ -1,5 +1,11 @@
 # Changelog for `npb`
 
+## 1.2.1
+
+- Fix failing dependencies during `--retry` being reported wrong ([`2426768`](https://github.com/samestep/npb/commit/2426768e7f60a312baa258df9ef86668ec1c0b0a))
+- Fix successful but garbage-collected store paths being forgotten ([`73a1c3e`](https://github.com/samestep/npb/commit/73a1c3e081d10c546af40193e3f5cbf55b2dcddf))
+- Fix failing Nix query commands being treated as successful builds ([`5e08839`](https://github.com/samestep/npb/commit/5e088394199395ddad8beee15feabc39ba396d54))
+
 ## 1.2.0
 
 - Fix lack of quoting for `-p` arguments in reproduction commands ([`8922905`](https://github.com/samestep/npb/commit/89229055502b88898d21e4731737456f5049598e))
