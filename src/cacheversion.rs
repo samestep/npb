@@ -4,7 +4,8 @@
 //! migration code (CLAUDE.md). The observation log (`observation`) and the
 //! patch-tree cache (`patch_tree`) are format-stable and drvpath-keyed — valid
 //! across every profile and format — so they survive untouched. But the eval
-//! *files* and the eval-derived DB caches (`eval_key` / `test_pkg` / `test_drv`)
+//! *files* and the eval-derived DB caches (`eval_key` / `test_pkg` / `test_drv` /
+//! `sel_drv`)
 //! change shape from time to time. Rather than coexist or migrate, a bump to
 //! [`CURRENT`] wipes exactly those on first run — after a Y/n prompt — while
 //! leaving the observation log intact. A `format-version` file at the cache root
@@ -116,23 +117,75 @@ fn wipe_eval_cache() -> Result<()> {
             }
         }
     }
-    // Drop the eval-derived tables if the DB exists; observation/patch_tree stay.
-    // Every child that references `eval_key` (`test_pkg`, `test_drv`, and an old
-    // db's `transitive_block`) must be dropped *before* `eval_key` itself:
-    // foreign keys are enforced in this SQLite build, so dropping the parent while
-    // a referencing row survives fails the constraint. `IF EXISTS` keeps it
-    // idempotent, so a re-run after a partially-applied wipe still completes.
     let db = db_path()?;
     if db.exists() {
-        let conn = Connection::open(&db).with_context(|| format!("opening {}", db.display()))?;
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS test_drv; \
-             DROP TABLE IF EXISTS test_pkg; \
-             DROP TABLE IF EXISTS transitive_block; \
-             DROP TABLE IF EXISTS eval_key; \
-             VACUUM;",
-        )
-        .context("dropping the eval-derived cache tables")?;
+        drop_eval_tables(&db)?;
     }
     Ok(())
+}
+
+/// Drop the eval-derived tables from the DB at `db`; observation/patch_tree stay.
+/// Every child that references `eval_key` (`test_pkg`, `test_drv`, `sel_drv`,
+/// and an old db's `transitive_block`) must be dropped *before* `eval_key`
+/// itself: foreign keys are enforced in this SQLite build, so dropping the parent
+/// while a referencing row survives fails the constraint — and the version
+/// marker is then never rewritten, so every later run would fail the same way.
+/// Any new table referencing `eval_key` belongs in this list. `IF EXISTS` keeps
+/// it idempotent, so a re-run after a partially-applied wipe still completes.
+fn drop_eval_tables(db: &std::path::Path) -> Result<()> {
+    let conn = Connection::open(db).with_context(|| format!("opening {}", db.display()))?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS test_drv; \
+         DROP TABLE IF EXISTS test_pkg; \
+         DROP TABLE IF EXISTS sel_drv; \
+         DROP TABLE IF EXISTS transitive_block; \
+         DROP TABLE IF EXISTS eval_key; \
+         VACUUM;",
+    )
+    .context("dropping the eval-derived cache tables")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Observation, Outcome, Resolved};
+    use crate::store::Store;
+
+    /// The wipe drops every eval-derived table — including `sel_drv`, whose rows
+    /// reference `eval_key` and so would otherwise fail the drop on a foreign key
+    /// — while the observation log survives.
+    #[test]
+    fn drop_eval_tables_clears_every_eval_key_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("npb.sqlite");
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&Observation {
+                drv_path: "/nix/store/a.drv".into(),
+                outcome: Outcome::Built,
+                blocker: Vec::new(),
+            })
+            .unwrap();
+            s.cache_resolutions("tree", "tok/sys", &[("hello".into(), Resolved::absent())])
+                .unwrap();
+            s.cache_test_eval("tree", "tok/sys", &["hello".into()], &[])
+                .unwrap();
+        }
+
+        drop_eval_tables(&db).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        assert!(
+            s.resolved_attrs("tree", "tok/sys", &["hello".into()])
+                .unwrap()
+                .is_empty(),
+            "selector resolutions are wiped"
+        );
+        assert_eq!(
+            s.load_observations("/nix/store/a.drv").unwrap().len(),
+            1,
+            "the observation log survives"
+        );
+    }
 }
