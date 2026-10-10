@@ -311,12 +311,20 @@ fn batch_build(drvs: &[&str], mut on_finish: impl FnMut(&str) -> Result<()>) -> 
 const CHECK_VALIDITY_CONCURRENCY: usize = 8;
 
 /// Which of `paths` are NOT valid in the local store (i.e. weren't built).
+///
+/// An error fails the whole call rather than reading as "nothing invalid":
+/// every caller takes an absent path as *not built*, so a query that silently
+/// printed nothing — a daemon it couldn't reach, say — would otherwise pass for
+/// every output being valid, and the build driver would record a permanent
+/// `Built` for a failure (at a stop event, in a self-heal, or in the post-batch
+/// sweep).
 fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
     if paths.is_empty() {
         return Ok(HashSet::new());
     }
-    // `--print-invalid` prints the invalid subset (exits non-zero when some are
-    // invalid — expected, so parse stdout regardless). Chunked to stay under
+    // `--print-invalid` prints the invalid subset and still exits 0 — a non-zero
+    // exit means the query itself failed (it can't reach the daemon, or a path
+    // is malformed), so that's an error, not an answer. Chunked to stay under
     // ARG_MAX, and the chunks run concurrently: validity is per-path independent,
     // so the invalid set is the union over the chunks, and on a mass-rebuild
     // changed set (~400k drvs, ~100 chunks) the serial spawns were ~16s of the
@@ -338,7 +346,17 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
                         .args(*chunk)
                         .output()
                     {
-                        Ok(out) => invalid.lock().unwrap().extend(cache::lines(&out.stdout)),
+                        Ok(out) if out.status.success() => {
+                            invalid.lock().unwrap().extend(cache::lines(&out.stdout))
+                        }
+                        Ok(out) => {
+                            *err.lock().unwrap() = Some(anyhow::anyhow!(
+                                "nix-store --check-validity failed ({}): {}",
+                                out.status,
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            ));
+                            break;
+                        }
                         Err(e) => {
                             *err.lock().unwrap() = Some(
                                 anyhow::Error::from(e)
@@ -1545,6 +1563,25 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed validity query is an error, never "nothing invalid" — which every
+    /// caller would read as "all built". `--print-invalid` exits 0 for absent
+    /// paths, so only a real failure (here a malformed path) is non-zero.
+    #[test]
+    #[ignore = "queries the real store via nix-store; needs nix"]
+    fn invalid_paths_fails_rather_than_reading_an_error_as_valid() {
+        let absent =
+            "/nix/store/00000000000000000000000000000000-npb-invalid-paths-absent".to_string();
+        assert_eq!(
+            invalid_paths(std::slice::from_ref(&absent)).unwrap(),
+            HashSet::from([absent.clone()]),
+            "an absent path is reported invalid, with no error"
+        );
+        assert!(
+            invalid_paths(&[absent, "/nix/store/not-a-store-path".to_string()]).is_err(),
+            "a failed query must be an error"
+        );
     }
 
     /// The direct-failure analogue of the dependency self-heal (DESIGN.md §5): a
