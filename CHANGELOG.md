@@ -1,5 +1,11 @@
 # Changelog for `npb`
 
+## 1.2.0
+
+- Fix lack of quoting for `-p` arguments in reproduction commands ([`8922905`](https://github.com/samestep/npb/commit/89229055502b88898d21e4731737456f5049598e))
+- Fix not all transitive dependents being built after a failed build later succeeds ([`06e7098`](https://github.com/samestep/npb/commit/06e70981d2cd967d426dec25d4d86278c3e81843))
+- Add a repeatable `--overlay` CLI argument ([#5](https://github.com/samestep/npb/pull/5))
+
 ## 1.1.3
 
 - Improve performance when searching for failed dependencies ([`7e4d47a`](https://github.com/samestep/npb/commit/7e4d47a26a4f05a753eb270b5147a052dd216a30))
