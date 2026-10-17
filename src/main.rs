@@ -844,10 +844,20 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// A report's reproduction command (see [`repro_command`]), plus which of its
+/// flags broke it across lines — what the report says when it folds a
+/// multi-line command away (DESIGN §8).
+pub struct ReproCommand {
+    pub text: String,
+    /// Each flag whose value spans lines, once, in command order: `--overlay`
+    /// for an overlay with a newline in it, `--patch` for an embedded diff.
+    pub multiline_flags: Vec<&'static str>,
+}
+
 /// The shell command a report prints (DESIGN §8) so anyone can reproduce its
 /// exact changeset — not the ambiguous invocation the author typed (`npb` alone
 /// is a different changeset per machine and day), but the resolved identity.
-/// Every form runs `npb --base <sha> --head <…>` on a **pinned base** and a head
+/// Every form runs `npb … --base <sha> --head <…>` on a **pinned base** and a head
 /// whose **tree** is pinned: the eval is tree-keyed and the synthetic merge is
 /// deterministic (DESIGN §6), so that reproduces the review byte-for-byte. A
 /// fetchable head is just `--head <sha>`; otherwise the head is rebuilt with
@@ -856,7 +866,10 @@ fn shell_quote(s: &str) -> String {
 /// command calls no external binary. Only flags that change *what the report
 /// contains* are echoed (`--no-merge`, the profile's `--allow-*`, `--no-tests`,
 /// each `-p` of a selection, the systems); `--retry` and the eval-sizing
-/// knobs don't change the changeset, so they're omitted.
+/// knobs don't change the changeset, so they're omitted. They come *before*
+/// `--base`/`--head`: the report shows a one-line command unfolded, and two
+/// full shas would otherwise push an unusual flag like `-p` past the right
+/// edge of its code block.
 fn repro_command(
     base_sha: &str,
     head: &HeadRepro,
@@ -865,8 +878,9 @@ fn repro_command(
     no_tests: bool,
     coverage: &Coverage,
     systems: &[String],
-) -> String {
+) -> ReproCommand {
     let mut flags = String::new();
+    let mut multiline_flags = Vec::new();
     if no_merge {
         flags.push_str(" --no-merge");
     }
@@ -882,6 +896,9 @@ fn repro_command(
     for o in &profile.overlays {
         flags.push_str(&format!(" --overlay {}", shell_quote(o)));
     }
+    if profile.overlays.iter().any(|o| o.contains('\n')) {
+        multiline_flags.push("--overlay");
+    }
     if no_tests {
         flags.push_str(" --no-tests");
     }
@@ -895,12 +912,13 @@ fn repro_command(
     for s in systems {
         flags.push_str(&format!(" -s {}", shell_quote(s)));
     }
-    match head {
-        HeadRepro::Commit(sha) => format!("npb --base {base_sha} --head {sha}{flags}"),
+    let text = match head {
+        HeadRepro::Commit(sha) => format!("npb{flags} --base {base_sha} --head {sha}"),
         HeadRepro::Compare { anchor, expr } => {
-            format!("npb --base {base_sha} --head {anchor} --patch {expr}{flags}")
+            format!("npb{flags} --base {base_sha} --head {anchor} --patch {expr}")
         }
         HeadRepro::Embed { anchor, diff } => {
+            multiline_flags.push("--patch");
             let diff = if diff.ends_with('\n') {
                 diff.clone()
             } else {
@@ -910,9 +928,13 @@ fn repro_command(
             // no `-` special case). `<<'PATCH'` blocks interpolation; a diff body
             // line always has a `+`/`-`/space prefix, so a bare `PATCH` can't occur.
             format!(
-                "npb --base {base_sha} --head {anchor} --patch /dev/stdin{flags} <<'PATCH'\n{diff}PATCH"
+                "npb{flags} --base {base_sha} --head {anchor} --patch /dev/stdin <<'PATCH'\n{diff}PATCH"
             )
         }
+    };
+    ReproCommand {
+        text,
+        multiline_flags,
     }
 }
 
@@ -2182,7 +2204,8 @@ mod tests {
             &Coverage::All,
             &["x86_64-linux".into()],
         );
-        assert_eq!(cmd, "npb --base aaa --head bbb -s x86_64-linux");
+        assert_eq!(cmd.text, "npb -s x86_64-linux --base aaa --head bbb");
+        assert!(cmd.multiline_flags.is_empty());
         // Every widening flag echoed, in token order (u, b, i → the flags below).
         let cmd = repro_command(
             "aaa",
@@ -2194,9 +2217,9 @@ mod tests {
             &["a".into(), "b".into()],
         );
         assert_eq!(
-            cmd,
-            "npb --base aaa --head bbb --no-merge --allow-broken --allow-unsupported \
-             --allow-insecure --no-tests -s a -s b"
+            cmd.text,
+            "npb --no-merge --allow-broken --allow-unsupported --allow-insecure \
+             --no-tests -s a -s b --base aaa --head bbb"
         );
 
         // Compare (PR): --patch is the compare expression, applied onto --head.
@@ -2212,7 +2235,11 @@ mod tests {
             &Coverage::All,
             &["sys".into()],
         );
-        assert_eq!(cmd, "npb --base m1 --head fork --patch fork...m2 -s sys");
+        assert_eq!(
+            cmd.text,
+            "npb -s sys --base m1 --head fork --patch fork...m2"
+        );
+        assert!(cmd.multiline_flags.is_empty());
 
         // Embed (working tree): a heredoc straight into `--patch /dev/stdin`.
         let cmd = repro_command(
@@ -2228,9 +2255,10 @@ mod tests {
             &["sys".into()],
         );
         assert_eq!(
-            cmd,
-            "npb --base b --head h --patch /dev/stdin -s sys <<'PATCH'\n--- a\n+++ b\nPATCH"
+            cmd.text,
+            "npb -s sys --base b --head h --patch /dev/stdin <<'PATCH'\n--- a\n+++ b\nPATCH"
         );
+        assert_eq!(cmd.multiline_flags, ["--patch"]);
 
         // A selection decides what the report covers, so it's echoed — one token
         // per attr, in the order they were named.
@@ -2243,7 +2271,7 @@ mod tests {
             &Coverage::Only(vec!["git".into(), "hello".into()]),
             &["sys".into()],
         );
-        assert_eq!(cmd, "npb --base aaa --head bbb -p git -p hello -s sys");
+        assert_eq!(cmd.text, "npb -p git -p hello -s sys --base aaa --head bbb");
 
         // An attr path with a quoted element is quoted whole, or the shell would
         // strip the `"`s and the repro would select a different path.
@@ -2257,8 +2285,8 @@ mod tests {
             &["x86_64-linux".into()],
         );
         assert_eq!(
-            cmd,
-            "npb --base aaa --head bbb -p 'texlivePackages.\"texlive.infra\"' -s x86_64-linux"
+            cmd.text,
+            "npb -p 'texlivePackages.\"texlive.infra\"' -s x86_64-linux --base aaa --head bbb"
         );
 
         // Overlays change what evaluates, so each is echoed, in order, as one
@@ -2277,10 +2305,13 @@ mod tests {
             &["sys".into()],
         );
         assert_eq!(
-            cmd,
-            "npb --base aaa --head bbb --overlay 'final: prev: { }' \
-             --overlay '_: p: {\n  x = p.y;\n}' -s sys"
+            cmd.text,
+            "npb --overlay 'final: prev: { }' --overlay '_: p: {\n  x = p.y;\n}' \
+             -s sys --base aaa --head bbb"
         );
+        // That second overlay's newlines make the command multi-line; the report
+        // says so when it folds it (DESIGN §8). Named once, however many overlays.
+        assert_eq!(cmd.multiline_flags, ["--overlay"]);
     }
 
     #[test]

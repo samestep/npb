@@ -1328,11 +1328,18 @@ pure function of the source tree, and a report's provenance is a tag anyone can
 fetch rather than a commit that may only exist in one clone.
 
 **Every report carries a copy-pasteable reproduction command** (a `sh`
-block folded in a `<details>` under the heading, `repro_command` in
-`src/main.rs`), followed by a second `<details>` glossing every glyph, so anyone
+block under the heading, `repro_command` in `src/main.rs`), followed by a
+`<details>` glossing every glyph, so anyone
 can re-run `npb` on the _exact same changeset_ — not the ambiguous invocation the
 author happened to type (`npb` alone means a different changeset per machine and
-day), but the resolved identity. Every form runs `npb --base <sha> --head <…>`
+day), but the resolved identity. A one-line command is shown **unfolded**, so a
+reviewer sees at a glance whether the run was narrowed or reshaped (a `-p`
+selection, an `--overlay`, an `--allow-*`) without having to think to expand
+anything; only a multi-line command — an embedded `--patch` diff, or an overlay
+containing a newline — is folded in a `<details>` whose summary names the
+flag(s) responsible. For the same reason the echoed flags come **before**
+`--base`/`--head`: two full shas would otherwise push them past the right edge
+of the code block. Every form runs `npb … --base <sha> --head <…>`
 on a **pinned base** and a head whose **tree** is pinned: because the eval is
 tree-keyed and the synthetic merge is deterministic (§6), that reproduces the
 review byte-for-byte, and npb re-mints the merge itself — the command never names

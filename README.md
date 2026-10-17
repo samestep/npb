@@ -12,13 +12,9 @@ That command may not give you the same result if you run it yourself, but `npb`'
 
 > ## [`npb`](README.md) · [`26426a9`](https://github.com/NixOS/nixpkgs/commit/26426a9ad1c5cebe35b163a94152065a7b9d1413) → [`17a97c0`](https://github.com/NixOS/nixpkgs/commit/17a97c09e0d9467dd191a2cfbc800c2a984b5f1b)
 >
-> <details><summary>Expand this for a reproducible command.</summary>
->
 > ```sh
-> npb --base 26426a9ad1c5cebe35b163a94152065a7b9d1413 --head 9acc6884ece717d2d20a485da38fb2fc39d575a0 --patch 9acc6884ece717d2d20a485da38fb2fc39d575a0...17a97c09e0d9467dd191a2cfbc800c2a984b5f1b -s aarch64-darwin
+> npb -s aarch64-darwin --base 26426a9ad1c5cebe35b163a94152065a7b9d1413 --head 9acc6884ece717d2d20a485da38fb2fc39d575a0 --patch 9acc6884ece717d2d20a485da38fb2fc39d575a0...17a97c09e0d9467dd191a2cfbc800c2a984b5f1b
 > ```
->
-> </details>
 >
 > <details><summary>Expand this for a legend of all symbols below.</summary>
 >
