@@ -204,27 +204,48 @@ fn longest_backtick_run(s: &str) -> usize {
 
 /// Render the per-system entries to Markdown, grouped into `before → after`
 /// sections ordered worst-delta-first. `command` is the shell reproduction of
-/// this exact changeset (see `repro_command`), tucked under the heading inside a
-/// folded <details> alongside a legend of the glyphs (DESIGN §8).
+/// this exact changeset (see `repro_command`), shown under the heading — in the
+/// open when it fits on one line, else folded in a <details> naming the flags
+/// that made it span lines — followed by a folded legend of the glyphs
+/// (DESIGN §8).
 pub fn render(
     base: &str,
     head: &str,
-    command: &str,
+    command: &crate::ReproCommand,
     per_system: &[(String, Vec<Entry>)],
 ) -> String {
+    let text = &command.text;
     // Fence with more backticks than any run inside the command, so a working-
     // tree reproduction whose embedded diff touches a Markdown file (its own
     // ``` fences and all) can't close the block early.
-    let fence = "`".repeat(longest_backtick_run(command).max(2) + 1);
+    let fence = "`".repeat(longest_backtick_run(text).max(2) + 1);
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
     // `npb` links to the tagged source tree this binary was built from (§8).
     let url = crate::URL;
     let mut out = format!("## [`npb`]({url}) · {base} → {head}\n\n");
-    // The reproduction command and the glyph legend each fold away behind a
-    // <details>, keeping the heading close to the per-system sections below.
-    out.push_str("<details><summary>Expand this for a reproducible command.</summary>\n\n");
-    out.push_str(&format!("{fence}sh\n{command}\n{fence}\n"));
-    out.push_str("</details>\n\n");
+    let block = format!("{fence}sh\n{text}\n{fence}\n");
+    // A one-line command stays in view, so a reader sees any report-shaping
+    // flag (a `-p` selection, say) without having to think to expand anything.
+    // Only a multi-line one — an embedded diff, or an overlay with a newline —
+    // folds away, keeping the heading close to the per-system sections below.
+    if text.contains('\n') {
+        let why = match command.multiline_flags.as_slice() {
+            [] => String::new(),
+            flags => {
+                let flags: Vec<String> =
+                    flags.iter().map(|f| format!("<code>{f}</code>")).collect();
+                format!(" due to using {}", flags.join(" and "))
+            }
+        };
+        out.push_str(&format!(
+            "<details><summary>Expand this for a reproducible command (multiple lines{why}).</summary>\n\n"
+        ));
+        out.push_str(&block);
+        out.push_str("</details>\n\n");
+    } else {
+        out.push_str(&block);
+        out.push('\n');
+    }
     out.push_str("<details><summary>Expand this for a legend of all symbols below.</summary>\n\n");
     for state in State::ALL {
         out.push_str(&format!("- {} = {}\n", state.glyph(), state.label()));
@@ -294,19 +315,67 @@ mod tests {
         assert_eq!(side_state(&d, true, &[obs(Outcome::Built)]), State::Built);
     }
 
+    fn cmd(text: &str, multiline_flags: &[&'static str]) -> crate::ReproCommand {
+        crate::ReproCommand {
+            text: text.into(),
+            multiline_flags: multiline_flags.to_vec(),
+        }
+    }
+
     #[test]
     fn reproduction_fence_outgrows_embedded_backticks() {
         // A working-tree reproduction embeds its diff, which can contain a ```
         // run (editing a Markdown file). The fence must be longer so the report
         // block doesn't close early.
-        let cmd = "git apply --cached <<'PATCH'\n+```sh hi\nPATCH";
-        let out = render("b", "h", cmd, &[]);
+        let c = cmd(
+            "npb --patch /dev/stdin <<'PATCH'\n+```sh hi\nPATCH",
+            &["--patch"],
+        );
+        let out = render("b", "h", &c, &[]);
         assert!(out.contains("\n````sh\n"), "{out}");
         // The block closes on its own oversized fence, then the <details> wrapping it.
         assert!(out.contains("\n````\n</details>\n"), "{out}");
         // The common (no-backtick) command still gets a plain triple fence.
-        let out = render("b", "h", "npb --base a --head b", &[]);
+        let out = render("b", "h", &cmd("npb --base a --head b", &[]), &[]);
         assert!(out.contains("\n```sh\n"), "{out}");
+    }
+
+    #[test]
+    fn reproduction_folds_only_when_multiline() {
+        // One line: in the open, straight under the heading, no fold.
+        let out = render("b", "h", &cmd("npb -p x --base a --head b", &[]), &[]);
+        assert!(
+            out.contains("→ h\n\n```sh\nnpb -p x --base a --head b\n```\n\n<details>"),
+            "{out}"
+        );
+        assert!(!out.contains("reproducible command"), "{out}");
+
+        // Multiple lines: folded, and the summary names the flag(s) responsible.
+        let out = render(
+            "b",
+            "h",
+            &cmd("npb <<'PATCH'\n+x\nPATCH", &["--patch"]),
+            &[],
+        );
+        assert!(
+            out.contains(
+                "<details><summary>Expand this for a reproducible command (multiple lines \
+                 due to using <code>--patch</code>).</summary>\n\n```sh\nnpb <<'PATCH'\n"
+            ),
+            "{out}"
+        );
+        let both = cmd(
+            "npb --overlay '\n' <<'PATCH'\nPATCH",
+            &["--overlay", "--patch"],
+        );
+        let out = render("b", "h", &both, &[]);
+        assert!(
+            out.contains(
+                "(multiple lines due to using <code>--overlay</code> and \
+                 <code>--patch</code>)."
+            ),
+            "{out}"
+        );
     }
 
     #[test]
@@ -420,16 +489,13 @@ mod tests {
         let out = render(
             "base",
             "head",
-            "npb --base base --head head",
+            &cmd("npb --base base --head head", &[]),
             &[("aarch64-linux".into(), entries)],
         );
 
-        // The reproduction command sits in a code block behind a folded <details>.
+        // A one-line reproduction command sits in an unfolded code block.
         assert!(
-            out.contains(
-                "<details><summary>Expand this for a reproducible command.</summary>\n\n\
-                 ```sh\nnpb --base base --head head\n```\n</details>\n"
-            ),
+            out.contains("```sh\nnpb --base base --head head\n```\n\n<details>"),
             "{out}"
         );
         // The glyph legend is a second folded <details>, one bullet per state.
