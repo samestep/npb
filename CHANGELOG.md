@@ -1,5 +1,9 @@
 # Changelog for `npb`
 
+## 1.2.2
+
+- Always show repro command when it's only one line ([#7](https://github.com/samestep/npb/pull/7))
+
 ## 1.2.1
 
 - Fix failing dependencies during `--retry` being reported wrong ([`2426768`](https://github.com/samestep/npb/commit/2426768e7f60a312baa258df9ef86668ec1c0b0a))
