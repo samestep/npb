@@ -1,7 +1,6 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -12,7 +11,6 @@
     {
       self,
       nixpkgs,
-      flake-utils,
       crane,
       rust-overlay,
     }:
@@ -113,11 +111,25 @@
       overlay = final: _prev: {
         npb = (npbFor final).npb;
       };
+      # Calls `f` once per supported system and transposes its outputs into the
+      # `packages.<system>` &c. shape flakes expect.
+      eachSystem =
+        f:
+        let
+          bySystem = nixpkgs.lib.genAttrs [
+            "aarch64-darwin"
+            "aarch64-linux"
+            "x86_64-linux"
+          ] f;
+        in
+        builtins.mapAttrs (name: _: builtins.mapAttrs (_: outputs: outputs.${name}) bySystem) (
+          bySystem.x86_64-linux
+        );
     in
     {
       overlays.default = overlay;
     }
-    // flake-utils.lib.eachDefaultSystem (
+    // eachSystem (
       system:
       let
         pkgs = import nixpkgs {
